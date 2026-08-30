@@ -45,10 +45,10 @@ def test_main_rejects_missing_and_empty_coverage(monkeypatch, capsys):
     assert errors == ""
 
 
-def test_main_rejects_coverage_at_or_below_threshold(monkeypatch, capsys):
-    code, _, errors = run_main("Project coverage: 95/100\n", monkeypatch, capsys)
+def test_main_rejects_non_exact_coverage(monkeypatch, capsys):
+    code, _, errors = run_main("Project coverage: 99/100\n", monkeypatch, capsys)
     assert code == 1
-    assert "must be above 95%" in errors
+    assert "must be exactly 100%" in errors
 
 
 def test_script_entry_point(monkeypatch, capsys):

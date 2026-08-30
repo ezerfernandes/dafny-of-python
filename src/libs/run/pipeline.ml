@@ -39,13 +39,13 @@ let exit_code result =
   else if result.typecheck.exit_code <> 0 then 2
   else 0
 
-exception PipelineError of string
-
-let[@inline] failwith message = raise (PipelineError message)
-
 let close_noerr fd =
   try Unix.close fd with
   | Unix.Unix_error _ -> ()
+
+let rec read_available read fd bytes =
+  try read fd bytes 0 (Bytes.length bytes) with
+  | Unix.Unix_error (Unix.EINTR, _, _) -> read_available read fd bytes
 
 let status_code = function
   | Unix.WEXITED code -> code
@@ -71,20 +71,15 @@ let default_runner ({ program; args } : command) =
         let fds = List.map !streams ~f:fst in
         let ready, _, _ = Unix.select fds [] [] (-1.0) in
         List.iter ready ~f:(fun fd ->
-          match List.find !streams ~f:(fun (candidate, _) -> Stdlib.compare candidate fd = 0) with
-          | None -> ()
-          | Some (_, buffer) ->
-            let bytes = Bytes.create 4096 in
-            let rec read_available () =
-              try Some (Unix.read fd bytes 0 (Bytes.length bytes)) with
-              | Unix.Unix_error (Unix.EINTR, _, _) -> read_available ()
-            in
-            match read_available () with
-            | Some 0 ->
-              close_noerr fd;
-              streams := List.filter !streams ~f:(fun (candidate, _) -> Stdlib.compare candidate fd <> 0)
-            | Some count -> Stdlib.Buffer.add_subbytes buffer bytes 0 count
-            | None -> ());
+          let _, buffer =
+            List.find_exn !streams ~f:(fun (candidate, _) -> Stdlib.compare candidate fd = 0)
+          in
+          let bytes = Bytes.create 4096 in
+          match read_available Unix.read fd bytes with
+          | 0 ->
+            close_noerr fd;
+            streams := List.filter !streams ~f:(fun (candidate, _) -> Stdlib.compare candidate fd <> 0)
+          | count -> Stdlib.Buffer.add_subbytes buffer bytes 0 count);
         drain ()
     in
     drain ();

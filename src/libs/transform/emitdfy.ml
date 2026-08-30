@@ -129,6 +129,7 @@ let print_type id t =
     | DSeq (_, t) -> "seq<" ^ (get_v t) ^ ">"
     | DSet (_, t) -> "set<" ^ (get_v t) ^ ">"
     | DMap (_, t1, t2) -> "map<" ^ (get_v t1) ^ ", " ^ (get_v t2) ^ ">"
+    | DArray (_, t) -> (get_v t) ^ "[]"
     | DTuple (_, tl) -> "(" ^ (String.concat ~sep:", " (List.map ~f:get_v tl)) ^ ")"
     | DFunTyp (_, tl, t) -> "(" ^ (String.concat ~sep:", " (List.map ~f:get_v tl)) ^ ") -> " ^ (get_v t)
     | _ -> ""
@@ -145,6 +146,7 @@ let print_type id t =
     | DSeq (s, _) -> s
     | DSet (s, _) -> s
     | DMap (s, _,  _) -> s
+    | DArray (s, _) -> s
     | DTuple (s, _) -> s 
     | DFunTyp (s, _, _) -> s
     | _ -> def_seg
@@ -264,7 +266,7 @@ let rec print_exp id = function
     let pe = (print_exp 0 e) in
     String.concat [n; f; pil; pd; pe]
   | DExists (il, e) -> let n = newcolumn (indent id) in
-    let ex = (newcolumn "exists") in 
+    let ex = (newcolumn "exists ") in
     let pil = (newcolumn_concat (print_ident 0) ", " il) in
     let pc = (newcolumn " :: ") in 
     let pe = (print_exp 0 e) in
@@ -541,16 +543,12 @@ let print_prog_with_sourcemap program =
   let source_map = ref (List.map !sm ~f:(fun mapping -> mapping)) in
   source, source_map
 
-let extr lst = match lst with
-  | Some el -> el
-  | None -> []
-
 let rec nearest_seg_helper sm line column nearest = 
   match List.hd sm with
   | Some mapping -> 
     let ldiff = Int.abs ((fst (fst mapping)) - line) in 
     let l_so_far = Int.abs ((fst (fst nearest)) - line) in
-    let rest = extr (List.tl sm) in
+    let rest = List.tl_exn sm in
     if ldiff < l_so_far then nearest_seg_helper rest line column mapping
     else if ldiff = l_so_far then begin
       let cdiff = Int.abs ((snd (fst mapping)) - column) in

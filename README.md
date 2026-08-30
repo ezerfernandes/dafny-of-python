@@ -82,7 +82,7 @@ make run FILE=program.py
 and the CLI checks. Coverage is pytest-cov branch coverage for Python and
 Bisect_ppx expression-point coverage for maintained handwritten OCaml in
 `src/bin`, `src/libs/parse`, `src/libs/transform`, and `src/libs/run`. Both
-coverage gates require results strictly above 95%. See
+coverage gates require exactly 100%. See
 [`docs/coverage.md`](docs/coverage.md) for the prototype-code decision and
 exclusions.
 

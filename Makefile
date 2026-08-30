@@ -78,7 +78,7 @@ test: python-test ocaml-test
 
 python-coverage:
 	$(UV_RUN) $(PYTEST) -q test/python \
-		--cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=95.01
+		--cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=100
 
 ocaml-coverage:
 	@if test -x "$(LOCAL_OPAM_BIN)/dune"; then \

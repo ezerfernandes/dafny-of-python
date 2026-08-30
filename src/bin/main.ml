@@ -87,8 +87,10 @@ let main () =
   Run.Report.report ~sourcemap:result.sourcemap result.verification.stdout;
   Run.Pipeline.exit_code result
 
+[@@@coverage off]
 let () =
   try Stdlib.exit (main ()) with
   | exn ->
     prerr (Stdlib.Printexc.to_string exn ^ "\n");
     Stdlib.exit 1
+[@@@coverage on]

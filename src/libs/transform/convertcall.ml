@@ -45,22 +45,20 @@ let rec exp_calls = function
     (al@als@[a], a_ident)
   | Lst el -> 
     let als_nes = List.map ~f:exp_calls el in
-    List.fold als_nes ~f:(
-      fun (al1, lel) (al2, e) -> begin
-        match lel with
-        | Lst el -> (al1@al2, Lst (el@[e]))
-        | _ -> (al1, lel)
-        end
-    )  ~init:([], Lst [])
+    let al, n_el =
+      List.fold als_nes
+        ~f:(fun (al1, n_el) (al2, e) -> (al1 @ al2, n_el @ [ e ]))
+        ~init:([], [])
+    in
+    (al, Lst n_el)
   | Tuple el -> 
     let als_nes = List.map ~f:exp_calls el in
-    List.fold als_nes ~f:(
-      fun (al1, lel) (al2, e) -> begin
-        match lel with
-        | Tuple el -> (al1@al2, Tuple (el@[e]))
-        | _ -> (al1, lel)
-        end
-    )  ~init:([], Tuple [])
+    let al, n_el =
+      List.fold als_nes
+        ~f:(fun (al1, n_el) (al2, e) -> (al1 @ al2, n_el @ [ e ]))
+        ~init:([], [])
+    in
+    (al, Tuple n_el)
   | Subscript (e1, e2) -> 
     let al1, n_e1 = exp_calls e1 in
     let al2, n_e2 = exp_calls e2 in

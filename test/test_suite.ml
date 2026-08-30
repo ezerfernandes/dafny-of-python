@@ -239,6 +239,8 @@ let test_nice_parser_wrapper_paths () =
   Raw_parser_for_test.mode := Parse;
   expect "wrapped parse error" (function P.ParseError _ -> true | _ -> false)
     (fun () -> P.parse_string "input");
+  expect "empty lexer output" (function Failure _ -> true | _ -> false)
+    (fun () -> ignore ((Pyparse.Indenter.flatten (fun _ -> [])) (Lexing.from_string "")));
   Raw_parser_for_test.mode := Ok
 
 let test_parser_expression_and_type_forms () =
@@ -747,7 +749,11 @@ let test_generics_paths () =
   expect_exception "unequal generic assignment" (function Ast.PyAstError _ -> true | _ -> false)
     (fun () -> Transform.Generics.generics (Assign (None, [ identifier "x" ], [])));
   check bool "non-TypeVar call is ignored" true
-    (Option.is_none (Transform.Generics.convert_typvar (identifier "T") (Call (identifier "Other", []))));
+    (Option.is_none
+       (Transform.Generics.convert_typvar
+          (identifier "T") (Call (identifier "Other", [ Literal (StringLit "Other") ]))));
+  check bool "non-call generic rhs is ignored" true
+    (Option.is_none (Transform.Generics.convert_typvar (identifier "T") (Literal TrueLit)));
   check bool "unknown generic identifier is ignored" true
     (Option.is_none (Transform.Generics.convert_typvar (identifier "U") (identifier "Unknown")));
   check bool "non-assignment is preserved" true
@@ -789,6 +795,8 @@ let test_todafnyast_paths () =
     (fun () -> Transform.Todafnyast.typ_dfy (TSet (def_seg, None)));
   expect_exception "untyped dict" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
     (fun () -> Transform.Todafnyast.typ_dfy (TDict (def_seg, None, Some int_typ)));
+  expect_exception "dict with untyped value" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
+    (fun () -> Transform.Todafnyast.typ_dfy (TDict (def_seg, Some int_typ, None)));
   expect_exception "untyped type" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
     (fun () -> Transform.Todafnyast.typ_dfy (TType (def_seg, None)));
   let x = identifier "x" in
@@ -883,6 +891,8 @@ let test_todafnyast_paths () =
     (Option.is_none (Transform.Todafnyast.convert_typsyn (Identifier (segment "Nothing")) (Typ (TNone def_seg))));
   check bool "non-identifier type alias is ignored" true
     (Option.is_none (Transform.Todafnyast.convert_typsyn (Literal TrueLit) (Typ int_typ)));
+  check bool "non-type alias rhs is ignored" true
+    (Option.is_none (Transform.Todafnyast.convert_typsyn (Identifier (segment "NotAType")) (Literal TrueLit)));
   check bool "None is not a top-level declaration" false
     (Transform.Todafnyast.is_toplevel (Assign (None, [ x ], [ Typ (TNone def_seg) ])));
   check bool "ordinary statement is not top-level" false
@@ -912,7 +922,9 @@ let test_todafnyast_paths () =
   ignore (Transform.Todafnyast.toplevel_dfy [] Pass);
   expect_exception "unequal top-level declaration" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
     (fun () -> Transform.Todafnyast.toplevel_dfy [] (Assign (None, [ x; y ], [ Typ int_typ ])));
-  ignore (Transform.Todafnyast.prog_dfy (Program [ function_return; Assign (None, [ x ], [ Literal (IntLit "1") ]) ]))
+  ignore (Transform.Todafnyast.prog_dfy
+            (Program [ function_return
+                     ; Assign (None, [ x ], [ Typ int_typ ]) ]))
 
 let test_emitter_paths_and_sourcemaps () =
   let ds name = segment name in
@@ -955,6 +967,8 @@ let test_emitter_paths_and_sourcemaps () =
     (render_type (D.DSet (def_seg, D.DInt def_seg)));
   check string "map type rendering" "map<int, string>"
     (render_type (D.DMap (def_seg, D.DInt def_seg, D.DString def_seg)));
+  check string "array type rendering" "int[]"
+    (render_type (D.DArray (def_seg, D.DInt def_seg)));
   check string "tuple type rendering" "(int)"
     (render_type (D.DTuple (def_seg, [ D.DInt def_seg ])));
   check string "function type rendering" "(int) -> bool"
@@ -999,6 +1013,10 @@ let test_emitter_paths_and_sourcemaps () =
     ]
   in
   Transform.Emitdfy.reset ();
+  check string "newline concatenation" "first\nsecond"
+    (Transform.Emitdfy.newline_concat (fun value -> value) [ "first"; "second" ]);
+  check bool "lookup searches past the first declaration" true
+    (Transform.Emitdfy.lookup "f" "x" [ ("g", "y"); ("f", "x") ]);
   List.iter (fun expression -> ignore (Transform.Emitdfy.print_exp 0 expression)) expressions;
   let render_exp expression =
     Transform.Emitdfy.reset ();
@@ -1039,7 +1057,7 @@ let test_emitter_paths_and_sourcemaps () =
   check string "empty slice rendering" "[]" (render_exp (D.DSlice (None, None)));
   check string "forall rendering" "forall k :: true"
     (render_exp (D.DForall ([ ds "k" ], D.DTrue)));
-  check string "exists rendering" "existsk :: false"
+  check string "exists rendering" "exists k :: false"
     (render_exp (D.DExists ([ ds "k" ], D.DFalse)));
   check string "length rendering" "|x|" (render_exp (D.DLen (def_seg, id "x")));
   check string "old rendering" "old(x)" (render_exp (D.DOld (def_seg, id "x")));
@@ -1075,6 +1093,9 @@ let test_emitter_paths_and_sourcemaps () =
   check string "typed assignment rendering" "var y: int := 1;"
     (Transform.Emitdfy.print_stmt 0
        (D.DAssign (Some (D.DInt def_seg), [ ds "y" ], [ D.DIntLit "1" ])));
+  check string "typed declaration without initializer" "var z: int;"
+    (Transform.Emitdfy.print_stmt 0
+       (D.DAssign (Some (D.DInt def_seg), [ ds "z" ], [])));
   check string "typed assignment records declaration" "y;"
     (Transform.Emitdfy.print_stmt 0 (D.DAssign (None, [ ds "y" ], [])));
   check string "parameter rendering" "x: int"
@@ -1167,6 +1188,7 @@ let test_emitter_paths_and_sourcemaps () =
     ; D.DFuncMeth ([ D.DEnsures D.DTrue ], ds "f", [ "T" ], [], D.DInt def_seg, Some D.DTrue)
     ; D.DFuncMeth ([], ds "void_f", [], [], D.DVoid, None)
     ; D.DMeth ([ D.DRequires D.DTrue ], ds "m", [ "T" ], [ (ds "x", D.DInt def_seg) ], [ D.DInt def_seg ], Some [ D.DReturn [ D.DIntLit "1" ] ])
+    ; D.DMeth ([], ds "void_m", [], [], [ D.DVoid ], None)
     ]
   in
   let source = Transform.Emitdfy.print_prog (D.DProg ("", top_levels)) in
@@ -1175,6 +1197,8 @@ let test_emitter_paths_and_sourcemaps () =
   check string "emitter is repeatable" source source_again;
   let mapping = ref [ ((2, 3), segment "nearest"); ((1, 1), segment "other") ] in
   check string "nearest source map entry" "nearest" (seg_val (Transform.Emitdfy.nearest_seg !mapping 2 3));
+  check string "nearest source map with one entry" "nearest"
+    (seg_val (Transform.Emitdfy.nearest_seg [ ((2, 3), segment "nearest") ] 2 3));
   check string "empty source map fallback" "Line: 0  Column: 0" (print_seg (Transform.Emitdfy.nearest_seg [] 10 10));
   let ties = [ ((2, 1), segment "first"); ((2, 5), segment "second") ] in
   check string "nearest source map tie by column" "first" (seg_val (Transform.Emitdfy.nearest_seg ties 2 3));
@@ -1243,6 +1267,7 @@ let test_report_paths () =
     Buffer.contents buffer
   in
   check bool "report prints mapped diagnostics" true (has_substring reported "first");
+  Run.Report.report "verifier finished with 1 verified, 0 errors\n";
   Run.Report.verification_summary "verifier finished with 2 verified, 0 errors\n";
   expect_exception "malformed verifier summary" (function Run.Report.ReportError _ -> true | _ -> false)
     (fun () -> Run.Report.verification_summary "no summary\n")
@@ -1296,6 +1321,16 @@ let test_pipeline_system_and_exception_paths () =
   check int "shell command succeeds" 0 output.exit_code;
   check string "stdout is captured" "stdout" output.stdout;
   check string "stderr is captured" "stderr" output.stderr;
+  let read_attempts = ref 0 in
+  let read_with_interrupt _ _ _ _ =
+    incr read_attempts;
+    if !read_attempts = 1 then
+      raise (Unix.Unix_error (Unix.EINTR, "read", ""))
+    else 0
+  in
+  check int "interrupted reads are retried" 0
+    (Run.Pipeline.read_available read_with_interrupt Unix.stdin (Bytes.create 1));
+  check int "interrupted read is retried once" 2 !read_attempts;
   let signalled = Run.Pipeline.default_runner
       { program = "/bin/sh"; args = [ "-c"; "kill -TERM $$" ] }
   in

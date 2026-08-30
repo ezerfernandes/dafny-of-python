@@ -37,22 +37,20 @@ let rec exp_lst = function
     (als@[Assign (None, [Identifier n_ident], [new_list_call])], Identifier n_ident) (* TODO: use type of rhs *)
   | Tuple el -> 
     let als_nes = List.map ~f:exp_lst el in
-    List.fold als_nes ~f:(
-      fun (al1, lel) (al2, e) -> begin
-        match lel with
-        | Tuple el -> (al1@al2, Tuple (el@[e]))
-        | _ -> (al1, lel)
-        end
-    ) ~init:([], Tuple [])
+    let al, n_el =
+      List.fold als_nes
+        ~f:(fun (al1, n_el) (al2, e) -> (al1 @ al2, n_el @ [ e ]))
+        ~init:([], [])
+    in
+    (al, Tuple n_el)
   | Array el -> 
     let als_nes = List.map ~f:exp_lst el in
-    List.fold als_nes ~f:(
-      fun (al1, lel) (al2, e) -> begin
-        match lel with
-        | Array el -> (al1@al2, Array (el@[e]))
-        | _ -> (al1, lel)
-        end
-    ) ~init:([], Array [])
+    let al, n_el =
+      List.fold als_nes
+        ~f:(fun (al1, n_el) (al2, e) -> (al1 @ al2, n_el @ [ e ]))
+        ~init:([], [])
+    in
+    (al, Array n_el)
   | Len (s, e) -> 
     let al, n_e = exp_lst e in
     (al, Call (Dot (n_e, (fst s, Some "len")), []))

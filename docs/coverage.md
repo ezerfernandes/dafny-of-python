@@ -34,9 +34,9 @@ make coverage
 
 The gate removes stale `.coverage` files, forces every test to rerun under
 Bisect_ppx, checks that every maintained `.ml` file is present, emits an HTML
-report in `_coverage/html`, and requires OCaml expression-point coverage above
-95%. Python coverage is measured with pytest-cov, including branch coverage,
-and is also required to be above 95%. The verifier summary is
+report in `_coverage/html`, and requires exactly 100% OCaml expression-point
+coverage. Python coverage is measured with pytest-cov, including branch
+coverage, and is also required to be exactly 100%. The verifier summary is
 reported as Dafny emits it: its verified count includes `program.dfy`, the
 prelude, and the list runtime library. Error locations are remapped only when
 they correspond to generated-program source-map entries; runtime-library

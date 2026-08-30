@@ -52,6 +52,8 @@ def increment(x: int) -> int:
   return x + 1
 
 assert increment(1) == 2
+if exists k :: k == 0:
+  pass
 PYTHON
 
 set +e
@@ -67,9 +69,11 @@ set +e
 status=$?
 set -e
 
-test "$status" -eq 0
+test "$status" -eq 2
 grep -q 'function increment' "$workdir/output"
+grep -q 'exists k ::' "$workdir/output"
 grep -q 'verifier finished with [0-9][0-9]* verified, 0 error' "$workdir/output"
+grep -q 'Typechecking failed (exit code 2)' "$workdir/errors"
 # Dafny 4.11 reports harmless warnings (for example, an `old` expression that
 # does not dereference the heap) on stderr. A zero exit code and a zero-error
 # verifier summary are the validity checks; warnings are intentionally

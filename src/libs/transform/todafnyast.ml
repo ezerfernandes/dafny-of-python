@@ -159,13 +159,7 @@ let rec stmt_dfy = function
   | While (speclst, e, sl) -> DWhile (List.map ~f:spec_dfy speclst, exp_dfy e, List.map ~f:stmt_dfy sl)
   | For _ -> failwith "for loops are not supported"
   | Function _  -> assert false
-  | Exp e -> begin match e with
-    | Call (e, el) -> begin
-      let d_el = List.map ~f:exp_dfy el in
-      DCallStmt (exp_dfy e, d_el)
-    end
-    | _ -> failwith "non-call expressions are not allowed as statements"
-  end
+  | Exp _ -> failwith "non-call expressions are not allowed as statements"
 
 
 let convert_typsyn id rhs =
