@@ -52,8 +52,16 @@ let main () =
     ]
   in
   Arg.parse options (fun _ -> ()) "Translate typed Python from stdin to Dafny";
-  let prelude = Option.value !prelude_override ~default:(resource_path "prelude.dfy") in
-  let list_library = Option.value !list_override ~default:(resource_path "list.dfy") in
+  let prelude =
+    match !prelude_override with
+    | Some path -> path
+    | None -> resource_path "prelude.dfy"
+  in
+  let list_library =
+    match !list_override with
+    | Some path -> path
+    | None -> resource_path "list.dfy"
+  in
   let base_config = Run.Pipeline.default_config ~prelude ~list_library in
   let config =
     { base_config with

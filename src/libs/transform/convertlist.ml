@@ -153,7 +153,7 @@ let rec stmt_lst s =
     let n_specl = List.fold als_nspecl ~f:(fun so_far (_, n_spec) -> so_far@[n_spec]) ~init:[] in
     let als = List.fold als_nspecl ~f:(fun so_far (al, _) -> so_far@al) ~init:[] in
     let n_sl = List.fold sl ~f:(fun so_far s -> so_far@(stmt_lst s)) ~init:[] in
-    al@als@[While (n_specl, n_e, n_sl)]
+    al@als@[While (n_specl, n_e, n_sl @ als)]
   | Function (specl, i, pl, t, sl) ->
     let als_nspecl = List.map specl ~f:spec_lst in
     let n_specl = List.fold als_nspecl ~f:(fun so_far (_, n_spec) -> so_far@[n_spec]) ~init:[] in

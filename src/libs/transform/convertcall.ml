@@ -64,11 +64,12 @@ let rec exp_calls = function
         end
     )  ~init:([], Tuple [])
   | Forall (sl, e) ->
-    let al, n_e = exp_calls e in
-    (al, Forall (sl, n_e))
+    (* Calls inside a quantifier must remain inside its lexical scope.  An
+       assignment produced here would be emitted before the quantifier and
+       could refer to a bound variable that does not exist there. *)
+    ([], Forall (sl, e))
   | Exists (sl, e) ->
-    let al, n_e = exp_calls e in
-    (al, Exists (sl, n_e))
+    ([], Exists (sl, e))
   | Subscript (e1, e2) -> 
     let al1, n_e1 = exp_calls e1 in
     let al2, n_e2 = exp_calls e2 in
@@ -97,8 +98,7 @@ let rec exp_calls = function
     let al3, n_e2 = exp_calls e2 in
     (al1@al2@al3, IfElseExp (n_e1, n_c, n_e2))
   | Lambda (il, e) ->
-    let al, n_e = exp_calls e in
-    (al, Lambda (il, n_e))
+    ([], Lambda (il, e))
   | e -> ([], e) 
   
 let assign_to_inv = function
@@ -153,13 +153,12 @@ let rec stmt_calls s =
     (* let n_specl = List.fold n_specll ~f:(fun so_far specl -> so_far@[specl]) ~init:[] in *)
     let als = List.fold als_nspecll ~f:(fun so_far (al, _) -> so_far@al) ~init:[] in
     let n_sl = List.fold sl ~f:(fun so_far s -> so_far@(stmt_calls s)) ~init:[] in
-    al@als@[While (n_specl, n_e, n_sl)]
+    al@als@[While (n_specl, n_e, n_sl @ als)]
   | Function (specl, i, pl, t, sl) ->
-    let als_nspecl = List.map specl ~f:spec_calls in
-    let n_specl = List.fold als_nspecl ~f:(fun so_far (_, specs) -> so_far @ specs) ~init:[] in
-    let als = List.fold als_nspecl ~f:(fun so_far (al, _) -> so_far @ al) ~init:[] in
+    (* Function specifications are evaluated in the function's scope.  Do
+       not hoist their calls into declarations preceding the function. *)
     let n_sl = List.fold sl ~f:(fun so_far s -> so_far@(stmt_calls s)) ~init:[] in
-    als @ [Function (n_specl, i, pl, t, n_sl)]
+    [Function (specl, i, pl, t, n_sl)]
   | For (specl, il, e, sl) ->
     let als_nspecl = List.map specl ~f:spec_calls in
     let n_specl = List.fold als_nspecl ~f:(fun so_far (_, specs) -> so_far @ specs) ~init:[] in

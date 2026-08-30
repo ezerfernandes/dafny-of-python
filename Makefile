@@ -21,7 +21,7 @@ endif
 
 .PHONY: help setup uv-sync opam-switch opam-install build ocaml-build \
         python-test ocaml-test test python-coverage ocaml-coverage coverage \
-        integration run clean
+        real-integration integration run clean
 
 help:
 	@printf '%s\n' \
@@ -31,7 +31,8 @@ help:
 	  'make ocaml-test     Run the Dune/Alcotest suite and CLI checks' \
 	  'make test           Run Python and OCaml tests' \
 	  'make coverage       Run Python and OCaml coverage gates' \
-	  'make integration     Build and run the integration checks' \
+	  'make real-integration Run the real mypy/Dafny smoke test' \
+	  'make integration     Build and run all integration checks' \
 	  'make run FILE=x.py  Translate FILE with the CLI' \
 	  'make clean           Remove generated build and coverage output'
 
@@ -57,7 +58,7 @@ opam-install: opam-switch
 	  :; \
 	else \
 	  $(OPAM) install . --deps-only --locked --yes; \
-	  $(OPAM) install alcotest bisect_ppx.2.8.3 --yes; \
+	  $(OPAM) install alcotest.1.9.1 bisect_ppx.2.8.3 --yes; \
 	fi
 
 setup: uv-sync opam-install
@@ -77,14 +78,21 @@ test: python-test ocaml-test
 
 python-coverage:
 	$(UV_RUN) $(PYTEST) -q test/python \
-		--cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=95
+		--cov=scripts --cov-branch --cov-report=term-missing --cov-fail-under=95.01
 
 ocaml-coverage:
-	$(OCAML_ENV) ./scripts/coverage.sh
+	@if test -x "$(LOCAL_OPAM_BIN)/dune"; then \
+	  $(OCAML_ENV) ./scripts/coverage.sh; \
+	else \
+	  $(OPAM_EXEC) ./scripts/coverage.sh; \
+	fi
 
 coverage: python-coverage ocaml-coverage
 
-integration: build ocaml-test
+real-integration: build
+	$(OCAML_EXEC) build @real-integration
+
+integration: test real-integration
 
 run:
 	@test -n "$(FILE)" || { printf '%s\n' 'Usage: make run FILE=program.py' >&2; exit 2; }

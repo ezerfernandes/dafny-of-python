@@ -456,6 +456,10 @@ let test_convertlist_paths () =
 let test_convertlist_statement_paths () =
   let open Ast in
   let x = identifier "x" in
+  Transform.Convertlist.reset ();
+  (match Transform.Convertlist.stmt_lst (While ([ Invariant (Lst [ x ]) ], x, [ Pass ])) with
+   | [ Assign _; While (_, _, [ Pass; Assign _ ]) ] -> ()
+   | _ -> fail "list invariant helper should be refreshed after the body");
   List.iter
     (fun spec -> ignore (Transform.Convertlist.spec_lst spec))
     [ Pre x; Post x; Invariant x; Decreases x; Reads x; Modifies x ];
@@ -482,10 +486,17 @@ let test_convertcall_and_convertfor_paths () =
    | _ -> fail "outer call should use the second temporary");
   Transform.Convertcall.reset ();
   let quantifier = Forall ([ segment "k" ], Call (identifier "h", [])) in
-  let _, rewritten_quantifier = Transform.Convertcall.exp_calls quantifier in
+  let quantifier_assignments, rewritten_quantifier = Transform.Convertcall.exp_calls quantifier in
+  check int "quantifier calls stay scoped" 0 (List.length quantifier_assignments);
   (match rewritten_quantifier with
-   | Forall (_, Identifier (_, Some "tempcall_1")) -> ()
-   | _ -> fail "calls in quantifiers should be rewritten");
+   | Forall (_, Call _) -> ()
+   | _ -> fail "calls in quantifiers should stay scoped");
+  let lambda = Lambda ([ segment "k" ], Call (identifier "h", [])) in
+  let lambda_assignments, rewritten_lambda = Transform.Convertcall.exp_calls lambda in
+  check int "lambda calls stay scoped" 0 (List.length lambda_assignments);
+  (match rewritten_lambda with
+   | Lambda (_, Call _) -> ()
+   | _ -> fail "calls in lambdas should stay scoped");
   Transform.Convertcall.reset ();
   let fresh = Fresh (def_seg, Call (identifier "fresh_value", [])) in
   let _, rewritten_fresh = Transform.Convertcall.exp_calls fresh in
@@ -515,8 +526,9 @@ let test_convertcall_and_convertfor_paths () =
     Function ([ Pre (Call (identifier "guard", [])) ], segment "f", [], Typ (TInt def_seg), [ Exp nested ])
   in
   (match Transform.Convertcall.prog (Program [ function_with_spec ]) with
-   | Program (Assign _ :: Function (specs, _, _, _, _) :: _) ->
-     check bool "function spec call assignment" true (List.length specs > 0)
+   | Program [ Function ([ Pre (Call _) ], _, _, _, body) ] ->
+     check bool "function body remains transformable" true
+       (List.exists (function Assign _ -> true | _ -> false) body)
    | _ -> fail "function call conversion should preserve function");
   ignore (Transform.Convertcall.prog (Program [ IfElse (nested, [ Exp nested ], [ (nested, [ Pass ]) ], [ Return nested ]) ]))
 
@@ -563,6 +575,12 @@ let test_convertcall_expression_paths () =
   List.iter
     (fun spec -> ignore (Transform.Convertcall.spec_calls spec))
     [ Pre x; Post x; Invariant x; Decreases x; Reads x; Modifies x ];
+  let while_with_call_invariant =
+    While ([ Invariant (Call (identifier "bound", [])) ], x, [ Pass ])
+  in
+  (match Transform.Convertcall.stmt_calls while_with_call_invariant with
+   | [ Assign _; While (_, _, [ Pass; Assign _ ]) ] -> ()
+   | _ -> fail "call invariant helper should be refreshed after the body");
   let statements =
     [ Pass; Break; Continue; Exp x; Assign (None, [ x ], [ x ])
     ; IfElse (x, [ Pass ], [ (x, [ Break ]) ], [ Continue ])

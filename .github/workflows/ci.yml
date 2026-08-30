@@ -29,7 +29,7 @@ jobs:
       - name: Install OCaml dependencies
         run: |
           opam install . --deps-only --locked --yes
-          opam install alcotest bisect_ppx.2.8.3 --yes
+          opam install alcotest.1.9.1 bisect_ppx.2.8.3 --yes
 
       - name: Install pinned Dafny
         run: |
@@ -40,10 +40,13 @@ jobs:
         run: uv run --frozen -- opam exec -- dune build @all --profile dev
 
       - name: Run unit and integration tests
-        run: uv run --frozen -- opam exec -- dune runtest
+        run: make test
+
+      - name: Run real-tool integration smoke test
+        run: REQUIRE_REAL_TOOLS=1 make real-integration
 
       - name: Enforce exact coverage
-        run: uv run --frozen -- opam exec -- ./scripts/coverage.sh
+        run: make coverage
 
       - name: Upload coverage HTML
         if: always()

@@ -37,9 +37,14 @@ chmod +x "$workdir/mypy-fails" "$workdir/mypy-succeeds" "$workdir/dafny-succeeds
 grep -q -- '--prelude' "$workdir/help.out"
 test ! -s "$workdir/help.err"
 
+# Explicit runtime paths must work even when the executable is isolated from
+# both the source tree and an installed runtime directory.
+explicit_exe="$workdir/explicit-main.exe"
+cp "$main_exe" "$explicit_exe"
+
 export DAFNY_OF_PYTHON_DAFNY_ARGS="$workdir/dafny.args"
 set +e
-(cd "$workdir" && printf 'x = 1\n' | "$main_exe" \
+(cd "$workdir" && printf 'x = 1\n' | "$explicit_exe" \
   --mypy "$workdir/mypy-fails" \
   --dafny "$workdir/dafny-succeeds" \
   --prelude "$prelude" \

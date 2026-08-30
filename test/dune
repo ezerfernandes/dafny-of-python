@@ -14,3 +14,16 @@
     %{exe:../src/bin/main.exe}
     %{dep:../src/libs/run/prelude.dfy}
     %{dep:../src/libs/run/list.dfy})))
+
+(rule
+ (alias real-integration)
+ (deps
+  real_tool_test.sh
+  %{exe:../src/bin/main.exe}
+  %{dep:../src/libs/run/prelude.dfy}
+  %{dep:../src/libs/run/list.dfy})
+ (action
+  (run ./real_tool_test.sh
+    %{exe:../src/bin/main.exe}
+    %{dep:../src/libs/run/prelude.dfy}
+    %{dep:../src/libs/run/list.dfy})))

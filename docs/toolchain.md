@@ -18,7 +18,7 @@ The local Opam switch is created with:
 ```sh
 opam switch create . 4.14.2
 opam install . --deps-only --locked
-opam install alcotest bisect_ppx.2.8.3
+opam install alcotest.1.9.1 bisect_ppx.2.8.3
 ```
 
 The separate test-tool install is intentional: `bisect_ppx.2.8.3` publishes an

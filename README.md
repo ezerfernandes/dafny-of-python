@@ -35,8 +35,8 @@ Install the locked Python dependency and enter the pinned Opam environment:
 ```
 uv sync --frozen
 opam switch create . 4.14.2
-opam install . --deps-only
-opam install alcotest bisect_ppx.2.8.3
+opam install . --deps-only --locked
+opam install alcotest.1.9.1 bisect_ppx.2.8.3
 ```
 
 Translate a Python program from standard input. The command uses the pinned
@@ -74,6 +74,7 @@ make python-test
 make ocaml-test
 make test
 make coverage
+make real-integration
 make run FILE=program.py
 ```
 
@@ -86,7 +87,10 @@ coverage gates require results strictly above 95%. See
 exclusions.
 
 CI installs the pinned Dafny tool, synchronizes uv with `--frozen`, creates the
-Opam environment, runs the ordinary suite, and enforces the coverage gate.
+Opam environment, runs the ordinary suite plus a real mypy/Dafny smoke test,
+and enforces the coverage gate. `make real-integration` skips locally when the
+real Dafny executable is unavailable; CI sets `REQUIRE_REAL_TOOLS=1` so the
+check cannot silently skip there.
 ## Examples
 ### Type Variables and Aliases
 ```Python
