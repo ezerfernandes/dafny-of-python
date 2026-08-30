@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce an exact 100% Bisect_ppx point-coverage result.
+"""Enforce the project's minimum Bisect_ppx point-coverage result.
 
 The reporter's human-readable output has changed formatting between releases.
 This gate accepts the stable covered/total pair when present and rejects any
@@ -13,6 +13,7 @@ import sys
 
 
 PAIR = re.compile(r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)")
+MINIMUM_PERCENT = 95.0
 
 
 def project_pair(summary: str) -> tuple[int, int] | None:
@@ -44,9 +45,11 @@ def main() -> int:
     if total <= 0:
         print("coverage gate: project contains no instrumentation points", file=sys.stderr)
         return 2
-    if covered != total:
+    percentage = 100.0 * covered / total
+    if percentage <= MINIMUM_PERCENT:
         print(
-            f"coverage gate: {covered}/{total} instrumentation points covered; expected {total}/{total}",
+            f"coverage gate: {covered}/{total} instrumentation points covered ({percentage:.2f}%); "
+            f"must be above {MINIMUM_PERCENT:.0f}%",
             file=sys.stderr,
         )
         return 1

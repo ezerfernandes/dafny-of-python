@@ -91,6 +91,27 @@ let segment ?(line = 1) ?(column = 1) name =
 
 let identifier ?line ?column name = Ast.Identifier (segment ?line ?column name)
 
+module Raw_parser_for_test = struct
+  type token = string
+  type result = string
+  exception LexError of string
+  exception ParseError
+
+  type mode = Ok | Lex | Parse
+  let mode = ref Ok
+
+  let next_token _ = "next"
+  let indent _ = "indent"
+  let parse next lexbuf =
+    let token = next lexbuf in
+    match !mode with
+    | Ok -> token
+    | Lex -> raise (LexError "bad token")
+    | Parse -> raise ParseError
+end
+
+module Nice_parser_for_test = Pyparse.Nice_parser.Make (Raw_parser_for_test)
+
 let parse_file_round_trip () =
   let path = Filename.temp_file "dafny-of-python-parser-" ".py" in
   Fun.protect
@@ -150,7 +171,48 @@ let test_parser_entry_points_and_errors () =
      ignore (Pyparse.Parser.parse_string "def broken(:\n");
      fail "malformed syntax should raise Parser.ParseError"
    with
-   | Pyparse.Parser.ParseError _ -> ())
+     | Pyparse.Parser.ParseError _ -> ())
+
+let test_nice_parser_wrapper_paths () =
+  let module P = Nice_parser_for_test in
+  let expect name predicate f =
+    try
+      ignore (f ());
+      fail (name ^ " should raise")
+    with
+    | exn when predicate exn -> ()
+    | exn -> fail (name ^ " raised " ^ Printexc.to_string exn)
+  in
+  P.pp_exceptions ();
+  (match Location.error_of_exn (P.LexError { msg = "bad"; loc = Location.none }) with
+   | Some (`Ok _) -> ()
+   | _ -> fail "LexError should be rendered by the location printer");
+  (match Location.error_of_exn (P.ParseError { token = "token"; loc = Location.none }) with
+   | Some (`Ok _) -> ()
+   | _ -> fail "ParseError should be rendered by the location printer");
+  ignore (Printexc.to_string (P.LexError { msg = "bad"; loc = Location.none }));
+  ignore (Printexc.to_string (Failure "ordinary"));
+  Raw_parser_for_test.mode := Ok;
+  check string "raw parser result" "indent" (P.parse_string "input");
+  let position = { Lexing.dummy_pos with pos_fname = "position.py"; pos_lnum = 3 } in
+  ignore (P.parse_string ~pos:position "input");
+  let channel_path = Filename.temp_file "dafny-of-python-nice-parser-" ".txt" in
+  Fun.protect
+    ~finally:(fun () -> if Sys.file_exists channel_path then Sys.remove channel_path)
+    (fun () ->
+       Stdio.Out_channel.write_all channel_path ~data:"input";
+       In_channel.with_open_bin channel_path (fun channel ->
+         check string "channel parser result" "indent" (P.parse_chan channel));
+       In_channel.with_open_bin channel_path (fun channel ->
+         ignore (P.parse_chan ~pos:position channel));
+       check string "file parser result" "indent" (P.parse_file channel_path));
+  Raw_parser_for_test.mode := Lex;
+  expect "wrapped lexical error" (function P.LexError _ -> true | _ -> false)
+    (fun () -> P.parse_string "input");
+  Raw_parser_for_test.mode := Parse;
+  expect "wrapped parse error" (function P.ParseError _ -> true | _ -> false)
+    (fun () -> P.parse_string "input");
+  Raw_parser_for_test.mode := Ok
 
 let test_parser_expression_and_type_forms () =
   let forms =
@@ -239,11 +301,86 @@ let test_ast_utilities () =
   check string "segment without value" "" (seg_val def_seg);
   check string "position" "Line: 2  Column: 3" (print_pos (fst (new_seg 2 3 None)));
   check string "segment update" "new" (seg_val (update_seg_val (segment "old") (Some "new")));
+  check int "segment values compare" 0 (seg_val_compare (segment "same") (segment "same"));
+  ignore (seg_pos (segment "position"));
+  ignore (sexp_of_pos (fst (segment "position")));
+  ignore (sexp_of_segment (segment "position"));
+  ignore (sexp_of_linecol (2, 3));
+  ignore (sexp_of_sourcemap (ref [ ((2, 3), segment "position") ]));
   (try
      ignore (idlst_to_id [ Literal (IntLit "1") ]);
      fail "invalid identifier lists should raise"
    with
    | Pyparse.Astpy.PyAstError _ -> ())
+
+let test_ast_serializers_and_subtyping () =
+  let open Ast in
+  let s = def_seg in
+  let primitive_types =
+    [ TIdent s; TInt s; TFloat s; TBool s; TStr s; TNone s; TObj s ]
+  in
+  let all_types =
+    primitive_types
+    @ [ TLst (s, Some (TInt s)); TLst (s, None)
+      ; TDict (s, Some (TInt s), Some (TStr s)); TDict (s, None, Some (TStr s))
+      ; TSet (s, Some (TInt s)); TTuple (s, Some primitive_types); TTuple (s, None)
+      ; TCallable (s, primitive_types, TInt s); TType (s, Some (TInt s))
+      ]
+  in
+  List.iter (fun typ -> ignore (sexp_of_typ typ)) all_types;
+  List.iter (fun value -> ignore (sexp_of_unaryop value)) [ Not s; UMinus s ];
+  List.iter
+    (fun value -> ignore (sexp_of_literal value))
+    [ TrueLit; FalseLit; IntLit "1"; FloatLit "1.0"; StringLit "s"; NoneLit ];
+  let operators =
+    [ Plus s; Minus s; Times s; Divide s; Mod s; EqEq s; NEq s; Lt s; LEq s
+    ; Gt s; GEq s; And s; Or s; NotIn s; In s; BiImpl s; Implies s; Explies s ]
+  in
+  List.iter (fun value -> ignore (sexp_of_binaryop value)) operators;
+  let x = Identifier s in
+  let expressions =
+    [ Typ (TInt s); Literal TrueLit; x; Dot (x, s); BinaryExp (x, Plus s, x)
+    ; UnaryExp (Not s, x); Call (x, [ x ]); Lst [ x ]; Array [ x ]; Set [ x ]
+    ; Dict [ (x, x) ]; Tuple [ x ]; Subscript (x, x); Index x
+    ; Slice (Some x, Some x); Forall ([ s ], x); Exists ([ s ], x)
+    ; Len (s, x); Max (s, x); Old (s, x); Fresh (s, x); Lambda ([ s ], x)
+    ; IfElseExp (x, x, x); Slice (Some x, None); Slice (None, Some x)
+    ; Slice (None, None)
+    ]
+  in
+  List.iter (fun value -> ignore (sexp_of_exp value)) expressions;
+  List.iter (fun value -> ignore (sexp_of_identifier value)) [ s ];
+  List.iter (fun value -> ignore (sexp_of_param value)) [ (s, x) ];
+  List.iter
+    (fun value -> ignore (sexp_of_spec value))
+    [ Pre x; Post x; Invariant x; Decreases x; Reads x; Modifies x ];
+  let statements =
+    [ IfElse (x, [ Pass ], [ (x, [ Break ]) ], [ Continue ])
+    ; For ([], [ s ], x, [ Pass ]); While ([], x, [ Pass ])
+    ; Assign (Some (Typ (TInt s)), [ x ], [ x ]); Function ([], s, [ (s, x) ], x, [ Pass ])
+    ; Return x; Assert x; Break; Continue; Pass; Exp x
+    ]
+  in
+  List.iter (fun value -> ignore (sexp_of_stmt value)) statements;
+  ignore (sexp_of_program (Program statements));
+  check bool "identical primitive types are subtypes" true (subtyp (TBool s) (TBool s));
+  check bool "different primitive types are not subtypes" false (subtyp (TBool s) (TStr s));
+  check bool "identifiers are not concrete subtypes" false (subtyp (TIdent s) (TIdent s));
+  check bool "untyped lists compare as equal" true (eqtyp (TLst (s, None)) (TLst (s, None)));
+  check bool "untyped dictionaries compare as equal" true
+    (eqtyp (TDict (s, None, None)) (TDict (s, None, None)));
+  check bool "tuple None option compares as equal" true
+    (eqtyp (TTuple (s, None)) (TTuple (s, None)));
+  check bool "tuple option mismatch" false
+    (subtyp (TTuple (s, Some [ TInt s ])) (TTuple (s, None)));
+  check bool "tuple element mismatch" false
+    (subtyp (TTuple (s, Some [ TFloat s ])) (TTuple (s, Some [ TInt s ])));
+  check bool "set option mismatch" false
+    (subtyp (TSet (s, Some (TInt s))) (TSet (s, None)));
+  check bool "string types are subtypes" true (subtyp (TStr s) (TStr s));
+  check bool "none types are subtypes" true (subtyp (TNone s) (TNone s));
+  check bool "untyped tuple mismatch" false
+    (subtyp (TTuple (s, None)) (TTuple (s, Some [ TInt s ])))
 
 let expect_exception name predicate f =
   try
@@ -316,6 +453,23 @@ let test_convertlist_paths () =
   expect_exception "invalid subscript" (function Ast.PyAstError _ -> true | _ -> false)
     (fun () -> Transform.Convertlist.exp_lst (Subscript (xs, Literal (IntLit "1"))))
 
+let test_convertlist_statement_paths () =
+  let open Ast in
+  let x = identifier "x" in
+  List.iter
+    (fun spec -> ignore (Transform.Convertlist.spec_lst spec))
+    [ Pre x; Post x; Invariant x; Decreases x; Reads x; Modifies x ];
+  List.iter
+    (fun statement -> ignore (Transform.Convertlist.stmt_lst statement))
+    [ Pass; Break; Continue; Exp x; Assert x
+    ; Assign (None, [ x ], [ Lst [ x ] ])
+    ; IfElse (x, [ Pass ], [ (x, [ Break ]) ], [ Assert x ])
+    ; Return x
+    ; While ([ Invariant x ], x, [ Pass ])
+    ; For ([ Post x ], [ segment "i" ], x, [ Pass ])
+    ; Function ([ Reads x ], segment "f", [], Typ (TInt def_seg), [ Pass ])
+    ]
+
 let test_convertcall_and_convertfor_paths () =
   let open Ast in
   let f = identifier "f" in
@@ -386,9 +540,29 @@ let test_convertcall_expression_paths () =
     ; Fresh (def_seg, x)
     ; Exists ([ segment "k" ], x)
     ; IfElseExp (x, Literal TrueLit, x)
+    ; Lambda ([ segment "k" ], x)
     ]
   in
   List.iter (fun expression -> ignore (Transform.Convertcall.exp_calls expression)) expressions;
+  List.iter
+    (fun primary ->
+       Transform.Convertcall.reset ();
+       ignore (Transform.Convertcall.exp_calls (Call (primary, []))))
+    [ Dot (x, segment "field")
+    ; Call (x, [])
+    ; Subscript (x, Index (Literal (IntLit "0")))
+    ; IfElseExp (x, Literal TrueLit, x)
+    ];
+  Transform.Convertcall.reset ();
+  ignore (Transform.Convertcall.exp_calls (Call (Identifier def_seg, [])));
+  expect_exception "invalid call primary" (function Ast.PyAstError _ -> true | _ -> false)
+    (fun () -> Transform.Convertcall.exp_calls (Call (Literal TrueLit, [])));
+  ignore (Transform.Convertcall.assign_to_inv (Assign (None, [ x ], [ x ])));
+  expect_exception "non-assignment invariant" (function Ast.PyAstError _ -> true | _ -> false)
+    (fun () -> Transform.Convertcall.assign_to_inv Pass);
+  List.iter
+    (fun spec -> ignore (Transform.Convertcall.spec_calls spec))
+    [ Pre x; Post x; Invariant x; Decreases x; Reads x; Modifies x ];
   let statements =
     [ Pass; Break; Continue; Exp x; Assign (None, [ x ], [ x ])
     ; IfElse (x, [ Pass ], [ (x, [ Break ]) ], [ Continue ])
@@ -398,6 +572,17 @@ let test_convertcall_expression_paths () =
     ]
   in
   List.iter (fun statement -> ignore (Transform.Convertcall.stmt_calls statement)) statements
+
+let test_convertfor_statement_paths () =
+  let open Ast in
+  let x = identifier "x" in
+  List.iter
+    (fun statement -> ignore (Transform.Convertfor.stmt_for statement))
+    [ Pass; Exp x; Break; Continue; Assign (None, [ x ], [ x ]); Return x; Assert x
+    ; IfElse (x, [ Pass ], [ (x, [ Assert x ]) ], [ Break ])
+    ; While ([], x, [ Pass ])
+    ; Function ([], segment "f", [], Typ (TInt def_seg), [ Pass ])
+    ]
 
 let test_generics_paths () =
   let open Ast in
@@ -415,7 +600,17 @@ let test_generics_paths () =
   expect_exception "constrained TypeVar" (function Ast.PyAstError _ -> true | _ -> false)
     (fun () -> Transform.Generics.prog (Program [ Assign (None, [ identifier "T" ], [ Call (identifier "TypeVar", [ Literal (StringLit "T"); Literal (IntLit "1") ]) ]) ]));
   expect_exception "unequal generic assignment" (function Ast.PyAstError _ -> true | _ -> false)
-    (fun () -> Transform.Generics.generics (Assign (None, [ identifier "x" ], [])))
+    (fun () -> Transform.Generics.generics (Assign (None, [ identifier "x" ], [])));
+  check bool "non-TypeVar call is ignored" true
+    (Option.is_none (Transform.Generics.convert_typvar (identifier "T") (Call (identifier "Other", []))));
+  check bool "unknown generic identifier is ignored" true
+    (Option.is_none (Transform.Generics.convert_typvar (identifier "U") (identifier "Unknown")));
+  check bool "non-assignment is preserved" true
+    (Option.is_some (fst (Transform.Generics.generics Pass)));
+  check bool "non-identifier lhs is ignored" true
+    (Option.is_none (Transform.Generics.convert_typvar (Literal TrueLit) (identifier "T")));
+  expect_exception "mismatched TypeVar name" (function Ast.PyAstError _ -> true | _ -> false)
+    (fun () -> Transform.Generics.convert_typvar (identifier "U") (type_var "T"))
 
 let test_todafnyast_paths () =
   let open Ast in
@@ -488,6 +683,16 @@ let test_todafnyast_paths () =
     ]
   in
   List.iter (fun expression -> ignore (Transform.Todafnyast.exp_dfy expression)) expressions;
+  let all_operators =
+    [ NotIn def_seg; In def_seg; Plus def_seg; Minus def_seg; Times def_seg
+    ; Divide def_seg; Mod def_seg; NEq def_seg; EqEq def_seg; Lt def_seg
+    ; LEq def_seg; Gt def_seg; GEq def_seg; And def_seg; Or def_seg
+    ; BiImpl def_seg; Implies def_seg; Explies def_seg ]
+  in
+  List.iter
+    (fun operator -> ignore (Transform.Todafnyast.exp_dfy (BinaryExp (x, operator, y))))
+    all_operators;
+  ignore (Transform.Todafnyast.exp_dfy (UnaryExp (UMinus def_seg, x)));
   expect_exception "non-None type expression" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
     (fun () -> Transform.Todafnyast.exp_dfy (Typ int_typ));
   List.iter
@@ -516,6 +721,8 @@ let test_todafnyast_paths () =
     (fun () -> Transform.Todafnyast.stmt_dfy (For ([], [], x, [])));
   expect_exception "non-call expression statement" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
     (fun () -> Transform.Todafnyast.stmt_dfy (Exp x));
+  expect_exception "invalid assignment type" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
+    (fun () -> Transform.Todafnyast.stmt_dfy (Assign (Some (Literal TrueLit), [ x ], [ x ])));
   expect_exception "function statement" (function Assert_failure _ -> true | _ -> false)
     (fun () -> Transform.Todafnyast.stmt_dfy (Function ([], segment "f", [], Typ int_typ, [])));
   Transform.Todafnyast.reset ();
@@ -525,6 +732,12 @@ let test_todafnyast_paths () =
   (match Transform.Todafnyast.convert_typsyn (Identifier (segment "Alias2")) (Identifier (segment "Alias")) with
    | Some (D.DTypSynonym _) -> ()
    | _ -> fail "a type alias should resolve to a known synonym");
+  check bool "unknown type alias is ignored" true
+    (Option.is_none (Transform.Todafnyast.convert_typsyn (Identifier (segment "Unknown2")) (Identifier (segment "Unknown"))));
+  check bool "None type alias is ignored" true
+    (Option.is_none (Transform.Todafnyast.convert_typsyn (Identifier (segment "Nothing")) (Typ (TNone def_seg))));
+  check bool "non-identifier type alias is ignored" true
+    (Option.is_none (Transform.Todafnyast.convert_typsyn (Literal TrueLit) (Typ int_typ)));
   check bool "None is not a top-level declaration" false
     (Transform.Todafnyast.is_toplevel (Assign (None, [ x ], [ Typ (TNone def_seg) ])));
   check bool "typed assignment is a top-level declaration" true
@@ -537,8 +750,13 @@ let test_todafnyast_paths () =
   ignore (Transform.Todafnyast.func_dfy [] function_return);
   ignore (Transform.Todafnyast.func_dfy [] function_exp);
   ignore (Transform.Todafnyast.func_dfy [] function_pass);
+  check bool "return function is recognized" true (Transform.Todafnyast.is_func function_return);
+  check bool "expression function is recognized" true (Transform.Todafnyast.is_func function_exp);
+  check bool "pass function is recognized" true (Transform.Todafnyast.is_func function_pass);
+  check bool "ordinary statement is not a function" false (Transform.Todafnyast.is_func Pass);
   ignore (Transform.Todafnyast.toplevel_dfy [] function_return);
   ignore (Transform.Todafnyast.toplevel_dfy [] (Assign (None, [ x ], [ Typ int_typ ])));
+  ignore (Transform.Todafnyast.toplevel_dfy [] Pass);
   expect_exception "unequal top-level declaration" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
     (fun () -> Transform.Todafnyast.toplevel_dfy [] (Assign (None, [ x; y ], [ Typ int_typ ])));
   ignore (Transform.Todafnyast.prog_dfy (Program [ function_return; Assign (None, [ x ], [ Literal (IntLit "1") ]) ]))
@@ -602,13 +820,19 @@ let test_emitter_paths_and_sourcemaps () =
   in
   Transform.Emitdfy.reset ();
   List.iter (fun statement -> ignore (Transform.Emitdfy.print_stmt 0 statement)) statements;
+  Transform.Emitdfy.reset ();
+  ignore (Transform.Emitdfy.print_stmt 0 (D.DAssign (None, [ ds "x" ], [ D.DIntLit "1" ])));
+  ignore (Transform.Emitdfy.print_stmt 0 (D.DAssign (None, [ ds "x" ], [ D.DIntLit "2" ])));
+  ignore (Transform.Emitdfy.print_stmt 0 (D.DIf (D.DTrue, [ D.DBreak ], [], [])));
   ignore (Transform.Emitdfy.print_rets 0 []);
   ignore (Transform.Emitdfy.print_rets 0 [ D.DVoid ]);
   ignore (Transform.Emitdfy.print_rets 0 [ D.DInt def_seg ]);
   let top_levels =
     [ D.DTypSynonym (ds "Alias", Some (D.DInt def_seg))
+    ; D.DTypSynonym (ds "BareAlias", None)
     ; D.DFuncMeth ([ D.DEnsures D.DTrue ], ds "f", [ "T" ], [], D.DInt def_seg, Some D.DTrue)
-    ; D.DMeth ([ D.DRequires D.DTrue ], ds "m", [], [ (ds "x", D.DInt def_seg) ], [ D.DInt def_seg ], Some [ D.DReturn [ D.DIntLit "1" ] ])
+    ; D.DFuncMeth ([], ds "void_f", [], [], D.DVoid, None)
+    ; D.DMeth ([ D.DRequires D.DTrue ], ds "m", [ "T" ], [ (ds "x", D.DInt def_seg) ], [ D.DInt def_seg ], Some [ D.DReturn [ D.DIntLit "1" ] ])
     ]
   in
   let source = Transform.Emitdfy.print_prog (D.DProg ("", top_levels)) in
@@ -618,6 +842,10 @@ let test_emitter_paths_and_sourcemaps () =
   let mapping = ref [ ((2, 3), segment "nearest"); ((1, 1), segment "other") ] in
   check string "nearest source map entry" "nearest" (seg_val (Transform.Emitdfy.nearest_seg !mapping 2 3));
   check string "empty source map fallback" "Line: 0  Column: 0" (print_seg (Transform.Emitdfy.nearest_seg [] 10 10));
+  let ties = [ ((2, 1), segment "first"); ((2, 5), segment "second") ] in
+  check string "nearest source map tie by column" "first" (seg_val (Transform.Emitdfy.nearest_seg ties 2 3));
+  let closer = [ ((2, 1), segment "first"); ((2, 5), segment "second") ] in
+  check string "nearest source map closer column" "second" (seg_val (Transform.Emitdfy.nearest_seg closer 2 6));
   ignore (Transform.Emitdfy.print_sourcemap !mapping)
 
 let test_report_paths () =
@@ -628,6 +856,11 @@ let test_report_paths () =
    | None -> fail "verification error should be recognized");
   check bool "non-error output has no locations" true
     (Option.is_none (Run.Report.verification_errors ~sourcemap:source_map "verified\n"));
+  ignore (Run.Report.replace_num ~sourcemap:source_map "no numeric location");
+  ignore (Run.Report.replace_num "1,2");
+  ignore (Run.Report.verification_errors "verified\n");
+  Run.Report.report ~sourcemap:source_map
+    (output ^ "verifier finished with 2 verified, 0 errors\n");
   Run.Report.verification_summary "verifier finished with 2 verified, 0 errors\n";
   expect_exception "malformed verifier summary" (function Run.Report.ReportError _ -> true | _ -> false)
     (fun () -> Run.Report.verification_summary "no summary\n")
@@ -672,24 +905,61 @@ let test_pipeline_failure_and_artifact_paths () =
   in
   check int "mypy failure status" 2 (Run.Pipeline.exit_code typecheck_only_failure)
 
+let test_pipeline_system_and_exception_paths () =
+  let output = Run.Pipeline.default_runner
+      { program = "/bin/sh"; args = [ "-c"; "printf stdout; printf stderr >&2" ] }
+  in
+  check int "shell command succeeds" 0 output.exit_code;
+  check string "stdout is captured" "stdout" output.stdout;
+  check string "stderr is captured" "stderr" output.stderr;
+  let signalled = Run.Pipeline.default_runner
+      { program = "/bin/sh"; args = [ "-c"; "kill -TERM $$" ] }
+  in
+  check bool "signalled command has non-zero status" true (signalled.exit_code <> 0);
+  let read_fd, write_fd = Unix.pipe () in
+  Unix.close read_fd;
+  Run.Pipeline.close_noerr write_fd;
+  Run.Pipeline.close_noerr write_fd;
+  ignore (Run.Pipeline.status_code (Unix.WSIGNALED 2));
+  ignore (Run.Pipeline.status_code (Unix.WSTOPPED 2));
+  Run.Pipeline.remove_file "/definitely/missing/dafny-of-python-file";
+  Run.Pipeline.cleanup_directory
+    { (Run.Pipeline.default_config ~prelude:"prelude" ~list_library:"list") with keep_artifacts = false }
+    "/definitely/missing/dafny-of-python-directory" [];
+  let root = Filename.temp_file "dafny-of-python-exception-" ".tmp" in
+  Sys.remove root;
+  Unix.mkdir root 0o700;
+  let base = Run.Pipeline.default_config ~prelude:"prelude.dfy" ~list_library:"list.dfy" in
+  let exploding _ = failwith "runner exploded" in
+  let config = { base with temp_root = Some root; runner = exploding } in
+  expect_exception "runner exceptions are re-raised" (function Failure _ -> true | _ -> false)
+    (fun () -> Run.Pipeline.run ~config "x = 1\n");
+  check bool "exception cleanup removes temporary files" true (Array.length (Sys.readdir root) = 0);
+  Unix.rmdir root
+
 let () =
   run "dafny-of-python"
     [ ("parser", [ test_case "typed assignment" `Quick test_parser_assignment
                   ; test_case "specifications and control flow" `Quick test_parser_specs_and_control_flow
                   ; test_case "fresh expression" `Quick test_parser_fresh
                   ; test_case "entry points and errors" `Quick test_parser_entry_points_and_errors
+                  ; test_case "nice parser wrapper" `Quick test_nice_parser_wrapper_paths
                   ; test_case "expression and type forms" `Quick test_parser_expression_and_type_forms
-                  ; test_case "AST utilities" `Quick test_ast_utilities ])
+                  ; test_case "AST utilities" `Quick test_ast_utilities
+                  ; test_case "AST serializers and subtyping" `Quick test_ast_serializers_and_subtyping ])
     ; ("transforms", [ test_case "call state reset" `Quick test_transform_state_resets
                       ; test_case "emitter state reset" `Quick test_emitter_resets_state
                       ; test_case "Dafny 4 function syntax" `Quick test_dafny4_function_syntax
                       ; test_case "list conversion paths" `Quick test_convertlist_paths
+                      ; test_case "list statement paths" `Quick test_convertlist_statement_paths
                       ; test_case "call and for conversion" `Quick test_convertcall_and_convertfor_paths
+                      ; test_case "for statement paths" `Quick test_convertfor_statement_paths
                       ; test_case "generic conversion" `Quick test_generics_paths
                       ; test_case "call expression paths" `Quick test_convertcall_expression_paths
                       ; test_case "Dafny AST conversion" `Quick test_todafnyast_paths
                       ; test_case "emitter and source maps" `Quick test_emitter_paths_and_sourcemaps ])
     ; ("report", [ test_case "report parsing" `Quick test_report_paths ])
     ; ("pipeline", [ test_case "injected commands and cleanup" `Quick test_pipeline_injects_commands_and_cleans_files
-                    ; test_case "failure and artifact paths" `Quick test_pipeline_failure_and_artifact_paths ])
+                    ; test_case "failure and artifact paths" `Quick test_pipeline_failure_and_artifact_paths
+                    ; test_case "system and exception paths" `Quick test_pipeline_system_and_exception_paths ])
     ]

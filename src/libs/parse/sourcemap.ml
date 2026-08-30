@@ -2,6 +2,9 @@ open Base
 
 let printf = Stdlib.Printf.printf
 
+(* These are data-only records and aliases. The ppx_jane serializers generated
+   for them are not part of the handwritten source-map implementation. *)
+[@@@coverage off]
 type pos = Lexing.position =
 { 
   pos_fname : string [@sexp_drop_if fun _ -> true]
@@ -17,6 +20,7 @@ type linecol = int * int
 [@@deriving sexp]
 type sourcemap = (linecol * segment) list ref
 [@@deriving sexp]
+[@@@coverage on]
 
 let def_pos = Lexing.dummy_pos
 let def_seg = (def_pos, None)

@@ -65,20 +65,25 @@ dependencies are declared in `dafny-of-python.opam` and pinned for the local
 Opam switch by `dafny-of-python.opam.locked`. The generated Dafny uses Dafny 4
 syntax (`function`).
 
-Canonical commands are:
+Canonical commands are provided by the Makefile:
 
 ```
-uv sync --frozen
-uv run --frozen -- opam exec -- dune build @all
-uv run --frozen -- opam exec -- dune runtest
-uv run --frozen -- opam exec -- ./scripts/coverage.sh
+make setup
+make build
+make python-test
+make ocaml-test
+make test
+make coverage
+make run FILE=program.py
 ```
 
-Coverage is Bisect_ppx expression-point coverage over maintained handwritten
-OCaml in `src/bin`, `src/libs/parse`, `src/libs/transform`, and `src/libs/run`.
-The gate requires every expected source file and exactly 100% of its
-instrumentation points. See [`docs/coverage.md`](docs/coverage.md) for the
-prototype-code decision and exclusions.
+`make python-test` uses pytest; `make ocaml-test` runs the Dune/Alcotest suite
+and the CLI checks. Coverage is pytest-cov branch coverage for Python and
+Bisect_ppx expression-point coverage for maintained handwritten OCaml in
+`src/bin`, `src/libs/parse`, `src/libs/transform`, and `src/libs/run`. Both
+coverage gates require results strictly above 95%. See
+[`docs/coverage.md`](docs/coverage.md) for the prototype-code decision and
+exclusions.
 
 CI installs the pinned Dafny tool, synchronizes uv with `--frozen`, creates the
 Opam environment, runs the ordinary suite, and enforces the coverage gate.

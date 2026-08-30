@@ -9,9 +9,9 @@ The project has three independent toolchains:
 | .NET tool | Dafny verifier and runtime libraries | Dafny 4.11.0 target |
 
 The project is a non-package uv project. `uv sync --frozen` creates the virtual
-environment and installs `mypy`; it does not install or invoke the OCaml
-toolchain. `uv run --frozen -- opam exec -- ...` is the canonical composition
-for commands that need both toolchains.
+environment and installs `mypy`, pytest, and pytest-cov; it does not install or
+invoke the OCaml toolchain. `uv run --frozen -- opam exec -- ...` is the
+canonical composition for commands that need both toolchains.
 
 The local Opam switch is created with:
 
@@ -38,6 +38,7 @@ resolution. Regenerate it with:
 opam lock ./dafny-of-python.opam
 ```
 
+`make setup` runs the locked uv synchronization and the equivalent Opam setup.
 CI performs the same resolution from a clean checkout. The lockfile preserves
 the test filters; the explicit test-tool install remains necessary because
 enabling all upstream package tests would reintroduce the incompatible

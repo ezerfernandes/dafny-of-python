@@ -5,6 +5,9 @@ open Sourcemap
 exception PyAstError of string
 let[@inline] failwith msg = raise (PyAstError msg)
 
+(* These declarations are data-only AST definitions. Their ppx_jane sexp
+   serializers are generated code, not executable translation logic. *)
+[@@@coverage off]
 type typ =
   | TIdent of segment
   | TInt of segment
@@ -147,6 +150,7 @@ type stmt =
 type program =
   | Program of stmt list
   [@@deriving sexp]
+[@@@coverage on]
 
 let rec idlst_to_id = function
   | [] -> []

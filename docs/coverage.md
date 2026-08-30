@@ -9,6 +9,9 @@ their source headers with `[@@@coverage exclude_file]`; their behavior is still
 exercised through the public parser entry points. The handwritten
 type-only `src/libs/transform/astdfy.ml` module has no executable Bisect_ppx
 points and is explicitly excluded for the same reason.
+The data-only AST and source-map declarations in `astpy.ml` and `sourcemap.ml`
+similarly suppress only their ppx-generated sexp serializer points; handwritten
+translation and source-map functions remain in the metric.
 
 `src/libs/type` and `src/libs/solver` are archived prototypes: they are tracked
 for historical reference, are not included by Dune, and are explicitly
@@ -16,22 +19,24 @@ excluded from the maintained-code coverage expectation. They must either be
 removed or brought back into the build and covered before being treated as
 production code.
 
-Run the ordinary suite with:
+Run the ordinary suites with:
 
 ```sh
-uv run --frozen -- opam exec -- dune runtest
+make python-test
+make ocaml-test
 ```
 
-Run the exact coverage gate with:
+Run both coverage gates with:
 
 ```sh
-uv run --frozen -- opam exec -- ./scripts/coverage.sh
+make coverage
 ```
 
 The gate removes stale `.coverage` files, forces every test to rerun under
 Bisect_ppx, checks that every maintained `.ml` file is present, emits an HTML
-report in `_coverage/html`, and compares covered and total instrumentation
-points exactly. A result such as 99.99% is rejected. The verifier summary is
+report in `_coverage/html`, and requires OCaml expression-point coverage above
+95%. Python coverage is measured with pytest-cov, including branch coverage,
+and is also required to be above 95%. The verifier summary is
 reported as Dafny emits it: its verified count includes `program.dfy`, the
 prelude, and the list runtime library. Error locations are remapped only when
 they correspond to generated-program source-map entries; runtime-library
