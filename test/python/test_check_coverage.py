@@ -33,11 +33,16 @@ def test_main_accepts_exact_coverage(monkeypatch, capsys):
 def test_main_rejects_missing_and_empty_coverage(monkeypatch, capsys):
     code, _, errors = run_main("not a report\n", monkeypatch, capsys)
     assert code == 2
-    assert "no covered/total" in errors
+    assert errors == "coverage gate: no covered/total instrumentation counts found\n"
 
     code, _, errors = run_main("Project coverage: 0/0\n", monkeypatch, capsys)
     assert code == 2
-    assert "no instrumentation" in errors
+    assert errors == "coverage gate: project contains no instrumentation points\n"
+
+    code, output, errors = run_main("Project coverage: 1/1\n", monkeypatch, capsys)
+    assert code == 0
+    assert output == "coverage gate: 1/1 instrumentation points covered\n"
+    assert errors == ""
 
 
 def test_main_rejects_coverage_at_or_below_threshold(monkeypatch, capsys):

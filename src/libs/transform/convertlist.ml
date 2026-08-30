@@ -15,8 +15,6 @@ let reset () = var_num := 0
 *)
 
 let rec exp_lst = function
-  | Literal l -> ([], Literal l)
-  | Identifier ident -> ([], Identifier ident)
   | Dot (e, ident) -> let al, n_e = exp_lst e in (al, Dot (n_e, ident))
   | BinaryExp (e1, op, e2) -> 
     let al1, n_e1 = exp_lst e1 in

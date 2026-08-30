@@ -40,7 +40,6 @@ let rec subtyp pt1 pt2 =
   | _, _ -> false
   in 
   match pt1, pt2 with
-  | TIdent _, TIdent _ -> false
   | TInt _, TInt _ -> true
   | TFloat _, TFloat _ -> true
   | TInt _, TFloat _ -> true

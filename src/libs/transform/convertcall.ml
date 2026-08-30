@@ -30,8 +30,6 @@ let replace e call =
   (Assign (None, [Identifier a_ident], [call]), Identifier a_ident) (* TODO: use type of call *)
 
 let rec exp_calls = function
-  | Literal l -> ([], Literal l)
-  | Identifier ident -> ([], Identifier ident)
   | Dot (e, ident) -> let al, n_e = exp_calls e in (al, Dot (n_e, ident))
   | BinaryExp (e1, op, e2) -> 
     let al1, n_e1 = exp_calls e1 in
@@ -63,13 +61,6 @@ let rec exp_calls = function
         | _ -> (al1, lel)
         end
     )  ~init:([], Tuple [])
-  | Forall (sl, e) ->
-    (* Calls inside a quantifier must remain inside its lexical scope.  An
-       assignment produced here would be emitted before the quantifier and
-       could refer to a bound variable that does not exist there. *)
-    ([], Forall (sl, e))
-  | Exists (sl, e) ->
-    ([], Exists (sl, e))
   | Subscript (e1, e2) -> 
     let al1, n_e1 = exp_calls e1 in
     let al2, n_e2 = exp_calls e2 in
@@ -97,8 +88,9 @@ let rec exp_calls = function
     let al2, n_c = exp_calls c in
     let al3, n_e2 = exp_calls e2 in
     (al1@al2@al3, IfElseExp (n_e1, n_c, n_e2))
-  | Lambda (il, e) ->
-    ([], Lambda (il, e))
+  (* Calls inside quantifiers and lambdas are deliberately left intact by the
+     catch-all below.  Hoisting an assignment from one of those expressions
+     would move it outside its lexical scope. *)
   | e -> ([], e) 
   
 let assign_to_inv = function

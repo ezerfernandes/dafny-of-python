@@ -41,6 +41,15 @@ let test_parser_fresh () =
 
 let test_transform_state_resets () =
   let input = parse_program "x = f(1)\n" in
+  Transform.Convertcall.reset ();
+  ignore
+    (Transform.Convertcall.exp_calls
+       (Ast.Call (Ast.Identifier (Pyparse.Sourcemap.new_seg 1 1 (Some "f")), [])));
+  check string "temporary source is recorded" "f"
+    (Transform.Emitdfy.source_from_temp "tempcall_1");
+  Transform.Convertcall.reset ();
+  check string "temporary source is cleared" "tempcall_1"
+    (Transform.Emitdfy.source_from_temp "tempcall_1");
   let first = Transform.Convertcall.prog (Ast.Program input) in
   let second = Transform.Convertcall.prog (Ast.Program input) in
   let first_name =
@@ -171,7 +180,20 @@ let test_parser_entry_points_and_errors () =
      ignore (Pyparse.Parser.parse_string "def broken(:\n");
      fail "malformed syntax should raise Parser.ParseError"
    with
-     | Pyparse.Parser.ParseError _ -> ())
+     | Pyparse.Parser.ParseError _ -> ());
+  let lexbuf = Lexing.from_string "\n  x" in
+  let token () = Pyparse.Indenter.f lexbuf in
+  (match token (), token (), token (), token (), token (), token () with
+   | Pyparse.Menhir_parser.NEWLINE,
+     Pyparse.Menhir_parser.INDENT,
+     Pyparse.Menhir_parser.IDENTIFIER _,
+     Pyparse.Menhir_parser.NEWLINE,
+     Pyparse.Menhir_parser.DEDENT,
+     Pyparse.Menhir_parser.EOF -> ()
+   | _ -> fail "indenter should flush dedents before EOF");
+  (match token () with
+   | Pyparse.Menhir_parser.EOF -> ()
+   | _ -> fail "indenter should remain at EOF after flushing dedents")
 
 let test_nice_parser_wrapper_paths () =
   let module P = Nice_parser_for_test in
@@ -190,10 +212,15 @@ let test_nice_parser_wrapper_paths () =
   (match Location.error_of_exn (P.ParseError { token = "token"; loc = Location.none }) with
    | Some (`Ok _) -> ()
    | _ -> fail "ParseError should be rendered by the location printer");
-  ignore (Printexc.to_string (P.LexError { msg = "bad"; loc = Location.none }));
+  let rendered = Printexc.to_string (P.LexError { msg = "bad"; loc = Location.none }) in
+  check bool "registered exception printer renders errors" true
+    (String.length rendered > 0);
   ignore (Printexc.to_string (Failure "ordinary"));
   Raw_parser_for_test.mode := Ok;
+  Location.input_lexbuf := None;
   check string "raw parser result" "indent" (P.parse_string "input");
+  check bool "parser records its input lexbuf" true
+    (Option.is_some !Location.input_lexbuf);
   let position = { Lexing.dummy_pos with pos_fname = "position.py"; pos_lnum = 3 } in
   ignore (P.parse_string ~pos:position "input");
   let channel_path = Filename.temp_file "dafny-of-python-nice-parser-" ".txt" in
@@ -300,6 +327,9 @@ let test_ast_utilities () =
   check string "segment value" "value" (seg_val (segment "value"));
   check string "segment without value" "" (seg_val def_seg);
   check string "position" "Line: 2  Column: 3" (print_pos (fst (new_seg 2 3 None)));
+  let positioned = { pos_fname = ""; pos_lnum = 2; pos_bol = 5; pos_cnum = 8 } in
+  check string "position column uses line offset" "Line: 2  Column: 3"
+    (print_pos positioned);
   check string "segment update" "new" (seg_val (update_seg_val (segment "old") (Some "new")));
   check int "segment values compare" 0 (seg_val_compare (segment "same") (segment "same"));
   ignore (seg_pos (segment "position"));
@@ -367,6 +397,8 @@ let test_ast_serializers_and_subtyping () =
   check bool "different primitive types are not subtypes" false (subtyp (TBool s) (TStr s));
   check bool "identifiers are not concrete subtypes" false (subtyp (TIdent s) (TIdent s));
   check bool "untyped lists compare as equal" true (eqtyp (TLst (s, None)) (TLst (s, None)));
+  check bool "typed list elements compare recursively" true
+    (subtyp (TLst (s, Some (TInt s))) (TLst (s, Some (TInt s))));
   check bool "untyped dictionaries compare as equal" true
     (eqtyp (TDict (s, None, None)) (TDict (s, None, None)));
   check bool "tuple None option compares as equal" true
@@ -450,6 +482,40 @@ let test_convertlist_paths () =
     ; Slice (None, None)
     ; IfElseExp (xs, Literal TrueLit, list)
     ];
+  let nested_list = Lst [ Literal (IntLit "4") ] in
+  let expect_list_assignment name expression =
+    let assignments, _ = Transform.Convertlist.exp_lst expression in
+    check int name 1 (List.length assignments)
+  in
+  expect_list_assignment "dot rewrites nested lists"
+    (Dot (nested_list, segment "field"));
+  expect_list_assignment "binary rewrites nested lists"
+    (BinaryExp (nested_list, Plus def_seg, xs));
+  expect_list_assignment "unary rewrites nested lists"
+    (UnaryExp (Not def_seg, nested_list));
+  expect_list_assignment "call rewrites nested list arguments"
+    (Call (xs, [ nested_list ]));
+  expect_list_assignment "tuple rewrites nested lists"
+    (Tuple [ nested_list ]);
+  expect_list_assignment "old rewrites nested lists"
+    (Old (def_seg, nested_list));
+  expect_list_assignment "forall rewrites nested lists"
+    (Forall ([ segment "k" ], nested_list));
+  expect_list_assignment "index rewrites nested lists"
+    (Index nested_list);
+  expect_list_assignment "slice rewrites nested lists"
+    (Slice (Some nested_list, None));
+  expect_list_assignment "conditional rewrites nested lists"
+    (IfElseExp (nested_list, xs, xs));
+  let reset_input = Program [ Assign (None, [ identifier "reset" ], [ nested_list ]) ] in
+  let converted_once = Transform.Convertlist.prog reset_input in
+  let converted_twice = Transform.Convertlist.prog reset_input in
+  let has_first_temporary = function
+    | Program [ Assign (_, [ Identifier (_, Some "templist_1") ], _); Assign _ ] -> true
+    | _ -> false
+  in
+  check bool "list temporary state resets" true (has_first_temporary converted_once);
+  check bool "list temporary state resets repeatedly" true (has_first_temporary converted_twice);
   expect_exception "invalid subscript" (function Ast.PyAstError _ -> true | _ -> false)
     (fun () -> Transform.Convertlist.exp_lst (Subscript (xs, Literal (IntLit "1"))))
 
@@ -513,7 +579,15 @@ let test_convertcall_and_convertfor_paths () =
   in
   let converted_loop = Transform.Convertfor.prog (Program [ loop ]) in
   (match converted_loop with
-   | Program [ Assign _; Assign _; Assign _; While (specs, _, body) ] ->
+   | Program
+       [ Assign (_, [ Identifier ((counter_pos, Some "tempfor_1")) ], _)
+       ; Assign (_, [ Identifier ((limit_pos, Some "tempfor_2")) ], _)
+       ; Assign _
+       ; While (specs, _, body) ] ->
+     check int "counter source line" 0 counter_pos.pos_lnum;
+     check int "counter source column" 0 counter_pos.pos_cnum;
+     check int "limit source line" 0 limit_pos.pos_lnum;
+     check int "limit source column" 0 limit_pos.pos_cnum;
      check bool "loop invariant retained" true (List.length specs >= 1);
      check bool "nested loop converted" true
        (List.exists (function While _ -> true | _ -> false) body)
@@ -535,6 +609,7 @@ let test_convertcall_and_convertfor_paths () =
 let test_convertcall_expression_paths () =
   let open Ast in
   let x = identifier "x" in
+  let call name = Call (identifier name, []) in
   let expressions =
     [ Dot (x, segment "field")
     ; BinaryExp (x, Plus def_seg, x)
@@ -553,9 +628,54 @@ let test_convertcall_expression_paths () =
     ; Exists ([ segment "k" ], x)
     ; IfElseExp (x, Literal TrueLit, x)
     ; Lambda ([ segment "k" ], x)
+    ; IfElseExp (call "if_true", call "condition", call "if_false")
+    ; Index (call "indexed")
+    ; Subscript (call "value", call "subscript")
+    ; Lst [ call "listed" ]
+    ; UnaryExp (Not def_seg, call "negated")
     ]
   in
   List.iter (fun expression -> ignore (Transform.Convertcall.exp_calls expression)) expressions;
+  let assignments, rewritten = Transform.Convertcall.exp_calls (IfElseExp (call "if_true", call "condition", call "if_false")) in
+  check int "conditional calls are rewritten" 3 (List.length assignments);
+  (match rewritten with
+   | IfElseExp (Identifier _, Identifier _, Identifier _) -> ()
+   | _ -> fail "conditional call expressions should use temporaries");
+  let assignments, rewritten = Transform.Convertcall.exp_calls (Index (call "indexed")) in
+  check int "index calls are rewritten" 1 (List.length assignments);
+  (match rewritten with
+   | Index (Identifier _) -> ()
+   | _ -> fail "index expressions should use temporaries");
+  let assignments, rewritten = Transform.Convertcall.exp_calls (Subscript (call "value", call "subscript")) in
+  check int "subscript calls are rewritten" 2 (List.length assignments);
+  (match rewritten with
+   | Subscript (Identifier _, Identifier _) -> ()
+   | _ -> fail "subscript expressions should use temporaries");
+  let assignments, rewritten = Transform.Convertcall.exp_calls (Lst [ call "listed" ]) in
+  check int "list calls are rewritten" 1 (List.length assignments);
+  (match rewritten with
+   | Lst [ Identifier _ ] -> ()
+   | _ -> fail "list expressions should use temporaries");
+  let assignments, rewritten = Transform.Convertcall.exp_calls (UnaryExp (Not def_seg, call "negated")) in
+  check int "unary calls are rewritten" 1 (List.length assignments);
+  (match rewritten with
+   | UnaryExp (_, Identifier _) -> ()
+   | _ -> fail "unary expressions should use temporaries");
+  let assignments, rewritten =
+    Transform.Convertcall.exp_calls
+      (BinaryExp (call "left", Plus def_seg, call "right"))
+  in
+  check int "binary calls are rewritten" 2 (List.length assignments);
+  (match rewritten with
+   | BinaryExp (Identifier _, _, Identifier _) -> ()
+   | _ -> fail "binary expressions should use temporaries");
+  let assignments, rewritten =
+    Transform.Convertcall.exp_calls (Tuple [ call "first"; call "second" ])
+  in
+  check int "tuple calls are rewritten" 2 (List.length assignments);
+  (match rewritten with
+   | Tuple [ Identifier _; Identifier _ ] -> ()
+   | _ -> fail "tuple expressions should use temporaries");
   List.iter
     (fun primary ->
        Transform.Convertcall.reset ();
@@ -609,12 +729,19 @@ let test_generics_paths () =
     Program
       [ Assign (None, [ identifier "T" ], [ type_var "T" ])
       ; Assign (None, [ identifier "S" ], [ identifier "T" ])
+      ; Assign (None, [ identifier "U" ], [ identifier "S" ])
       ; Assign (None, [ identifier "value" ], [ Literal (IntLit "1") ])
       ]
   in
   (match Transform.Generics.prog program with
-   | Program [ Assign (_, [ Identifier (_, Some "value") ], _) ], [ "T"; "S" ] -> ()
+   | Program [ Assign (_, [ Identifier (_, Some "value") ], _) ], [ "T"; "S"; "U" ] -> ()
    | _ -> fail "TypeVar declarations should become generic parameters");
+  ignore
+    (Transform.Generics.prog
+       (Program [ Assign (None, [ identifier "T" ], [ type_var "T" ]) ]));
+  (match Transform.Generics.prog (Program [ Assign (None, [ identifier "S" ], [ identifier "T" ]) ]) with
+   | Program [ Assign _ ], [] -> ()
+   | _ -> fail "generic state should reset between programs");
   expect_exception "constrained TypeVar" (function Ast.PyAstError _ -> true | _ -> false)
     (fun () -> Transform.Generics.prog (Program [ Assign (None, [ identifier "T" ], [ Call (identifier "TypeVar", [ Literal (StringLit "T"); Literal (IntLit "1") ]) ]) ]));
   expect_exception "unequal generic assignment" (function Ast.PyAstError _ -> true | _ -> false)
@@ -758,6 +885,8 @@ let test_todafnyast_paths () =
     (Option.is_none (Transform.Todafnyast.convert_typsyn (Literal TrueLit) (Typ int_typ)));
   check bool "None is not a top-level declaration" false
     (Transform.Todafnyast.is_toplevel (Assign (None, [ x ], [ Typ (TNone def_seg) ])));
+  check bool "ordinary statement is not top-level" false
+    (Transform.Todafnyast.is_toplevel Pass);
   check bool "typed assignment is a top-level declaration" true
     (Transform.Todafnyast.is_toplevel (Assign (None, [ x ], [ Typ int_typ ])));
   check bool "function is top-level" true
@@ -765,9 +894,15 @@ let test_todafnyast_paths () =
   let function_return = Function ([], segment "f", [ param ], Typ int_typ, [ Return x ]) in
   let function_exp = Function ([], segment "g", [], Typ int_typ, [ Exp x ]) in
   let function_pass = Function ([], segment "h", [], Typ int_typ, [ Pass ]) in
-  ignore (Transform.Todafnyast.func_dfy [] function_return);
-  ignore (Transform.Todafnyast.func_dfy [] function_exp);
-  ignore (Transform.Todafnyast.func_dfy [] function_pass);
+  (match Transform.Todafnyast.func_dfy [] function_return with
+   | [ D.DFuncMeth (_, _, _, _, _, Some _) ] -> ()
+   | _ -> fail "return function should become a Dafny function method");
+  (match Transform.Todafnyast.func_dfy [] function_exp with
+   | [ D.DFuncMeth (_, _, _, _, _, Some _) ] -> ()
+   | _ -> fail "expression function should become a Dafny function method");
+  (match Transform.Todafnyast.func_dfy [] function_pass with
+   | [ D.DFuncMeth (_, _, _, _, _, None) ] -> ()
+   | _ -> fail "pass function should become a void Dafny function method");
   check bool "return function is recognized" true (Transform.Todafnyast.is_func function_return);
   check bool "expression function is recognized" true (Transform.Todafnyast.is_func function_exp);
   check bool "pass function is recognized" true (Transform.Todafnyast.is_func function_pass);
@@ -801,6 +936,49 @@ let test_emitter_paths_and_sourcemaps () =
     ]
   in
   List.iter (fun typ -> ignore (Transform.Emitdfy.print_type 0 typ)) types;
+  let render_type typ =
+    Transform.Emitdfy.reset ();
+    Transform.Emitdfy.print_type 0 typ
+  in
+  check string "identifier type rendering" "T" (render_type (D.DIdentTyp (ds "T", [])));
+  check string "generic type rendering" "Box<int>"
+    (render_type (D.DIdentTyp (ds "Box", [ D.DInt def_seg ])));
+  check string "integer type rendering" "int" (render_type (D.DInt def_seg));
+  check string "real type rendering" "real" (render_type (D.DReal def_seg));
+  check string "boolean type rendering" "bool" (render_type (D.DBool def_seg));
+  check string "string type rendering" "string" (render_type (D.DString def_seg));
+  check string "character type rendering" "char" (render_type (D.DChar def_seg));
+  check string "object type rendering" "object" (render_type (D.DObj def_seg));
+  check string "sequence type rendering" "seq<int>"
+    (render_type (D.DSeq (def_seg, D.DInt def_seg)));
+  check string "set type rendering" "set<int>"
+    (render_type (D.DSet (def_seg, D.DInt def_seg)));
+  check string "map type rendering" "map<int, string>"
+    (render_type (D.DMap (def_seg, D.DInt def_seg, D.DString def_seg)));
+  check string "tuple type rendering" "(int)"
+    (render_type (D.DTuple (def_seg, [ D.DInt def_seg ])));
+  check string "function type rendering" "(int) -> bool"
+    (render_type (D.DFunTyp (def_seg, [ D.DInt def_seg ], D.DBool def_seg)));
+  let check_type_source name typ value =
+    Transform.Emitdfy.reset ();
+    ignore (Transform.Emitdfy.print_type 0 typ);
+    check bool name true
+      (has_substring (Transform.Emitdfy.print_sourcemap !Transform.Emitdfy.sm) value)
+  in
+  check_type_source "identifier type source map" (D.DIdentTyp (segment "T-source", [])) "T-source";
+  check_type_source "integer type source map" (D.DInt (segment "int-source")) "int-source";
+  check_type_source "real type source map" (D.DReal (segment "real-source")) "real-source";
+  check_type_source "boolean type source map" (D.DBool (segment "bool-source")) "bool-source";
+  check_type_source "string type source map" (D.DString (segment "string-source")) "string-source";
+  check_type_source "character type source map" (D.DChar (segment "char-source")) "char-source";
+  check_type_source "object type source map" (D.DObj (segment "object-source")) "object-source";
+  check_type_source "sequence type source map" (D.DSeq (segment "seq-source", D.DInt def_seg)) "seq-source";
+  check_type_source "set type source map" (D.DSet (segment "set-source", D.DInt def_seg)) "set-source";
+  check_type_source "map type source map"
+    (D.DMap (segment "map-source", D.DInt def_seg, D.DString def_seg)) "map-source";
+  check_type_source "tuple type source map" (D.DTuple (segment "tuple-source", [ D.DInt def_seg ])) "tuple-source";
+  check_type_source "function type source map"
+    (D.DFunTyp (segment "function-source", [ D.DInt def_seg ], D.DBool def_seg)) "function-source";
   let expressions =
     [ id "x"; D.DDot (id "x", ds "field")
     ; D.DBinary (id "x", D.DPlus def_seg, D.DIntLit "1")
@@ -822,6 +1000,144 @@ let test_emitter_paths_and_sourcemaps () =
   in
   Transform.Emitdfy.reset ();
   List.iter (fun expression -> ignore (Transform.Emitdfy.print_exp 0 expression)) expressions;
+  let render_exp expression =
+    Transform.Emitdfy.reset ();
+    Transform.Emitdfy.print_exp 0 expression
+  in
+  check string "identifier rendering" "x" (render_exp (id "x"));
+  check string "dot rendering" "x.field" (render_exp (D.DDot (id "x", ds "field")));
+  check string "binary rendering" "(x + 1)"
+    (render_exp (D.DBinary (id "x", D.DPlus def_seg, D.DIntLit "1")));
+  check string "unary rendering" "(!false)"
+    (render_exp (D.DUnary (D.DNot def_seg, D.DFalse)));
+  check string "integer literal rendering" "1" (render_exp (D.DIntLit "1"));
+  check string "real literal rendering" "1.5" (render_exp (D.DRealLit "1.5"));
+  check string "true rendering" "true" (render_exp D.DTrue);
+  check string "false rendering" "false" (render_exp D.DFalse);
+  check string "string literal rendering" "\"text\"" (render_exp (D.DStringLit "text"));
+  check string "null rendering" "null" (render_exp D.DNull);
+  check string "this rendering" "this" (render_exp D.DThis);
+  check string "empty expression rendering" "" (render_exp D.DEmptyExpr);
+  check string "call rendering" "f(x)" (render_exp (D.DCallExpr (id "f", [ id "x" ])));
+  check string "sequence rendering" "[x, y]"
+    (render_exp (D.DSeqExpr [ id "x"; id "y" ]));
+  check string "array rendering" "[x, y]"
+    (render_exp (D.DArrayExpr [ id "x"; id "y" ]));
+  check string "set rendering" "{x, y}"
+    (render_exp (D.DSetExpr [ id "x"; id "y" ]));
+  check string "map rendering" "map[x := 1, y := 2]"
+    (render_exp (D.DMapExpr [ (id "x", D.DIntLit "1"); (id "y", D.DIntLit "2") ]));
+  check string "subscript rendering" "x0"
+    (render_exp (D.DSubscript (id "x", D.DIndex (D.DIntLit "0"))));
+  check string "index rendering" "x" (render_exp (D.DIndex (id "x")));
+  check string "range slice rendering" "[1..2]"
+    (render_exp (D.DSlice (Some (D.DIntLit "1"), Some (D.DIntLit "2"))));
+  check string "lower slice rendering" "[1]"
+    (render_exp (D.DSlice (Some (D.DIntLit "1"), None)));
+  check string "upper slice rendering" "[2]"
+    (render_exp (D.DSlice (None, Some (D.DIntLit "2"))));
+  check string "empty slice rendering" "[]" (render_exp (D.DSlice (None, None)));
+  check string "forall rendering" "forall k :: true"
+    (render_exp (D.DForall ([ ds "k" ], D.DTrue)));
+  check string "exists rendering" "existsk :: false"
+    (render_exp (D.DExists ([ ds "k" ], D.DFalse)));
+  check string "length rendering" "|x|" (render_exp (D.DLen (def_seg, id "x")));
+  check string "old rendering" "old(x)" (render_exp (D.DOld (def_seg, id "x")));
+  check string "fresh rendering" "fresh(x)" (render_exp (D.DFresh (def_seg, id "x")));
+  check string "lambda rendering" "(x) => x"
+    (render_exp (D.DLambda ([ (ds "x", D.DVoid) ], [], id "x")));
+  check string "lambda specification rendering" "(x)requires true => x"
+    (render_exp
+       (D.DLambda ([ (ds "x", D.DVoid) ], [ D.DRequires D.DTrue ], id "x")));
+  check string "conditional rendering" "if true then 1 else 2"
+    (render_exp (D.DIfElseExpr (D.DTrue, D.DIntLit "1", D.DIntLit "2")));
+  check string "tuple rendering" "(x, y)"
+    (render_exp (D.DTupleExpr [ id "x"; id "y" ]));
+  Transform.Emitdfy.reset ();
+  Transform.Emitdfy.curr_func := "stale";
+  Transform.Emitdfy.reset ();
+  check string "emitter resets current function" "" !Transform.Emitdfy.curr_func;
+  ignore (Transform.Emitdfy.print_ident 0 (ds "x"));
+  ignore (Transform.Emitdfy.print_ident 0 (ds "y"));
+  check bool "source map tracks column changes" true
+    (has_substring (Transform.Emitdfy.print_sourcemap !Transform.Emitdfy.sm) "(1, 2)");
+  Transform.Emitdfy.reset ();
+  ignore (Transform.Emitdfy.print_ident 0 (ds "x"));
+  ignore (Transform.Emitdfy.newline ());
+  ignore (Transform.Emitdfy.print_ident 0 (ds "y"));
+  check bool "source map tracks line changes" true
+    (has_substring (Transform.Emitdfy.print_sourcemap !Transform.Emitdfy.sm) "(2, 1)");
+  Transform.Emitdfy.reset ();
+  check string "unbound assignment declaration" "var x;"
+    (Transform.Emitdfy.print_stmt 0 (D.DAssign (None, [ ds "x" ], [])));
+  check string "repeated assignment reuses declaration" "x;"
+    (Transform.Emitdfy.print_stmt 0 (D.DAssign (None, [ ds "x" ], [])));
+  check string "typed assignment rendering" "var y: int := 1;"
+    (Transform.Emitdfy.print_stmt 0
+       (D.DAssign (Some (D.DInt def_seg), [ ds "y" ], [ D.DIntLit "1" ])));
+  check string "typed assignment records declaration" "y;"
+    (Transform.Emitdfy.print_stmt 0 (D.DAssign (None, [ ds "y" ], [])));
+  check string "parameter rendering" "x: int"
+    (Transform.Emitdfy.print_param 0 (ds "x", D.DInt def_seg));
+  check string "void return rendering" ""
+    (Transform.Emitdfy.print_rets 0 [ D.DVoid ]);
+  check string "return rendering" "(res: int)"
+    (Transform.Emitdfy.print_rets 0 [ D.DInt def_seg ]);
+  check string "assume rendering" "assume true;"
+    (Transform.Emitdfy.print_stmt 0 (D.DAssume D.DTrue));
+  check string "assert rendering" "assert true;"
+    (Transform.Emitdfy.print_stmt 0 (D.DAssert D.DTrue));
+  check string "break rendering" "break;"
+    (Transform.Emitdfy.print_stmt 0 D.DBreak);
+  check string "call statement rendering" "f(1);"
+    (Transform.Emitdfy.print_stmt 0 (D.DCallStmt (id "f", [ D.DIntLit "1" ])));
+  check string "return statement rendering" "return 1;"
+    (Transform.Emitdfy.print_stmt 0 (D.DReturn [ D.DIntLit "1" ]));
+  check string "if statement rendering" "if true {\n  break;\n}"
+    (Transform.Emitdfy.print_stmt 0 (D.DIf (D.DTrue, [ D.DBreak ], [], [])));
+  check string "if else statement rendering"
+    "if true {\n  break;\n} else if false {\n  break;\n} else {\n  assert true;\n}"
+    (Transform.Emitdfy.print_stmt 0
+       (D.DIf (D.DTrue, [ D.DBreak ],
+               [ (D.DFalse, [ D.DBreak ]) ], [ D.DAssert D.DTrue ])));
+  check string "while statement rendering" "while true\n  invariant true\n{\n  break;\n}"
+    (Transform.Emitdfy.print_stmt 0
+       (D.DWhile ([ D.DInvariant D.DTrue ], D.DTrue, [ D.DBreak ])));
+  let render_spec spec =
+    Transform.Emitdfy.reset ();
+    Transform.Emitdfy.print_spec 0 spec
+  in
+  check string "requires rendering" "requires true"
+    (render_spec (D.DRequires D.DTrue));
+  check string "modifies rendering" "modifies true"
+    (render_spec (D.DModifies D.DTrue));
+  let render_toplevel declaration =
+    Transform.Emitdfy.reset ();
+    Transform.Emitdfy.print_toplevel 0 declaration
+  in
+  check string "type declaration rendering" "type Alias = int"
+    (render_toplevel (D.DTypSynonym (ds "Alias", Some (D.DInt def_seg))));
+  check string "bare type declaration rendering" "type Alias"
+    (render_toplevel (D.DTypSynonym (ds "Alias", None)));
+  check string "method declaration rendering" "method m()\n\n"
+    (render_toplevel (D.DMeth ([], ds "m", [], [], [], None)));
+  check string "function declaration rendering"
+    "function f(): (res: int)\n\n{\n  true\n}\n"
+    (render_toplevel (D.DFuncMeth ([], ds "f", [], [], D.DInt def_seg, Some D.DTrue)));
+  let method_with_spec =
+    render_toplevel
+      (D.DMeth ([ D.DEnsures D.DTrue ], ds "spec_m", [], [], [], None))
+  in
+  check bool "method specification indentation" true
+    (has_substring method_with_spec "\n  ensures true");
+  check bool "method specification has no extra indentation" false
+    (has_substring method_with_spec "\n   ensures true");
+  let method_with_body =
+    render_toplevel
+      (D.DMeth ([], ds "body_m", [], [], [], Some [ D.DReturn [ D.DIntLit "1" ] ]))
+  in
+  check bool "method body indentation" true
+    (has_substring method_with_body "\n  return 1;");
   List.iter
     (fun spec -> ignore (Transform.Emitdfy.print_spec 0 spec))
     [ D.DRequires D.DTrue; D.DEnsures D.DTrue; D.DInvariant D.DTrue
@@ -864,21 +1180,69 @@ let test_emitter_paths_and_sourcemaps () =
   check string "nearest source map tie by column" "first" (seg_val (Transform.Emitdfy.nearest_seg ties 2 3));
   let closer = [ ((2, 1), segment "first"); ((2, 5), segment "second") ] in
   check string "nearest source map closer column" "second" (seg_val (Transform.Emitdfy.nearest_seg closer 2 6));
-  ignore (Transform.Emitdfy.print_sourcemap !mapping)
+  check string "source map rendering"
+    "(2, 3):  Line: 1  Column: 1  Value: nearest\n(1, 1):  Line: 1  Column: 1  Value: other"
+    (Transform.Emitdfy.print_sourcemap !mapping)
 
 let test_report_paths () =
-  let source_map = ref [ ((1, 2), segment ~line:4 ~column:6 "x") ] in
+  let source_map =
+    ref
+      [ ((1, 2), segment ~line:4 ~column:6 "first")
+      ; ((2, 1), segment ~line:8 ~column:3 "second")
+      ]
+  in
   let output = "program.dfy(1,2): Error, a postcondition might not hold\n" in
   (match Run.Report.verification_errors ~sourcemap:source_map output with
-   | Some errors -> check bool "verification error is reported" true (String.length errors > 0)
+   | Some errors ->
+     check string "diagnostic location is replaced in the first field"
+       "Line: 4  Column: 6  Value: first,  Error, a postcondition might not hold"
+       errors;
+     check bool "verification error is mapped" true (has_substring errors "first");
+     check bool "original verifier path is replaced" false
+       (has_substring errors "program.dfy")
    | None -> fail "verification error should be recognized");
   check bool "non-error output has no locations" true
     (Option.is_none (Run.Report.verification_errors ~sourcemap:source_map "verified\n"));
-  ignore (Run.Report.replace_num ~sourcemap:source_map "no numeric location");
+  let missing_location_map =
+    ref
+      [ ((0, 100), segment ~line:0 ~column:100 "zero")
+      ; ((2, 0), segment ~line:2 ~column:0 "two")
+      ]
+  in
+  check string "missing line defaults to zero" "Line: 0  Column: 100  Value: zero"
+    (Run.Report.replace_num ~sourcemap:missing_location_map "no numeric location");
   ignore (Run.Report.replace_num "1,2");
   ignore (Run.Report.verification_errors "verified\n");
-  Run.Report.report ~sourcemap:source_map
-    (output ^ "verifier finished with 2 verified, 0 errors\n");
+  let reported =
+    let read_fd, write_fd = Unix.pipe () in
+    let saved_stderr = Unix.dup Unix.stderr in
+    Unix.dup2 write_fd Unix.stderr;
+    Unix.close write_fd;
+    (try
+       Run.Report.report ~sourcemap:source_map
+         (output ^ "verifier finished with 2 verified, 0 errors\n");
+       Stdlib.flush Stdlib.stderr
+     with exn ->
+       Unix.dup2 saved_stderr Unix.stderr;
+       Unix.close saved_stderr;
+       Unix.close read_fd;
+       raise exn);
+    Unix.dup2 saved_stderr Unix.stderr;
+    Unix.close saved_stderr;
+    let buffer = Buffer.create 128 in
+    let bytes = Bytes.create 128 in
+    let rec read_all () =
+      match Unix.read read_fd bytes 0 (Bytes.length bytes) with
+      | 0 -> ()
+      | count ->
+        Buffer.add_subbytes buffer bytes 0 count;
+        read_all ()
+    in
+    read_all ();
+    Unix.close read_fd;
+    Buffer.contents buffer
+  in
+  check bool "report prints mapped diagnostics" true (has_substring reported "first");
   Run.Report.verification_summary "verifier finished with 2 verified, 0 errors\n";
   expect_exception "malformed verifier summary" (function Run.Report.ReportError _ -> true | _ -> false)
     (fun () -> Run.Report.verification_summary "no summary\n")
@@ -901,6 +1265,8 @@ let test_pipeline_failure_and_artifact_paths () =
   check int "verification status is preserved" 9 result.verification.exit_code;
   (match result.working_directory with
    | Some directory ->
+     check int "temporary directory permissions" 0o700
+       (Unix.(stat directory).st_perm);
      check bool "kept Python artifact" true (Sys.file_exists (Filename.concat directory "program.py"));
      check bool "kept Dafny artifact" true (Sys.file_exists (Filename.concat directory "program.dfy"));
      Sys.remove (Filename.concat directory "program.py");
@@ -938,8 +1304,10 @@ let test_pipeline_system_and_exception_paths () =
   Unix.close read_fd;
   Run.Pipeline.close_noerr write_fd;
   Run.Pipeline.close_noerr write_fd;
-  ignore (Run.Pipeline.status_code (Unix.WSIGNALED 2));
-  ignore (Run.Pipeline.status_code (Unix.WSTOPPED 2));
+  check int "signalled status maps to shell code" 130
+    (Run.Pipeline.status_code (Unix.WSIGNALED 2));
+  check int "stopped status maps to shell code" 130
+    (Run.Pipeline.status_code (Unix.WSTOPPED 2));
   Run.Pipeline.remove_file "/definitely/missing/dafny-of-python-file";
   Run.Pipeline.cleanup_directory
     { (Run.Pipeline.default_config ~prelude:"prelude" ~list_library:"list") with keep_artifacts = false }
