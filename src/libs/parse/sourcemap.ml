@@ -23,7 +23,7 @@ let def_seg = (def_pos, None)
 
 let print_pos (p: pos) = 
   let ln = Int.to_string p.pos_lnum in
-  let cn = Int.to_string (p.pos_cnum - p.pos_bol) in
+  let cn = Int.to_string (Int.max 0 (p.pos_cnum - p.pos_bol)) in
   String.concat ~sep:" " ["Line:"; ln; " Column:"; cn]
 
 let new_seg l c v = 

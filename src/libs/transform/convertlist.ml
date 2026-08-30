@@ -6,6 +6,8 @@ let printf = Stdlib.Printf.printf
 let var_num : int ref = ref 0
 let list_constructor = "list"
 
+let reset () = var_num := 0
+
 (* 
   1. converts lists
   2. converts subscripts
@@ -49,7 +51,7 @@ let rec exp_lst = function
     List.fold als_nes ~f:(
       fun (al1, lel) (al2, e) -> begin
         match lel with
-        | Tuple el -> (al1@al2, Array (el@[e]))
+        | Array el -> (al1@al2, Array (el@[e]))
         | _ -> (al1, lel)
         end
     ) ~init:([], Array [])
@@ -151,15 +153,22 @@ let rec stmt_lst s =
     let n_specl = List.fold als_nspecl ~f:(fun so_far (_, n_spec) -> so_far@[n_spec]) ~init:[] in
     let als = List.fold als_nspecl ~f:(fun so_far (al, _) -> so_far@al) ~init:[] in
     let n_sl = List.fold sl ~f:(fun so_far s -> so_far@(stmt_lst s)) ~init:[] in
-    let aug_n_sl = n_sl@als in
-    al@als@[While (n_specl, n_e, aug_n_sl)]
+    al@als@[While (n_specl, n_e, n_sl)]
   | Function (specl, i, pl, t, sl) ->
     let als_nspecl = List.map specl ~f:spec_lst in
     let n_specl = List.fold als_nspecl ~f:(fun so_far (_, n_spec) -> so_far@[n_spec]) ~init:[] in
     let als = List.fold als_nspecl ~f:(fun so_far (al, _) -> so_far@al) ~init:[] in
     let n_sl = List.fold sl ~f:(fun so_far s -> so_far@(stmt_lst s)) ~init:[] in
     als@[Function (n_specl, i, pl, t, n_sl)]
-  | For _ -> [s]
+  | For (specl, il, e, sl) ->
+    let als_nspecl = List.map specl ~f:spec_lst in
+    let n_specl = List.fold als_nspecl ~f:(fun so_far (_, n_spec) -> so_far@[n_spec]) ~init:[] in
+    let als = List.fold als_nspecl ~f:(fun so_far (al, _) -> so_far@al) ~init:[] in
+    let al, n_e = exp_lst e in
+    let n_sl = List.fold sl ~f:(fun so_far s -> so_far@(stmt_lst s)) ~init:[] in
+    als @ al @ [For (n_specl, il, n_e, n_sl)]
 
-let prog = function 
+let prog program =
+  reset ();
+  match program with
   | Program sl -> Program (List.fold sl ~f:(fun so_far s -> so_far@(stmt_lst s)) ~init:[])

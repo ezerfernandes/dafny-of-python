@@ -4,11 +4,21 @@ open Menhir_parser
 
 let convert_space_to_indent width f =
 	let indent = ref 0 in
+	let current_lexbuf = ref None in
+	let reset_for_new_lexbuf lexbuf =
+		match !current_lexbuf with
+		| Some previous when previous == lexbuf -> ()
+		| _ ->
+			current_lexbuf := Some lexbuf;
+			indent := 0
+	in
 	let make_indent _ = [NEWLINE; INDENT] in
 	let make_dedent _ = [NEWLINE; DEDENT] in
 	let g h a b = List.init (a - b) h |> List.concat in
 
-	fun lexbuf -> match f lexbuf with
+	fun lexbuf ->
+		reset_for_new_lexbuf lexbuf;
+		match f lexbuf with
 	| SPACE n ->
 		let m = n / width in
 		let k = !indent in
@@ -23,7 +33,12 @@ let convert_space_to_indent width f =
 
 let flatten f =
 	let xs = ref [] in
-		fun lexbuf -> match !xs with
+	let current_lexbuf = ref None in
+		fun lexbuf ->
+			(match !current_lexbuf with
+			| Some previous when previous == lexbuf -> ()
+			| _ -> current_lexbuf := Some lexbuf; xs := []);
+			match !xs with
 		| x::xs' -> xs := xs'; x
 		| [] -> (match f lexbuf with
 			| x::xs' -> xs := xs'; x

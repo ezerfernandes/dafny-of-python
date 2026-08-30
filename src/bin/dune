@@ -1,4 +1,7 @@
 (executable
   (name main)
   (libraries core pyparse transform run)
+  (instrumentation
+    (backend bisect_ppx --exclusions bisect.exclude)
+    (deps ../../bisect.exclude))
 )

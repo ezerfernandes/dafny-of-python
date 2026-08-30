@@ -1,1 +1,13 @@
 .merlin
+_build/
+.venv/
+_opam/
+.coverage/
+*.coverage
+_coverage/
+__pycache__/
+*.pyc
+program.py
+program.dfy
+# roborev snapshots
+/.roborev/

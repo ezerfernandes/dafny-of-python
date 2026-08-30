@@ -12,6 +12,8 @@ let[@inline] failwith msg = raise (ToDfyError msg)
 
 let typ_idents = Hash_set.create (module String)
 
+let reset () = Hash_set.clear typ_idents
+
 let check_exp_typ = function
   | Typ t -> t
   | Identifier s -> TIdent s
@@ -217,6 +219,7 @@ let is_func = function
   | _ -> false
 
 let prog_dfy p =
+  reset ();
   let (n_p, gens) = Generics.prog p in
   let p = Convertfor.prog n_p in
   let (Program sl) = Convertlist.prog p in

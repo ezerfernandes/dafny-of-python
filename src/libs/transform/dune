@@ -3,4 +3,7 @@
   (libraries
     pyparse
   )
+  (instrumentation
+    (backend bisect_ppx --exclusions bisect.exclude)
+    (deps ../../../bisect.exclude))
 )

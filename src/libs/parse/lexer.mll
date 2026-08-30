@@ -1,4 +1,6 @@
 {
+  [@@@coverage exclude_file]
+
   open Menhir_parser
 
   exception LexError of string
@@ -50,10 +52,10 @@ let typ_f = typ '('
 
 let identifier = ['a'-'z' 'A'-'Z' '_'] ['A'-'Z' 'a'-'z' '0'-'9' '_']*
 let digit = ['0'-'9']
-let integer = '-'? digit digit*
+let integer = digit digit*
 let frac = '.' digit*
 let exp = ['e' 'E'] ['-' '+']? digit+
-let float = frac exp | digit+ exp | digit+ frac exp | digit* frac
+let float = '-'? (frac exp | digit+ exp | digit+ frac exp | digit* frac)
 let strliteral = ('"'[^'"''\\']*('\\'_[^'"''\\']*)*'"')
 let comment = '#'
 let boolean = "True" | "False"
@@ -110,11 +112,11 @@ rule next_token = parse
 | ';' { SEMICOLON }
 | ',' { COMMA }
 | "old" { OLD (emit_segment lexbuf (Some "old")) }
+| "fresh" { FRESH (emit_segment lexbuf (Some "fresh")) }
 | "len" { LEN (emit_segment lexbuf (Some "len")) } 
-| "max" { IDENTIFIER (emit_segment lexbuf (Some "maxListInt")) } 
+| "max" { MAX (emit_segment lexbuf (Some "max")) }
 | "filter" { IDENTIFIER (emit_segment lexbuf (Some "filterF")) }
 | "map" { IDENTIFIER (emit_segment lexbuf (Some "mapF")) }
-| "->" { ARROW }
 | "->" { ARROW }
 | "def" { DEF (emit_segment lexbuf (Some "def" )) }
 | "lambda" { LAMBDA (emit_segment lexbuf (Some "lambda" )) }

@@ -2,10 +2,20 @@
   (name run)
   (libraries
     base
+    stdio
+    unix
     pyparse
     transform
     re2
   )
+  (instrumentation
+    (backend bisect_ppx --exclusions bisect.exclude)
+    (deps ../../../bisect.exclude))
   (flags (:standard -w -14))
 )
 
+(install
+ (section share)
+ (files
+  (prelude.dfy as dafny-of-python/prelude.dfy)
+  (list.dfy as dafny-of-python/list.dfy)))

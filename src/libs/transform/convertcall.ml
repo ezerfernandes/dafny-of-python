@@ -6,6 +6,10 @@ let temp_source = Hashtbl.create (module String)
 let printf = Stdlib.Printf.printf
 let var_num : int ref = ref 0
 
+let reset () =
+  Hashtbl.clear temp_source;
+  var_num := 0
+
 let replace e call =
   let pos, v = begin 
     match e with
@@ -59,8 +63,12 @@ let rec exp_calls = function
         | _ -> (al1, lel)
         end
     )  ~init:([], Tuple [])
-  | Forall (sl, e) -> ([], Forall (sl, e))
-  | Exists (sl, e) -> ([], Exists (sl, e))
+  | Forall (sl, e) ->
+    let al, n_e = exp_calls e in
+    (al, Forall (sl, n_e))
+  | Exists (sl, e) ->
+    let al, n_e = exp_calls e in
+    (al, Exists (sl, n_e))
   | Subscript (e1, e2) -> 
     let al1, n_e1 = exp_calls e1 in
     let al2, n_e2 = exp_calls e2 in
@@ -82,12 +90,15 @@ let rec exp_calls = function
     end
   | Len (s, e) -> let al, n_e = exp_calls e in (al, Len (s, n_e))
   | Old (s, e) -> let al, n_e = exp_calls e in (al, Old (s, n_e))
-  | Fresh (s, e) -> let al, n_e = exp_calls e in (al, Old (s, n_e))
+  | Fresh (s, e) -> let al, n_e = exp_calls e in (al, Fresh (s, n_e))
   | IfElseExp (e1, c, e2) -> 
     let al1, n_e1 = exp_calls e1 in
     let al2, n_c = exp_calls c in
     let al3, n_e2 = exp_calls e2 in
     (al1@al2@al3, IfElseExp (n_e1, n_c, n_e2))
+  | Lambda (il, e) ->
+    let al, n_e = exp_calls e in
+    (al, Lambda (il, n_e))
   | e -> ([], e) 
   
 let assign_to_inv = function
@@ -142,13 +153,22 @@ let rec stmt_calls s =
     (* let n_specl = List.fold n_specll ~f:(fun so_far specl -> so_far@[specl]) ~init:[] in *)
     let als = List.fold als_nspecll ~f:(fun so_far (al, _) -> so_far@al) ~init:[] in
     let n_sl = List.fold sl ~f:(fun so_far s -> so_far@(stmt_calls s)) ~init:[] in
-    let aug_n_sl = n_sl@als in
-    al@als@[While (n_specl, n_e, aug_n_sl)]
+    al@als@[While (n_specl, n_e, n_sl)]
   | Function (specl, i, pl, t, sl) ->
-    (* List.iter specl ~f:(fun spec -> let al, _ = spec_calls spec in if List.length al > 0 then failwith "Calls are not allowed in function specifications"); *)
+    let als_nspecl = List.map specl ~f:spec_calls in
+    let n_specl = List.fold als_nspecl ~f:(fun so_far (_, specs) -> so_far @ specs) ~init:[] in
+    let als = List.fold als_nspecl ~f:(fun so_far (al, _) -> so_far @ al) ~init:[] in
     let n_sl = List.fold sl ~f:(fun so_far s -> so_far@(stmt_calls s)) ~init:[] in
-    [Function (specl, i, pl, t, n_sl)]
-  | For _ -> [s]
+    als @ [Function (n_specl, i, pl, t, n_sl)]
+  | For (specl, il, e, sl) ->
+    let als_nspecl = List.map specl ~f:spec_calls in
+    let n_specl = List.fold als_nspecl ~f:(fun so_far (_, specs) -> so_far @ specs) ~init:[] in
+    let spec_assignments = List.fold als_nspecl ~f:(fun so_far (al, _) -> so_far @ al) ~init:[] in
+    let al, n_e = exp_calls e in
+    let n_sl = List.fold sl ~f:(fun so_far s -> so_far @ stmt_calls s) ~init:[] in
+    spec_assignments @ al @ [For (n_specl, il, n_e, n_sl)]
 
-let prog = function 
+let prog program =
+  reset ();
+  match program with
   | Program sl -> Program (List.fold sl ~f:(fun so_far s -> so_far@(stmt_calls s)) ~init:[])

@@ -5,6 +5,8 @@ let printf = Stdlib.Printf.printf
 
 let counter_num : int ref = ref 0
 
+let reset () = counter_num := 0
+
 let rec stmt_for s = 
   match s with
   | Pass -> [s]
@@ -50,7 +52,9 @@ let rec stmt_for s =
     let n_sl = List.fold sl ~f:(fun so_far s -> so_far@(stmt_for s)) ~init:[] in
     [Function (specl, i, pl, t, n_sl)]
 
-let prog = function 
+let prog program =
+  reset ();
+  match program with
   | Program sl ->
     let n_sl = List.fold sl ~f:(fun so_far s -> so_far@(stmt_for s)) ~init:[] in
     Program n_sl

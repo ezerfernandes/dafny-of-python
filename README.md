@@ -12,7 +12,7 @@ def cube(x: int) -> int:
 
 The following Dafny function is generated:
 ```Dafny
-function method cube(x: int): (res: int)
+function cube(x: int): (res: int)
   ensures (res == ((x * x) * x))
 {
   x
@@ -29,9 +29,59 @@ Line: 1  Column: 11  Value: ==,  Related location,  This is the postcondition th
 As the specifications are written in comments, Python programs can remain executable without modification. Assuming the translation is correct, successful verification of the translated Dafny program implies that the same properties hold for the original Python program. While the aim is to prevent knowledge of Dafny from being essential, it would certainly help in understanding what can be verified. You can see [additional examples below](#examples) and find more information in the [wiki](https://github.com/arsalanc-v2/dafny-of-python/wiki).
 
 ## Usage
+
+Install the locked Python dependency and enter the pinned Opam environment:
+
 ```
-sudo dune exec src/bin/main.exe < [file].py
+uv sync --frozen
+opam switch create . 4.14.2
+opam install . --deps-only
+opam install alcotest bisect_ppx.2.8.3
 ```
+
+Translate a Python program from standard input. The command uses the pinned
+`mypy` from `uv.lock`; Dune and the OCaml libraries come from Opam; Dafny is a
+separate pinned .NET tool.
+
+```
+uv run --frozen -- opam exec -- dune exec src/bin/main.exe < [file].py
+```
+
+The runtime library paths are resolved independently of the current working
+directory. Set `DAFNY_OF_PYTHON_RUNTIME_DIR`, or pass `--prelude` and `--list`,
+when using an installed copy. Generated files are temporary and removed after
+each run. Pass `--keep-artifacts` when debugging.
+
+The CLI exits with 0 when both mypy and Dafny succeed, 1 when translation or
+Dafny verification fails, and 2 when mypy fails but translation and Dafny
+verification still complete. A mypy failure is printed and does not prevent
+generated Dafny from being inspected.
+
+## Development
+
+The repository targets Python 3.12, OCaml 4.14.2, Dune 3.24.2, Dafny 4.11.0,
+and mypy 1.18.2. Python dependencies are locked in `uv.lock`; OCaml
+dependencies are declared in `dafny-of-python.opam` and pinned for the local
+Opam switch by `dafny-of-python.opam.locked`. The generated Dafny uses Dafny 4
+syntax (`function`).
+
+Canonical commands are:
+
+```
+uv sync --frozen
+uv run --frozen -- opam exec -- dune build @all
+uv run --frozen -- opam exec -- dune runtest
+uv run --frozen -- opam exec -- ./scripts/coverage.sh
+```
+
+Coverage is Bisect_ppx expression-point coverage over maintained handwritten
+OCaml in `src/bin`, `src/libs/parse`, `src/libs/transform`, and `src/libs/run`.
+The gate requires every expected source file and exactly 100% of its
+instrumentation points. See [`docs/coverage.md`](docs/coverage.md) for the
+prototype-code decision and exclusions.
+
+CI installs the pinned Dafny tool, synchronizes uv with `--frozen`, creates the
+Opam environment, runs the ordinary suite, and enforces the coverage gate.
 ## Examples
 ### Type Variables and Aliases
 ```Python
@@ -139,4 +189,3 @@ You can find more information in the [wiki](https://github.com/arsalanc-v2/dafny
 - [H2D](http://www.doc.ic.ac.uk/~dcw/h2d.cgi), a compiler from Haskell to Dafny
 - [coq-of-ocaml](https://github.com/clarus/coq-of-ocaml), a compiler from OCaml to Coq
 - [goose](https://github.com/tchajed/goose), a compiler from Go to Coq
-

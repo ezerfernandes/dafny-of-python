@@ -1,0 +1,3 @@
+(* Menhir's generated parser is not maintained source. Its grammar behavior is
+   still covered through Parser.parse_string and Parser.parse_file tests. *)
+file regexp ".*/menhir_parser\\.ml"

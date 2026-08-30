@@ -10,7 +10,10 @@
     base
     sexplib
   )
-  (preprocess (pps ppx_jane -allow-unannotated-ignores))
+  (preprocess (pps ppx_jane))
+  (instrumentation
+    (backend bisect_ppx --exclusions bisect.exclude)
+    (deps ../../../bisect.exclude))
   (inline_tests)
   (flags (:standard -w -14))
 )

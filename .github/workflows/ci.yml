@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test-coverage:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.26"
+          python-version: "3.12"
+
+      - name: Set up OCaml and Opam
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "4.14.2"
+          dune-cache: true
+
+      - name: Install locked Python dependencies
+        run: uv sync --frozen
+
+      - name: Install OCaml dependencies
+        run: |
+          opam install . --deps-only --locked --yes
+          opam install alcotest bisect_ppx.2.8.3 --yes
+
+      - name: Install pinned Dafny
+        run: |
+          dotnet tool install --global dafny --version 4.11.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      - name: Build with warnings enabled
+        run: uv run --frozen -- opam exec -- dune build @all --profile dev
+
+      - name: Run unit and integration tests
+        run: uv run --frozen -- opam exec -- dune runtest
+
+      - name: Enforce exact coverage
+        run: uv run --frozen -- opam exec -- ./scripts/coverage.sh
+
+      - name: Upload coverage HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bisect-ppx-html-coverage
+          path: _coverage/html
+          if-no-files-found: warn
+
+      - name: Confirm tests did not modify the checkout
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"

@@ -53,6 +53,16 @@ type declarations = (string * string) list ref
 let vars: declarations = ref []
 let add_vars vl = List.iter vl ~f:(fun v -> vars := (!curr_func, seg_val v)::!vars)
 
+(* All emitter state belongs to one translation. Reset it before every public
+   emission so repeated test runs and library callers cannot observe stale
+   line numbers, declarations, or source-map entries. *)
+let reset () =
+  sm := [];
+  curr_line := 1;
+  curr_column := 1;
+  curr_func := "";
+  vars := []
+
 let rec lookup fn v = function
   | [] -> false
   | (f2, v2)::_ when (String.equal fn f2) && (String.equal v v2) -> true
@@ -68,11 +78,7 @@ let newcolumn_h id s =
 let source_from_temp name =
   match Base.Hashtbl.find Convertcall.temp_source name with 
   | Some v -> v
-  | None -> begin 
-    match Base.Hashtbl.find Convertcall.temp_source name with 
-    | Some v -> v
-    | None -> name
-  end
+  | None -> name
 
 let print_ident id seg =
   let n = newcolumn (indent id) in 
@@ -484,7 +490,7 @@ let print_toplevel id = function
     ]
   | DFuncMeth (speclst, ident, gl, pl, t, oe) -> (curr_func := seg_val ident);
     let n = newcolumn (indent id) in 
-    let m = newcolumn "function method" in
+    let m = newcolumn "function" in
     let pident = print_ident 1 ident in
     let pgl = match gl with | [] -> "" | gl -> begin
       let ob = newcolumn "<" in
@@ -525,8 +531,15 @@ let print_toplevel id = function
       String.concat [eq; pt] in
     String.concat [n; t; pident; pet] 
 
-let print_prog = function
+let print_prog program =
+  reset ();
+  match program with
   | DProg(_, tll) -> newcolumn_concat (fun x -> newline_f (print_toplevel 0) x) "" tll
+
+let print_prog_with_sourcemap program =
+  let source = print_prog program in
+  let source_map = ref (List.map !sm ~f:(fun mapping -> mapping)) in
+  source, source_map
 
 let extr lst = match lst with
   | Some el -> el

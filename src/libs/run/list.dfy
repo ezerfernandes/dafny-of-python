@@ -51,7 +51,7 @@ class List<T(==)> {
         lst := res;
     }
 
-    function method removeIndex(e: T, lst: seq<T>): int
+    function removeIndex(e: T, lst: seq<T>): int
         requires e in lst
         ensures 0 <= removeIndex(e, lst) < |lst|
         ensures lst[removeIndex(e, lst)] == e
@@ -122,7 +122,7 @@ class List<T(==)> {
         }
     }
 
-    function method atIndex(idx: int): (e: T)
+    function atIndex(idx: int): (e: T)
         reads this
         requires 0 <= idx < |lst|
         ensures e == lst[idx]
@@ -168,14 +168,14 @@ class List<T(==)> {
         return new List(lst);
     }
 
-    function method len(): (l: nat) 
+    function len(): (l: nat)
         reads this
         ensures l == |lst|
     {
         |lst|
     }
 
-    function method count(e: T): (res: int)
+    function count(e: T): (res: int)
         reads this
         ensures res == multiset(lst)[e]
     {
@@ -200,7 +200,7 @@ class List<T(==)> {
         lst := newLst;
     }
 
-    function method contains(e: T): (res: bool)
+    function contains(e: T): (res: bool)
         reads this
         ensures e in lst <==> res
     {

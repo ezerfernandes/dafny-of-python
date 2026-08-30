@@ -4,6 +4,8 @@ open Pyparse.Astpy
 let printf = Stdlib.Printf.printf
 let vars = Hash_set.create (module String)
 
+let reset () = Hash_set.clear vars
+
 let convert_typvar lhs rhs = 
   match lhs with
   | Identifier (_, Some ident_v) -> begin
@@ -32,7 +34,9 @@ let generics = function
     end
   | s -> (Some s, [])
 
-let prog = function 
+let prog program =
+  reset ();
+  match program with
   | Program sl ->
     let (n_osl, vs) = List.fold sl ~f:(
       fun (sf_sl, sf_gens) s -> let (s, gens) = generics s in (sf_sl@[s], sf_gens@gens)) ~init:([], []) in

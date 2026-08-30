@@ -1,0 +1,16 @@
+(test
+ (name test_suite)
+ (libraries alcotest unix pyparse transform run))
+
+(rule
+ (alias runtest)
+ (deps
+  cli_test.sh
+  %{exe:../src/bin/main.exe}
+  %{dep:../src/libs/run/prelude.dfy}
+  %{dep:../src/libs/run/list.dfy})
+ (action
+  (run ./cli_test.sh
+    %{exe:../src/bin/main.exe}
+    %{dep:../src/libs/run/prelude.dfy}
+    %{dep:../src/libs/run/list.dfy})))

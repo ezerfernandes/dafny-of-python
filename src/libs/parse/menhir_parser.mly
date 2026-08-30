@@ -5,6 +5,8 @@ menhir --list-errors
 %nonassoc: raise a SyntaxError */
 
 %{
+  [@@@coverage exclude_file]
+
   open Astpy
 %}
 
@@ -51,8 +53,8 @@ stmts_plus:
   ;
 
 newline_star:
-  | NEWLINE; newline_star { [] }
-  | { [] }
+  | NEWLINE; newline_star { () }
+  | { () }
   ;
 
 stmt:
