@@ -78,9 +78,14 @@ grep -q 'Typechecking failed (exit code 2)' "$workdir/errors"
 # A valid Python fixture must exercise the pinned mypy success path and the
 # CLI's zero exit code while Dafny verifies the generated program.
 cat > "$workdir/valid_program.py" <<'PYTHON'
+# pre len(xs) > 0
+def first(xs: list[int]) -> int:
+  return xs[0]
+
 def increment(x: int) -> int:
   return x + 1
 
+assert first([1]) == 1
 assert increment(1) == 2
 PYTHON
 
@@ -98,6 +103,7 @@ status=$?
 set -e
 
 test "$status" -eq 0
+grep -q 'function first' "$workdir/valid_output"
 grep -q 'function increment' "$workdir/valid_output"
 grep -q 'verifier finished with [0-9][0-9]* verified, 0 error' "$workdir/valid_output"
 # Dafny 4.11 reports harmless warnings (for example, an `old` expression that

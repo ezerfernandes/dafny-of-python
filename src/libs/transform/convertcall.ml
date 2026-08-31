@@ -29,6 +29,38 @@ let replace e call =
   let a_ident = (pos, Some name) in 
   (Assign (None, [Identifier a_ident], [call]), Identifier a_ident) (* TODO: use type of call *)
 
+(* Traverse expressions under lexical binders without extracting assignments.
+   This keeps the old conversion API safe for callers that still use it while
+   making its traversal complete for every expression constructor. *)
+let rec exp_calls_scoped = function
+  | Dot (value, identifier) -> Dot (exp_calls_scoped value, identifier)
+  | BinaryExp (left, operator, right) ->
+    BinaryExp (exp_calls_scoped left, operator, exp_calls_scoped right)
+  | UnaryExp (operator, value) -> UnaryExp (operator, exp_calls_scoped value)
+  | Call (callee, arguments) ->
+    Call (exp_calls_scoped callee, List.map arguments ~f:exp_calls_scoped)
+  | Lst values -> Lst (List.map values ~f:exp_calls_scoped)
+  | Array values -> Array (List.map values ~f:exp_calls_scoped)
+  | Set values -> Set (List.map values ~f:exp_calls_scoped)
+  | Dict entries ->
+    Dict (List.map entries ~f:(fun (key, value) -> exp_calls_scoped key, exp_calls_scoped value))
+  | Tuple values -> Tuple (List.map values ~f:exp_calls_scoped)
+  | Subscript (value, selector) -> Subscript (exp_calls_scoped value, exp_calls_scoped selector)
+  | Index value -> Index (exp_calls_scoped value)
+  | Slice (lower, upper) ->
+    Slice (Option.map lower ~f:exp_calls_scoped, Option.map upper ~f:exp_calls_scoped)
+  | Forall (identifiers, body) -> Forall (identifiers, exp_calls_scoped body)
+  | Exists (identifiers, body) -> Exists (identifiers, exp_calls_scoped body)
+  | Len (segment, value) -> Len (segment, exp_calls_scoped value)
+  | Max (segment, value) -> Max (segment, exp_calls_scoped value)
+  | Old (segment, value) -> Old (segment, exp_calls_scoped value)
+  | Fresh (segment, value) -> Fresh (segment, exp_calls_scoped value)
+  | Lambda (identifiers, body) -> Lambda (identifiers, exp_calls_scoped body)
+  | IfElseExp (when_true, condition, when_false) ->
+    IfElseExp
+      (exp_calls_scoped when_true, exp_calls_scoped condition, exp_calls_scoped when_false)
+  | expression -> expression
+
 let rec exp_calls = function
   | Dot (e, ident) -> let al, n_e = exp_calls e in (al, Dot (n_e, ident))
   | BinaryExp (e1, op, e2) -> 
@@ -86,9 +118,14 @@ let rec exp_calls = function
     let al2, n_c = exp_calls c in
     let al3, n_e2 = exp_calls e2 in
     (al1@al2@al3, IfElseExp (n_e1, n_c, n_e2))
-  (* Calls inside quantifiers and lambdas are deliberately left intact by the
-     catch-all below.  Hoisting an assignment from one of those expressions
-     would move it outside its lexical scope. *)
+  | Forall (identifiers, body) -> Forall (identifiers, exp_calls_scoped body) |> fun expression -> [], expression
+  | Exists (identifiers, body) -> Exists (identifiers, exp_calls_scoped body) |> fun expression -> [], expression
+  | Lambda (identifiers, body) -> Lambda (identifiers, exp_calls_scoped body) |> fun expression -> [], expression
+  | Array values -> [], Array (List.map values ~f:exp_calls_scoped)
+  | Set values -> [], Set (List.map values ~f:exp_calls_scoped)
+  | Dict entries ->
+    [], Dict (List.map entries ~f:(fun (key, value) -> exp_calls_scoped key, exp_calls_scoped value))
+  | Max (segment, value) -> [], Max (segment, exp_calls_scoped value)
   | e -> ([], e) 
   
 let assign_to_inv = function

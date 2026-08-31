@@ -724,6 +724,409 @@ let test_convertfor_statement_paths () =
     ; Function ([], segment "f", [], Typ (TInt def_seg), [ Pass ])
     ]
 
+let test_semantic_lowering_paths () =
+  let open Ast in
+  let int_type = TInt def_seg in
+  let list_type = TLst (def_seg, Some int_type) in
+  let sequence_type = TGeneric (segment "seq", [ int_type ]) in
+  let map_type = TDict (def_seg, Some (TStr def_seg), Some int_type) in
+  let tuple_type = TTuple (def_seg, Some [ int_type; TStr def_seg ]) in
+  let xs = identifier "xs" in
+  let sequence = identifier "sequence" in
+  let mapping = identifier "mapping" in
+  let tuple = identifier "tuple" in
+  let environment =
+    Transform.Semantic.empty
+    |> fun environment -> Transform.Semantic.bind environment "xs" list_type
+    |> fun environment -> Transform.Semantic.bind environment "sequence" sequence_type
+    |> fun environment -> Transform.Semantic.bind environment "mapping" map_type
+    |> fun environment -> Transform.Semantic.bind environment "tuple" tuple_type
+  in
+  List.iter
+    (fun name -> ignore (Transform.Semantic.normalize_type (TIdent (segment name))))
+    [ "list"; "seq"; "sequence"; "set"; "dict"; "map"; "tuple"; "array" ];
+  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = [] } "ignored" int_type);
+  ignore (Transform.Semantic.annotation (Typ int_type));
+  ignore (Transform.Semantic.annotation (Identifier (segment "Alias")));
+  ignore (Transform.Semantic.annotation (Literal TrueLit));
+  let lower expression = Transform.Lowering.expression ~environment expression in
+  (match Transform.Lowering.type_dfy list_type with
+   | D.DIdentTyp ((_, Some "List"), [ D.DInt _ ]) -> ()
+   | _ -> fail "list annotations should use the runtime List type");
+  let list_index = lower (Subscript (xs, Index (Literal (IntLit "0")))) in
+  (match list_index.result with
+   | D.DCallExpr (D.DDot (_, (_, Some "atIndex")), [ D.DIntLit "0" ]) -> ()
+   | _ -> fail "list indexes should use the runtime atIndex operation");
+  expect_exception "scoped list construction" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () ->
+       Transform.Lowering.lower
+         (Transform.Lowering.scoped (Transform.Lowering.context environment))
+         (Lst [ Literal (IntLit "1") ]));
+  let sequence_index = lower (Subscript (sequence, Index (Literal (IntLit "0")))) in
+  (match sequence_index.result with
+   | D.DNativeIndex (_, D.DIntLit "0") -> ()
+   | _ -> fail "sequence indexes should use native Dafny indexing");
+  let array_environment =
+    Transform.Semantic.bind environment "array" (TGeneric (segment "array", [ int_type ]))
+  in
+  let array_index =
+    Transform.Lowering.expression ~environment:array_environment
+      (Subscript (identifier "array", Index (Literal (IntLit "0"))))
+  in
+  (match array_index.result with
+   | D.DNativeIndex _ -> ()
+   | _ -> fail "array indexes should use native Dafny indexing");
+  let map_index = lower (Subscript (mapping, Index (Literal (StringLit "key")))) in
+  (match map_index.result with
+   | D.DNativeIndex (_, D.DStringLit "key") -> ()
+   | _ -> fail "map indexes should use native Dafny indexing");
+  let tuple_index = lower (Subscript (tuple, Index (Literal (IntLit "1")))) in
+  (match tuple_index.result with
+   | D.DTupleIndex (_, 1) -> ()
+   | _ -> fail "tuple indexes should select a static tuple field");
+  let unknown_index = lower (Subscript (identifier "unknown", Index (Literal (IntLit "0")))) in
+  (match unknown_index.result with
+   | D.DSubscript _ -> ()
+   | _ -> fail "unknown collection indexes should remain explicit subscripts");
+  expect_exception "dynamic tuple indexes" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> lower (Subscript (tuple, Index (identifier "position"))));
+  let list_length = lower (Len (def_seg, xs)) in
+  (match list_length.result with
+   | D.DCallExpr (D.DDot (_, (_, Some "len")), []) -> ()
+   | _ -> fail "list length should use the runtime len operation");
+  let sequence_length = lower (Len (def_seg, sequence)) in
+  (match sequence_length.result with
+   | D.DLen (_, D.DIdentifier _) -> ()
+   | _ -> fail "sequence length should use Dafny cardinality");
+  let method_call = Call (Dot (xs, segment "method"), []) in
+  let lowered_method = lower method_call in
+  check int "ordinary method calls have one local prelude" 1 (List.length lowered_method.prelude);
+  let quantifier = lower (Forall ([ segment "k" ], method_call)) in
+  check int "quantifier calls do not escape their scope" 0 (List.length quantifier.prelude);
+  (match quantifier.result with
+   | D.DForall (_, D.DCallExpr _) -> ()
+   | _ -> fail "quantifier body should retain its method call");
+  let conditional = lower (IfElseExp (method_call, Literal TrueLit, method_call)) in
+  check int "conditional branches are not evaluated eagerly" 0 (List.length conditional.prelude);
+  let nested_dictionary = lower (Dict [ Literal (StringLit "key"), method_call ]) in
+  check int "nested method calls are not silently dropped" 1 (List.length nested_dictionary.prelude);
+  let explicit_target =
+    Transform.Lowering.statements ~environment
+      [ Assign (None, [ Dot (xs, segment "field") ], [ Literal (IntLit "1") ]) ]
+  in
+  (match explicit_target with
+   | [ D.DAssignLvalue (_, [ D.Field (_, (_, Some "field")) ], _) ] -> ()
+   | _ -> fail "field assignments should use explicit Dafny lvalues");
+  let class_environment =
+    let definition : Transform.Semantic.class_definition =
+      { class_name = "Box"
+      ; fields =
+          [ { field_name = "value"; field_type = int_type }
+          ; { field_name = "apply"; field_type = TCallable (def_seg, [], int_type) }
+          ]
+      ; methods =
+          [ { name = "run"; parameters = []; return_type = int_type
+            ; kind = Transform.Semantic.Method
+            } ]
+      }
+    in
+    Transform.Semantic.add_class environment definition
+    |> fun environment -> Transform.Semantic.bind environment "box" (TGeneric (segment "Box", []))
+  in
+  check bool "class fields resolve through the semantic environment" true
+    (eqtyp
+       (Transform.Semantic.infer class_environment (Dot (identifier "box", segment "value")))
+       int_type);
+  ignore (Transform.Semantic.infer class_environment (Dot (identifier "box", segment "missing")));
+  ignore (Transform.Semantic.infer environment (Dot (identifier "ordinary", segment "field")));
+  check bool "class methods resolve through the semantic environment" true
+    (eqtyp
+       (Transform.Semantic.infer class_environment
+          (Call (Dot (identifier "box", segment "run"), [])))
+       int_type);
+  check bool "callable-valued fields expose their return type" true
+    (eqtyp
+       (Transform.Semantic.infer class_environment
+          (Call (Dot (identifier "box", segment "apply"), [])))
+       int_type);
+  let signature : Transform.Semantic.callable_signature =
+    { name = "pure"; parameters = []; return_type = int_type; kind = Transform.Semantic.PureFunction }
+  in
+  let function_environment = Transform.Semantic.add_function environment signature in
+  let generator_signature : Transform.Semantic.callable_signature =
+    { name = "generate"; parameters = []; return_type = int_type; kind = Transform.Semantic.Generator }
+  in
+  let constructor_signature : Transform.Semantic.callable_signature =
+    { name = "construct"; parameters = []; return_type = int_type; kind = Transform.Semantic.Constructor }
+  in
+  let callable_environment =
+    Transform.Semantic.add_function function_environment generator_signature
+    |> fun environment -> Transform.Semantic.add_function environment constructor_signature
+  in
+  check int "generator calls use a scoped temporary" 1
+    (List.length
+       (Transform.Lowering.expression ~environment:callable_environment
+          (Call (identifier "generate", []))).prelude);
+  check int "constructors remain expressions" 0
+    (List.length
+       (Transform.Lowering.expression ~environment:callable_environment
+          (Call (identifier "construct", []))).prelude);
+  check bool "callable kind is resolved" true
+    (match Transform.Semantic.callable_kind function_environment (identifier "pure") with
+     | Transform.Semantic.PureFunction -> true
+     | _ -> false);
+  check bool "unknown identifiers default to pure functions" true
+    (match Transform.Semantic.callable_kind environment (identifier "unknown") with
+     | Transform.Semantic.PureFunction -> true
+     | _ -> false);
+  check bool "non-identifier callables default to pure functions" true
+    (match Transform.Semantic.callable_kind environment (Literal TrueLit) with
+     | Transform.Semantic.PureFunction -> true
+     | _ -> false);
+  (match Transform.Semantic.normalize_type list_type with
+   | TGeneric (_, [ TInt _ ]) -> ()
+   | _ -> fail "list annotations should normalize to generic types");
+  let all_types =
+    [ TIdent (segment "Alias"); TInt def_seg; TFloat def_seg; TBool def_seg
+    ; TStr def_seg; TNone def_seg; TObj def_seg; TLst (def_seg, Some int_type)
+    ; TDict (def_seg, Some int_type, Some (TStr def_seg)); TSet (def_seg, Some int_type)
+    ; TTuple (def_seg, Some [ int_type ]); TTuple (def_seg, None)
+    ; TCallable (def_seg, [ int_type ], int_type); TType (def_seg, Some int_type)
+    ; TGeneric (segment "Box", [ int_type ])
+    ; TGeneric (segment "list", [ int_type ]); TGeneric (segment "seq", [ int_type ])
+    ; TGeneric (segment "set", [ int_type ]); TGeneric (segment "map", [ TStr def_seg; int_type ])
+    ; TGeneric (segment "array", [ int_type ]); TGeneric (segment "tuple", [ int_type; TStr def_seg ])
+    ]
+  in
+  List.iter (fun typ -> ignore (Transform.Semantic.normalize_type typ)) all_types;
+  List.iter (fun typ -> ignore (Transform.Semantic.type_name typ)) all_types;
+  List.iter (fun typ -> ignore (Transform.Semantic.generic_arguments typ)) all_types;
+  ignore (Transform.Semantic.lookup environment "missing");
+  ignore (Transform.Semantic.lookup_function environment "missing");
+  ignore (Transform.Semantic.lookup_class environment "Missing");
+  ignore (Transform.Semantic.leave_scope (Transform.Semantic.enter_scope environment Transform.Semantic.ComprehensionScope));
+  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = [] });
+  let replacement : Transform.Semantic.callable_signature =
+    { name = "pure"; parameters = []; return_type = int_type; kind = Transform.Semantic.Constructor }
+  in
+  ignore (Transform.Semantic.add_function function_environment replacement);
+  let replacement_class : Transform.Semantic.class_definition =
+    { class_name = "Box"; fields = []; methods = [] }
+  in
+  ignore (Transform.Semantic.add_class class_environment replacement_class);
+  List.iter
+    (fun expression -> ignore (Transform.Semantic.infer environment expression))
+    [ Typ list_type; Literal TrueLit; xs; Dot (xs, segment "field")
+    ; UnaryExp (Not def_seg, Literal TrueLit)
+    ; BinaryExp (Literal (IntLit "1"), Plus def_seg, Literal (FloatLit "1.0"))
+    ; BinaryExp (Literal TrueLit, And def_seg, Literal FalseLit)
+    ; Call (identifier "pure", []); Call (identifier "len", [ xs ])
+    ; Call (identifier "list", [ Lst [ Literal (IntLit "1") ] ])
+    ; Call (identifier "list", [])
+    ; Call (identifier "set", []); Call (identifier "dict", [])
+    ; Call (Dot (xs, segment "method"), []); Lst [ xs ]; Array [ xs ]; Set [ xs ]
+    ; Dict [ (Literal (StringLit "k"), Literal (IntLit "1")) ]; Tuple [ xs; sequence ]
+    ; Subscript (xs, Index (Literal (IntLit "0")))
+    ; Subscript (mapping, Index (Literal (StringLit "k")))
+    ; Subscript (tuple, Index (Literal (IntLit "1"))); Index xs
+    ; Slice (Some (Literal (IntLit "0")), None); Forall ([ segment "k" ], xs)
+    ; Exists ([ segment "k" ], xs); Len (def_seg, xs); Max (def_seg, xs)
+    ; Old (def_seg, xs); Fresh (def_seg, xs); Lambda ([ segment "k" ], xs)
+    ; IfElseExp (xs, Literal TrueLit, sequence)
+    ];
+  List.iter
+    (fun operator ->
+       ignore
+         (Transform.Semantic.infer environment
+            (BinaryExp (Literal (IntLit "1"), operator, Literal (IntLit "2")))))
+    [ Minus def_seg; Times def_seg; Divide def_seg; Mod def_seg; EqEq def_seg
+    ; NEq def_seg; Lt def_seg; LEq def_seg; Gt def_seg; GEq def_seg; Or def_seg
+    ; NotIn def_seg; In def_seg; BiImpl def_seg; Implies def_seg; Explies def_seg ];
+  ignore (Transform.Semantic.infer_literal TrueLit);
+  List.iter (fun literal -> ignore (Transform.Semantic.infer_literal literal))
+    [ FalseLit; IntLit "1"; FloatLit "1.0"; StringLit "s"; NoneLit ];
+  ignore (Transform.Semantic.numeric_type int_type (TFloat def_seg));
+  ignore (Transform.Semantic.numeric_type (TFloat def_seg) int_type);
+  ignore (Transform.Semantic.numeric_type int_type int_type);
+  ignore (Transform.Semantic.numeric_type (TIdent def_seg) (TIdent def_seg));
+  ignore (Transform.Semantic.tuple_element 0 []);
+  ignore (Transform.Semantic.tuple_element 1 [ int_type; TStr def_seg ]);
+  ignore (Transform.Semantic.integer_literal (Literal (IntLit "not-an-int")));
+  List.iter
+    (fun target -> ignore (Transform.Semantic.type_of_target environment target))
+    [ xs; Dot (xs, segment "field"); Subscript (xs, Index (Literal (IntLit "0")))
+    ; Tuple [ xs; sequence ]; Literal TrueLit ];
+  ignore (Transform.Semantic.infer environment (Call (Lst [], [])));
+  ignore (Transform.Semantic.infer environment (Call (identifier "unknown", [])));
+  ignore (Transform.Semantic.infer environment (Call (identifier "map", [])));
+  ignore (Transform.Semantic.infer environment (Call (Dot (identifier "ordinary", segment "method"), [])));
+  ignore (Transform.Semantic.infer environment (Call (Literal TrueLit, [])));
+  ignore (Transform.Semantic.infer environment (Dict []));
+  ignore (Transform.Semantic.infer environment (Subscript (sequence, Slice (None, None))));
+  ignore (Transform.Semantic.infer environment (Subscript (identifier "unknown", Index (Literal (IntLit "0")))));
+  ignore (Transform.Semantic.infer environment (Max (def_seg, identifier "unknown")));
+  ignore (Transform.Semantic.infer environment
+            (IfElseExp (Literal (IntLit "1"), Literal (IntLit "2"), Literal (IntLit "3"))));
+  ignore (Transform.Semantic.infer environment
+            (IfElseExp (Literal (FloatLit "1.0"), Literal (IntLit "2"), Literal (StringLit "3"))));
+  ignore (Transform.Semantic.infer environment
+            (IfElseExp (Literal (FloatLit "1.0"), Literal (IntLit "2"), Literal (FloatLit "3.0"))));
+  ignore (Transform.Semantic.infer environment
+            (IfElseExp (Literal (FloatLit "1.0"), Literal TrueLit, Literal (IntLit "3"))));
+  List.iter
+    (fun specification -> ignore (Transform.Semantic.infer_spec environment specification))
+    [ Pre xs; Post xs; Invariant xs; Decreases xs; Reads xs; Modifies xs ];
+  ignore
+    (Transform.Semantic.analyze
+       (Program
+          [ Assign (Some (Typ int_type), [ identifier "value" ], [ Literal (IntLit "1") ])
+          ; Assign (Some (Typ list_type), [ identifier "xs" ], [ Lst [ Literal (IntLit "1") ] ])
+          ; Assign (None, [ Dot (xs, segment "field") ], [ Literal (IntLit "1") ])
+          ; IfElse (Literal TrueLit, [ Assert xs ], [ (Literal FalseLit, [ Pass ]) ], [ Exp xs ])
+          ; While ([ Invariant xs ], Literal FalseLit, [ Pass ])
+          ; For ([ Invariant xs ], [ segment "item" ], xs, [ Pass ])
+          ; For ([], [ segment "item" ], identifier "unknown", [ Break; Continue ])
+          ; Break
+          ; Continue
+          ; Function ([], segment "local", [ segment "argument", Typ int_type ], Typ int_type, [ Return xs ])
+          ]));
+  List.iter (fun typ -> ignore (Transform.Lowering.type_dfy typ)) all_types;
+  ignore (Transform.Todafnyast.typ_dfy (TGeneric (segment "Box", [ int_type ])));
+  List.iter
+    (fun typ -> expect_exception "invalid incomplete type" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+       (fun () -> Transform.Lowering.type_dfy typ))
+    [ TLst (def_seg, None); TSet (def_seg, None); TDict (def_seg, None, Some int_type)
+    ; TDict (def_seg, Some int_type, None); TType (def_seg, None) ];
+  ignore (Transform.Lowering.annotation_type (Typ int_type));
+  ignore (Transform.Lowering.annotation_type (Identifier (segment "Alias")));
+  expect_exception "invalid annotation" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> Transform.Lowering.annotation_type (Literal TrueLit));
+  List.iter (fun literal -> ignore (Transform.Lowering.literal_dfy literal))
+    [ TrueLit; FalseLit; IntLit "1"; FloatLit "1.0"; StringLit "s"; NoneLit ];
+  List.iter (fun operator -> ignore (Transform.Lowering.unary_operator operator)) [ Not def_seg; UMinus def_seg ];
+  List.iter
+    (fun operator -> ignore (Transform.Lowering.binary_operator operator))
+    [ NotIn def_seg; In def_seg; Plus def_seg; Minus def_seg; Times def_seg; Divide def_seg
+    ; Mod def_seg; NEq def_seg; EqEq def_seg; Lt def_seg; LEq def_seg; Gt def_seg; GEq def_seg
+    ; And def_seg; Or def_seg; BiImpl def_seg; Implies def_seg; Explies def_seg ];
+  ignore (Transform.Lowering.generic_name int_type);
+  ignore (Transform.Lowering.generic_arguments int_type);
+  ignore (Transform.Lowering.generic_arguments list_type);
+  List.iter
+    (fun expression -> ignore (Transform.Lowering.expression ~environment expression))
+    [ Typ (TNone def_seg); Literal (StringLit "s"); xs; Dot (xs, segment "field")
+    ; BinaryExp (xs, Plus def_seg, xs); BinaryExp (xs, And def_seg, xs)
+    ; BinaryExp (xs, Or def_seg, xs)
+    ; UnaryExp (Not def_seg, xs); Array [ xs ]; Set [ xs ]; Tuple [ xs; sequence ]
+    ; Lst [ xs ]; Dict [ (xs, sequence) ]; Tuple [ xs ]; Tuple [ xs; sequence ]
+    ; Subscript (sequence, Slice (Some xs, Some sequence)); Index xs
+    ; Subscript (IfElseExp (xs, Literal TrueLit, xs), Index xs)
+    ; Subscript (xs, Index (IfElseExp (xs, Literal TrueLit, xs)))
+    ; BinaryExp (IfElseExp (xs, Literal TrueLit, xs), Plus def_seg, xs)
+    ; BinaryExp (xs, Plus def_seg, IfElseExp (xs, Literal TrueLit, xs))
+    ; Dict [ (xs, IfElseExp (xs, Literal TrueLit, xs)) ]
+    ; Dict [ (IfElseExp (xs, Literal TrueLit, xs), xs) ]
+    ; Slice (Some xs, Some sequence); Forall ([ segment "k" ], xs)
+    ; Exists ([ segment "k" ], xs); Max (def_seg, xs); Old (def_seg, xs)
+    ; Fresh (def_seg, xs); Lambda ([ segment "k" ], xs)
+    ; IfElseExp (xs, Literal TrueLit, sequence) ];
+  List.iter
+    (fun selector -> ignore (Transform.Lowering.expression ~environment (Subscript (xs, selector))))
+    [ Slice (Some xs, Some sequence); Slice (Some xs, None)
+    ; Slice (None, Some sequence); Slice (None, None) ];
+  List.iter
+    (fun selector -> ignore (Transform.Lowering.lower_selector (Transform.Lowering.context environment) selector))
+    [ Index xs; Slice (Some xs, Some sequence); Slice (Some xs, None)
+    ; Slice (None, Some sequence); Slice (None, None) ];
+  expect_exception "type expression in value context" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> Transform.Lowering.expression ~environment (Typ int_type));
+  ignore (Transform.Lowering.expression (Literal TrueLit));
+  List.iter
+    (fun specification -> ignore (Transform.Lowering.lower_spec (Transform.Lowering.context environment) specification))
+    [ Pre xs; Post xs; Invariant xs; Decreases xs; Reads xs; Modifies xs ];
+  expect_exception "invalid selector" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> Transform.Lowering.lower_selector (Transform.Lowering.context environment) (Literal TrueLit));
+  let lowering_statements =
+    [ Pass; Break; Exp (Call (identifier "pure", [])); Assert xs; Return xs
+    ; Assign (None, [ xs ], [ Literal (IntLit "1") ])
+    ; Assign (Some (Typ int_type), [ xs ], [ Literal (IntLit "2") ])
+    ; IfElse (Literal TrueLit, [ Pass ], [ (Literal FalseLit, [ Pass ]) ], [ Pass ])
+    ; While ([ Invariant xs ], Literal FalseLit, [ Pass ])
+    ]
+  in
+  ignore (Transform.Lowering.statements ~environment lowering_statements);
+  expect_exception "continue lowering" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> Transform.Lowering.statements ~environment [ Continue ]);
+  expect_exception "for lowering requires loop conversion" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> Transform.Lowering.statements ~environment [ For ([], [], xs, []) ]);
+  expect_exception "nested function lowering" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> Transform.Lowering.statements ~environment [ Function ([], segment "f", [], Typ int_type, []) ]);
+  ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) xs);
+  ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) (Dot (xs, segment "field")));
+  ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) (Subscript (xs, Index (Literal (IntLit "0")))));
+  ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) (Tuple [ xs; sequence ]));
+  expect_exception "invalid lvalue" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) (Literal TrueLit));
+  ignore (Transform.Lowering.lower_expression_statement (Transform.Lowering.context environment) (Call (identifier "pure", [])));
+  ignore (Transform.Lowering.lower_expression_statement (Transform.Lowering.context environment) xs);
+  ignore (Transform.Lowering.statements [ Pass ]);
+  let alternative_with_prelude =
+    IfElse
+      (Literal TrueLit, [],
+       [ (method_call, [ Pass ]) ], [])
+  in
+  ignore (Transform.Lowering.statements ~environment [ alternative_with_prelude ]);
+  ignore (Transform.Semantic.infer environment (Subscript (identifier "unknown", Index (Literal (IntLit "0")))));
+  List.iter
+    (fun expression -> ignore (Transform.Convertcall.exp_calls expression))
+    [ Array [ Call (identifier "array_item", []) ]
+    ; Set [ Call (identifier "set_item", []) ]
+    ; Dict [ (Call (identifier "dict_key", []), Call (identifier "dict_value", [])) ]
+    ; Max (def_seg, Call (identifier "max_value", []))
+    ; Forall ([ segment "k" ], Dict [ (identifier "k", Call (identifier "bound", [])) ])
+    ; Exists ([ segment "k" ], Set [ Call (identifier "bound", []) ])
+    ; Lambda ([ segment "k" ], Array [ Call (identifier "bound", []) ])
+    ];
+  List.iter
+    (fun expression -> ignore (Transform.Convertcall.exp_calls_scoped expression))
+    [ Dot (xs, segment "field"); BinaryExp (xs, Plus def_seg, xs)
+    ; UnaryExp (Not def_seg, xs); Call (xs, [ xs ]); Lst [ xs ]; Array [ xs ]; Set [ xs ]
+    ; Dict [ (xs, xs) ]; Tuple [ xs ]; Subscript (xs, Index xs); Index xs
+    ; Slice (Some xs, None); Forall ([ segment "k" ], xs); Exists ([ segment "k" ], xs)
+    ; Len (def_seg, xs); Max (def_seg, xs); Old (def_seg, xs); Fresh (def_seg, xs)
+    ; Lambda ([ segment "k" ], xs); IfElseExp (xs, xs, xs) ];
+  let render_expression expression =
+    Transform.Emitdfy.reset ();
+    Transform.Emitdfy.print_exp 0 expression
+  in
+  ignore (render_expression (D.DNativeIndex (D.DIdentifier (segment "value"), D.DIntLit "0")));
+  ignore (render_expression (D.DTupleIndex (D.DIdentifier (segment "value"), 1)));
+  Transform.Emitdfy.reset ();
+  ignore (Transform.Emitdfy.print_stmt 0
+            (D.DAssignLvalue (None, [ D.Local (segment "local") ], [ D.DIntLit "1" ])));
+  ignore (Transform.Emitdfy.print_stmt 0
+            (D.DAssignLvalue (None, [ D.Local (segment "local") ], [ D.DIntLit "2" ])));
+  ignore (Transform.Emitdfy.print_stmt 0
+            (D.DAssignLvalue
+               (Some (D.DInt def_seg),
+                [ D.Field (D.DIdentifier (segment "object"), segment "field") ],
+                [ D.DIntLit "1" ])));
+  ignore (Transform.Emitdfy.print_stmt 0
+            (D.DAssignLvalue
+               (Some (D.DInt def_seg),
+                [ D.Local (segment "typed_local") ],
+                [ D.DIntLit "1" ])));
+  ignore (Transform.Emitdfy.print_stmt 0
+            (D.DAssignLvalue
+               (None,
+                [ D.Index (D.DIdentifier (segment "array"), D.DIntLit "0") ],
+                [ D.DIntLit "1" ])));
+  ignore (Transform.Emitdfy.print_stmt 0
+            (D.DAssignLvalue
+               (None,
+                [ D.TupleTarget [ D.Local (segment "first"); D.Local (segment "second") ] ],
+                [ D.DTupleExpr [ D.DIntLit "1"; D.DIntLit "2" ] ])))
+
 let test_generics_paths () =
   let open Ast in
   let type_var name = Call (identifier "TypeVar", [ Literal (StringLit name) ]) in
@@ -904,6 +1307,22 @@ let test_todafnyast_paths () =
   let function_return = Function ([], segment "f", [ param ], Typ int_typ, [ Return x ]) in
   let function_exp = Function ([], segment "g", [], Typ int_typ, [ Exp x ]) in
   let function_pass = Function ([], segment "h", [], Typ int_typ, [ Pass ]) in
+  let function_method =
+    Function
+      ([ Pre (Literal TrueLit) ], segment "method", [ param ], Typ int_typ,
+       [ Return (Call (Dot (Identifier (segment "arg"), segment "run"), [])) ])
+  in
+  let function_body =
+    Function
+      ([], segment "body", [], Typ int_typ,
+       [ Assert (Literal TrueLit); Return (Literal (IntLit "1")) ])
+  in
+  let list_function =
+    Function
+      ([], segment "list_function",
+       [ segment "values", Typ (TLst (def_seg, Some int_typ)) ], Typ int_typ,
+       [ Return (Subscript (identifier "values", Index (Literal (IntLit "0")))) ])
+  in
   (match Transform.Todafnyast.func_dfy [] function_return with
    | [ D.DFuncMeth (_, _, _, _, _, Some _) ] -> ()
    | _ -> fail "return function should become a Dafny function method");
@@ -920,10 +1339,17 @@ let test_todafnyast_paths () =
   ignore (Transform.Todafnyast.toplevel_dfy [] function_return);
   ignore (Transform.Todafnyast.toplevel_dfy [] (Assign (None, [ x ], [ Typ int_typ ])));
   ignore (Transform.Todafnyast.toplevel_dfy [] Pass);
+  ignore (Transform.Todafnyast.func_dfy [] Pass);
+  ignore (Transform.Todafnyast.func_dfy [] function_body);
   expect_exception "unequal top-level declaration" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
     (fun () -> Transform.Todafnyast.toplevel_dfy [] (Assign (None, [ x; y ], [ Typ int_typ ])));
   ignore (Transform.Todafnyast.prog_dfy
             (Program [ function_return
+                     ; function_method
+                     ; function_exp
+                     ; function_body
+                     ; function_pass
+                     ; list_function
                      ; Assign (None, [ x ], [ Typ int_typ ]) ]))
 
 let test_emitter_paths_and_sourcemaps () =
@@ -1000,6 +1426,7 @@ let test_emitter_paths_and_sourcemaps () =
     ; D.DIntLit "1"; D.DRealLit "1.5"; D.DTrue; D.DFalse
     ; D.DStringLit "text"; D.DNull; D.DThis; D.DEmptyExpr
     ; D.DCallExpr (id "f", [ id "x" ]); D.DSeqExpr [ id "x" ]
+    ; D.DNew (D.DIdentTyp (ds "List", [ D.DInt def_seg ]), [ D.DSeqExpr [ id "x" ] ])
     ; D.DArrayExpr [ id "x" ]; D.DSetExpr [ id "x" ]
     ; D.DMapExpr [ (id "x", D.DIntLit "1") ]; D.DSubscript (id "x", D.DIndex (D.DIntLit "0"))
     ; D.DIndex (id "x"); D.DSlice (Some (D.DIntLit "1"), Some (D.DIntLit "2"))
@@ -1037,6 +1464,8 @@ let test_emitter_paths_and_sourcemaps () =
   check string "this rendering" "this" (render_exp D.DThis);
   check string "empty expression rendering" "" (render_exp D.DEmptyExpr);
   check string "call rendering" "f(x)" (render_exp (D.DCallExpr (id "f", [ id "x" ])));
+  check string "new expression rendering" "new List<int>([x])"
+    (render_exp (D.DNew (D.DIdentTyp (ds "List", [ D.DInt def_seg ]), [ D.DSeqExpr [ id "x" ] ])));
   check string "sequence rendering" "[x, y]"
     (render_exp (D.DSeqExpr [ id "x"; id "y" ]));
   check string "array rendering" "[x, y]"
@@ -1375,6 +1804,7 @@ let () =
                       ; test_case "list statement paths" `Quick test_convertlist_statement_paths
                       ; test_case "call and for conversion" `Quick test_convertcall_and_convertfor_paths
                       ; test_case "for statement paths" `Quick test_convertfor_statement_paths
+                      ; test_case "semantic lowering paths" `Quick test_semantic_lowering_paths
                       ; test_case "generic conversion" `Quick test_generics_paths
                       ; test_case "call expression paths" `Quick test_convertcall_expression_paths
                       ; test_case "Dafny AST conversion" `Quick test_todafnyast_paths

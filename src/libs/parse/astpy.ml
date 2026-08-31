@@ -22,6 +22,10 @@ type typ =
   | TTuple of segment * (typ list) option
   | TCallable of segment * (typ list) * typ (* args, return *)
   | TType of segment * typ option
+  (* A normalized generic type.  The parser still produces the specialised
+     constructors above; semantic analysis uses this constructor so the
+     lowering phase does not need a separate case for every collection. *)
+  | TGeneric of segment * typ list
   (* | Union of segment * typ list *)
   [@@deriving sexp]
 
@@ -58,6 +62,21 @@ let rec subtyp pt1 pt2 =
     | None, None -> true
     | _, _ -> false
     end
+  | TGeneric (s1, args1), TGeneric (s2, args2) ->
+    String.equal (Option.value (snd s1) ~default:"")
+      (Option.value (snd s2) ~default:"")
+    && List.length args1 = List.length args2
+    && List.for_all2_exn args1 args2 ~f:subtyp
+  | (TLst (_, Some element), TGeneric (name, [ expected ]))
+  | (TGeneric (name, [ element ]), TLst (_, Some expected))
+    when String.equal (Option.value (snd name) ~default:"") "list" -> subtyp element expected
+  | (TDict (_, Some key, Some value), TGeneric (name, [ expected_key; expected_value ]))
+  | (TGeneric (name, [ key; value ]), TDict (_, Some expected_key, Some expected_value))
+    when String.equal (Option.value (snd name) ~default:"") "map" ->
+    subtyp key expected_key && subtyp value expected_value
+  | (TSet (_, Some element), TGeneric (name, [ expected ]))
+  | (TGeneric (name, [ element ]), TSet (_, Some expected))
+    when String.equal (Option.value (snd name) ~default:"") "set" -> subtyp element expected
   | _, _ -> false
 
 let eqtyp tp1 tp2 = (subtyp tp1 tp2) && (subtyp tp2 tp1)

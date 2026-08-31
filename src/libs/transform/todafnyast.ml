@@ -50,9 +50,11 @@ let rec typ_dfy = function
     | None -> DTuple (s, [])
     end
   | TCallable (s, tl, t) -> DFunTyp (s, List.map ~f:typ_dfy tl, typ_dfy t)
-  | TType (_, ot) -> match ot with
+  | TType (_, ot) -> begin match ot with
     | Some t -> typ_dfy t
     | None -> failwith "Please specify the exact type"
+    end
+  | TGeneric (s, tl) -> DIdentTyp (s, List.map ~f:typ_dfy tl)
 
 let ident_dfy = function
   | s -> s
@@ -212,18 +214,78 @@ let is_func = function
   | Function (_, _, _, _, Pass::[]) -> true
   | _ -> false
 
+(* The semantic lowering path is intentionally kept alongside the original
+   small conversion helpers.  The helpers remain useful as focused
+   compatibility APIs, while complete programs use one recursive, typed
+   expression pass so collections and calls cannot be skipped independently. *)
+let semantic_function_env environment name parameters return_type =
+  let scoped = Semantic.enter_scope environment (Semantic.FunctionScope (seg_val name)) in
+  let parameters =
+    List.map parameters ~f:(fun (identifier, value) ->
+      seg_val identifier, Semantic.annotation value)
+  in
+  Semantic.bind_many scoped
+    (parameters @ [ ("return", Semantic.annotation return_type) ])
+
+let semantic_specs environment specifications =
+  List.map specifications ~f:(fun specification ->
+    let _, lowered = Lowering.lower_spec (Lowering.context environment) specification in
+    lowered)
+
+let semantic_params parameters =
+  List.map parameters ~f:(fun (identifier, value) ->
+    ident_dfy identifier, Lowering.type_dfy (Semantic.annotation value))
+
+let semantic_function generics environment (speclst, name, parameters, return_type, body) =
+  let function_environment = semantic_function_env environment name parameters return_type in
+  let parameters = semantic_params parameters in
+  let list_reads =
+    List.filter_map parameters ~f:(fun (identifier, typ) ->
+      match typ with
+      | DIdentTyp ((_, Some name), _) when String.equal (String.lowercase name) "list" ->
+        Some (DReads (DIdentifier identifier))
+      | _ -> None)
+  in
+  let specifications = semantic_specs function_environment speclst @ list_reads in
+  let return_type = Lowering.type_dfy (Semantic.annotation return_type) in
+  match body with
+  | [ Return expression ] | [ Exp expression ] ->
+    let lowered = Lowering.expression ~environment:function_environment expression in
+    if List.is_empty lowered.prelude then
+      DFuncMeth (specifications, name, generics, parameters, return_type, Some lowered.result)
+    else
+      DMeth
+        (specifications, name, generics, parameters, [ return_type ],
+         Some (lowered.prelude @ [ DReturn [ lowered.result ] ]))
+  | [ Pass ] -> DFuncMeth (specifications, name, generics, parameters, return_type, None)
+  | _ ->
+    DMeth
+      (specifications, name, generics, parameters, [ return_type ],
+       Some (Lowering.statements ~environment:function_environment body))
+
+let semantic_toplevel generics environment statement =
+  match statement with
+  | Function (speclst, name, parameters, return_type, body) ->
+    [ semantic_function generics environment (speclst, name, parameters, return_type, body) ]
+  | _ -> toplevel_dfy generics statement
+
 let prog_dfy p =
   reset ();
+  (* Keep temporary/source-map state deterministic for callers that mix the
+     compatibility conversion APIs with whole-program lowering. *)
+  Convertcall.reset ();
   let (n_p, gens) = Generics.prog p in
+  let environment = Semantic.analyze n_p in
   let p = Convertfor.prog n_p in
-  let (Program sl) = Convertlist.prog p in
-  let d_funcs = List.fold ~f:(fun so_far s -> so_far@(func_dfy gens s)) ~init:[] sl in
-  let non_funcs = List.filter ~f:(fun x -> not (is_func x)) sl in
-  let calls_rewritten = Convertcall.prog (Program non_funcs) in
-  let (Program sl) = Convertfor.prog calls_rewritten in
-  let toplevel_stmts = List.filter ~f:is_toplevel sl in
-  let d_toplevel_stmts = List.fold ~f:(fun so_far s -> so_far@(toplevel_dfy gens s)) ~init:[] toplevel_stmts in
+  let (Program sl) = p in
+  let d_funcs = List.fold ~f:(fun so_far s ->
+    match s with
+    | Function (speclst, name, parameters, return_type, body) when is_func s ->
+      so_far @ [ semantic_function gens environment (speclst, name, parameters, return_type, body) ]
+    | _ -> so_far) ~init:[] sl in
+  let toplevel_stmts = List.filter ~f:(fun statement -> is_toplevel statement && not (is_func statement)) sl in
+  let d_toplevel_stmts = List.fold ~f:(fun so_far s -> so_far@(semantic_toplevel gens environment s)) ~init:[] toplevel_stmts in
   let non_toplevel_stmts = List.filter ~f:(fun x -> not (is_toplevel x)) sl in
-  let d_non_toplevel_stmts = List.map ~f:stmt_dfy non_toplevel_stmts in
+  let d_non_toplevel_stmts = Lowering.statements ~environment non_toplevel_stmts in
   let main = DMeth ([], (Lexing.dummy_pos, Some "Main"), [], [], [], Some d_non_toplevel_stmts) in
   DProg ("", d_funcs@d_toplevel_stmts@[main])

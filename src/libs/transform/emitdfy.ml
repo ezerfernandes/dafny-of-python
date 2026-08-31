@@ -218,6 +218,12 @@ let rec print_exp id = function
     let pel = newcolumn_concat (print_exp 0) ", " el in 
     let cb = newcolumn ")" in
     String.concat [n; pe; ob; pel; cb]
+  | DNew (typ, arguments) -> let n = newcolumn (indent id) in
+    let ptyp = print_type 0 typ in
+    let ob = newcolumn "(" in
+    let pargs = newcolumn_concat (print_exp 0) ", " arguments in
+    let cb = newcolumn ")" in
+    String.concat [n; "new "; ptyp; ob; pargs; cb]
   | DSeqExpr el -> print_delimited id "[" "]" (print_exp 0) el
   | DArrayExpr el -> print_delimited id "[" "]" (print_exp 0) el
   | DSetExpr el -> print_delimited id "{" "}" (print_exp 0) el
@@ -239,6 +245,17 @@ let rec print_exp id = function
   | DIndex e -> let n = newcolumn (indent id) in
     let pe = print_exp id e in 
     String.concat [n; pe]
+  | DNativeIndex (value, index) -> let n = newcolumn (indent id) in
+    let pv = print_exp 0 value in
+    let ob = newcolumn "[" in
+    let pi = print_exp 0 index in
+    let cb = newcolumn "]" in
+    String.concat [n; pv; ob; pi; cb]
+  | DTupleIndex (value, index) -> let n = newcolumn (indent id) in
+    let pv = print_exp 0 value in
+    let dot = newcolumn "." in
+    let pi = newcolumn (Int.to_string index) in
+    String.concat [n; pv; dot; pi]
   | DSlice (e1, e2) ->
     let n = newcolumn (indent id) in 
     let ob = (newcolumn "[") in
@@ -358,6 +375,29 @@ and print_stmt id = function
     let prhs = print_rhs (print_exp 0) el in
     let ps = newcolumn ";" in 
     String.concat [n; pre; pil; pt; prhs; ps]
+  | DAssignLvalue (None, targets, el) ->
+    let n = newcolumn (indent id) in
+    let locals = List.filter_map targets ~f:(function Local identifier -> Some identifier | _ -> None) in
+    let pre = match targets, locals with
+      | [ Local first ], [ _ ] when not (lookup (!curr_func) (seg_val first) !vars) ->
+        add_vars locals; newcolumn "var "
+      | _ -> ""
+    in
+    let lhs = newcolumn_concat (print_lvalue 0) ", " targets in
+    let prhs = print_rhs (print_exp 0) el in
+    let ps = newcolumn ";" in
+    String.concat [n; pre; lhs; prhs; ps]
+  | DAssignLvalue (Some tp, targets, el) ->
+    let n = newcolumn (indent id) in
+    let locals = List.filter_map targets ~f:(function Local identifier -> Some identifier | _ -> None) in
+    add_vars locals;
+    let pre = newcolumn "var " in
+    let lhs = newcolumn_concat (print_lvalue 0) ", " targets in
+    let colon = newcolumn ":" in
+    let printed_type = print_type 1 tp in
+    let prhs = print_rhs (print_exp 0) el in
+    let ps = newcolumn ";" in
+    String.concat [n; pre; lhs; colon; printed_type; prhs; ps]
   | DCallStmt (e, el) -> let n = newcolumn (indent id) in 
     let pident = print_exp 0 e in 
     let ob = newcolumn "(" in 
@@ -420,6 +460,24 @@ and print_stmt id = function
     let pel = (newcolumn_concat (print_exp 0) ", " el) in 
     let ps = newcolumn ";" in
     String.concat [n; r; pel; ps]
+
+and print_lvalue id = function
+  | Local identifier -> print_ident id identifier
+  | Field (value, identifier) ->
+    let n = newcolumn (indent id) in
+    let pv = print_exp 0 value in
+    let dot = newcolumn "." in
+    let pi = print_ident 0 identifier in
+    String.concat [n; pv; dot; pi]
+  | Index (value, index) ->
+    let n = newcolumn (indent id) in
+    let pv = print_exp 0 value in
+    let ob = newcolumn "[" in
+    let pi = print_exp 0 index in
+    let cb = newcolumn "]" in
+    String.concat [n; pv; ob; pi; cb]
+  | TupleTarget targets ->
+    print_delimited id "(" ")" (print_lvalue 0) targets
 
 let print_declaration id = function
   | (i, t) -> print_stmt id (DAssign (Some t, [i], [DIdentifier i]))

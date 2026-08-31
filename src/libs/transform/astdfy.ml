@@ -62,6 +62,7 @@ type dExpr =
   | DBinary of dExpr * dOp * dExpr
   | DUnary of dOp * dExpr
   | DCallExpr of dExpr * dExpr list
+  | DNew of dTyp * dExpr list
   | DSeqExpr of dExpr list
   | DSetExpr of dExpr list
   (* | DSetComp of dId list * dExpr * dExpr list * dExpr variables, target, conditions, result *)
@@ -69,6 +70,10 @@ type dExpr =
   | DArrayExpr of dExpr list
   | DSubscript of dExpr * dExpr (* value, slice *)
   | DIndex of dExpr
+  (* Native indexing is kept distinct from the runtime List.atIndex call.
+     This distinction is selected by semantic lowering. *)
+  | DNativeIndex of dExpr * dExpr
+  | DTupleIndex of dExpr * int
   | DSlice of dExpr option * dExpr option (* lower, upper *)
   | DForall of dId list * dExpr
   | DExists of dId list * dExpr
@@ -93,11 +98,22 @@ type dStmt =
   | DAssume of dExpr
   | DAssert of dExpr
   | DAssign of dTyp option * dId list * dExpr list
+  (* DAssign is retained for source compatibility with the original AST.
+     New lowering uses explicit targets, so field/index/tuple assignments
+     cannot be accidentally printed as local-variable assignments. *)
+  | DAssignLvalue of dTyp option * dLvalue list * dExpr list
   | DIf of dExpr * dStmt list * (dExpr * dStmt list) list * dStmt list
   | DWhile of dSpec list * dExpr * dStmt list
   | DReturn of dExpr list
   | DBreak
   | DCallStmt of dExpr * dExpr list
+  [@@deriving sexp]
+
+and dLvalue =
+  | Local of dId
+  | Field of dExpr * dId
+  | Index of dExpr * dExpr
+  | TupleTarget of dLvalue list
   [@@deriving sexp]
 
 type dGeneric = string
