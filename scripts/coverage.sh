@@ -10,7 +10,7 @@ mkdir -p _coverage
 BISECT_FILE="$ROOT_DIR/_coverage/bisect" \
   dune runtest --instrument-with bisect_ppx --force
 
-# The prototype directories and the type-only AST module are deliberately not
+# The prototype directories and type-only data modules are deliberately not
 # part of the maintained executable coverage scope. Keep exclusions explicit
 # so adding another source directory to src/ cannot silently disappear.
 REPORT_ARGS=(
@@ -21,6 +21,7 @@ REPORT_ARGS=(
   --do-not-expect src/libs/type/
   --do-not-expect src/libs/solver/
   --do-not-expect src/libs/transform/astdfy.ml
+  --do-not-expect src/libs/run/pipeline_types.ml
 )
 
 bisect-ppx-report html "${REPORT_ARGS[@]}" -o "$ROOT_DIR/_coverage/html"

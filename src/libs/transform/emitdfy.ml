@@ -116,41 +116,49 @@ let print_op id = function
   | DImplies s -> add_op id s "==>"
   | DExplies s -> add_op id s "<=="
 
-let print_type id t = 
-  let rec get_v t = match t with
-    | DIdentTyp (s, []) -> seg_val s
-    | DIdentTyp (s, gl) -> (seg_val s) ^ "<" ^ (String.concat ~sep:", " (List.map ~f:get_v gl)) ^ ">"
-    | DInt _ -> "int"
-    | DReal _ -> "real"
-    | DBool _ -> "bool"
-    | DString _ -> "string"
-    | DChar _ -> "char"
-    | DObj _ -> "object"
-    | DSeq (_, t) -> "seq<" ^ (get_v t) ^ ">"
-    | DSet (_, t) -> "set<" ^ (get_v t) ^ ">"
-    | DMap (_, t1, t2) -> "map<" ^ (get_v t1) ^ ", " ^ (get_v t2) ^ ">"
-    | DArray (_, t) -> "array<" ^ (get_v t) ^ ">"
-    | DTuple (_, tl) -> "(" ^ (String.concat ~sep:", " (List.map ~f:get_v tl)) ^ ")"
-    | DFunTyp (_, tl, t) -> "(" ^ (String.concat ~sep:", " (List.map ~f:get_v tl)) ^ ") -> " ^ (get_v t)
-    | _ -> ""
-  in   
-  let get_s t = 
-    match t with
-    | DIdentTyp (s, _) -> s
-    | DInt s -> s
-    | DReal s -> s
-    | DBool s -> s
-    | DString s -> s
-    | DChar s -> s
-    | DObj s -> s
-    | DSeq (s, _) -> s
-    | DSet (s, _) -> s
-    | DMap (s, _,  _) -> s
-    | DArray (s, _) -> s
-    | DTuple (s, _) -> s 
-    | DFunTyp (s, _, _) -> s
-    | _ -> def_seg
-  in add_op id (get_s t) (get_v t)
+let rec type_parts t =
+  match t with
+  | DIdentTyp (s, gl) ->
+    let name = seg_val s in
+    let value = match gl with
+      | [] -> name
+      | _ -> name ^ "<" ^ String.concat ~sep:", " (List.map gl ~f:(fun t -> snd (type_parts t))) ^ ">"
+    in s, value
+  | DInt s -> s, "int"
+  | DReal s -> s, "real"
+  | DBool s -> s, "bool"
+  | DString s -> s, "string"
+  | DChar s -> s, "char"
+  | DObj s -> s, "object"
+  | DSeq (s, t) -> s, "seq<" ^ snd (type_parts t) ^ ">"
+  | DSet (s, t) -> s, "set<" ^ snd (type_parts t) ^ ">"
+  | DMap (s, t1, t2) ->
+    s, "map<" ^ snd (type_parts t1) ^ ", " ^ snd (type_parts t2) ^ ">"
+  | DArray (s, t) -> s, "array<" ^ snd (type_parts t) ^ ">"
+  | DTuple (s, tl) ->
+    s, "(" ^ String.concat ~sep:", " (List.map tl ~f:(fun t -> snd (type_parts t))) ^ ")"
+  | DFunTyp (s, tl, t) ->
+    let args = String.concat ~sep:", " (List.map tl ~f:(fun t -> snd (type_parts t))) in
+    s, "(" ^ args ^ ") -> " ^ snd (type_parts t)
+  | _ -> def_seg, ""
+
+let print_type id t =
+  let type_segment, type_value = type_parts t in
+  add_op id type_segment type_value
+
+let print_delimited id left right print_element elements =
+  let n = newcolumn (indent id) in
+  let opening = newcolumn left in
+  let contents = newcolumn_concat print_element ", " elements in
+  let closing = newcolumn right in
+  String.concat [n; opening; contents; closing]
+
+let print_expression_line id keyword terminator print_expression expression =
+  let n = newcolumn (indent id) in
+  let k = newcolumn keyword in
+  let pe = print_expression expression in
+  let t = newcolumn terminator in
+  String.concat [n; k; pe; t]
 
 (* (vars := (!curr_func, idd)::!vars); *)
 let print_param id = function
@@ -210,21 +218,9 @@ let rec print_exp id = function
     let pel = newcolumn_concat (print_exp 0) ", " el in 
     let cb = newcolumn ")" in
     String.concat [n; pe; ob; pel; cb]
-  | DSeqExpr el -> let n = newcolumn (indent id) in 
-    let ob = (newcolumn "[") in 
-    let pel = (newcolumn_concat (print_exp 0) ", " el) in 
-    let cb = (newcolumn "]") in 
-    String.concat [n; ob; pel; cb]
-  | DArrayExpr el -> let n = newcolumn (indent id) in 
-    let ob = (newcolumn "[") in 
-    let pel = (newcolumn_concat (print_exp 0) ", " el) in 
-    let cb = (newcolumn "]") in 
-    String.concat [n; ob; pel; cb] 
-  | DSetExpr el -> let n = newcolumn (indent id) in 
-    let ob = (newcolumn "{") in 
-    let pel = (newcolumn_concat (print_exp 0) ", " el) in 
-    let cb = (newcolumn "}") in 
-    String.concat [n; ob; pel; cb]
+  | DSeqExpr el -> print_delimited id "[" "]" (print_exp 0) el
+  | DArrayExpr el -> print_delimited id "[" "]" (print_exp 0) el
+  | DSetExpr el -> print_delimited id "{" "}" (print_exp 0) el
   | DMapExpr eel -> let n = newcolumn (indent id) in
     let m = newcolumn "map[" in
     let peel = newcolumn_concat (
@@ -295,44 +291,29 @@ let rec print_exp id = function
     let pe = print_exp 1 e in
     String.concat [n; ob; pfl; cb; psl; op; pe]
   | DIfElseExpr (c, e1, e2) -> let n = newcolumn (indent id) in
-    let i = newcolumn "if" in
-    let pc = print_exp 1 c in
+    let i = newcolumn "if " in
+    let pc = print_exp 0 c in
     let t = newcolumn " then" in
     let pe1 = print_exp 1 e1 in
     let el = newcolumn " else" in
     let pe2 = print_exp 1 e2 in
     String.concat [n; i; pc; t; pe1; el; pe2]
-  | DTupleExpr el -> let n = newcolumn (indent id) in
-    let ob = newcolumn "(" in
-    let pel = newcolumn_concat (print_exp 0) ", " el in
-    let cb = newcolumn ")" in
-    String.concat [n; ob; pel; cb]
+  | DTupleExpr el -> print_delimited id "(" ")" (print_exp 0) el
 
 and print_spec id = function
-  | DRequires e -> let n  = newcolumn (indent id) in 
-    let s = newcolumn "requires" in 
-    let pe = (print_exp 1 e) in
-    String.concat [n; s; pe] 
-  | DEnsures e ->  let n  = newcolumn (indent id) in 
-    let s = newcolumn "ensures" in 
-    let pe = (print_exp 1 e) in
-    String.concat [n; s; pe]
-  | DInvariant e -> let n  = newcolumn (indent id) in 
-    let s = newcolumn "invariant" in 
-    let pe = (print_exp 1 e) in
-    String.concat [n; s; pe] 
-  | DDecreases e -> let n  = newcolumn (indent id) in 
-    let s = newcolumn "decreases" in 
-    let pe = (print_exp 1 e) in
-    String.concat [n; s; pe]
-  | DReads e -> let n = newcolumn (indent id) in 
-    let s = newcolumn "reads" in 
-    let pe = (print_exp 1 e) in
-    String.concat [n; s; pe]
-  | DModifies e -> let n = newcolumn (indent id) in 
-    let s = newcolumn "modifies" in 
-    let pe = print_exp 1 e in
-    String.concat [n; s; pe]
+  | DRequires e -> print_expression_line id "requires" "" (print_exp 1) e
+  | DEnsures e -> print_expression_line id "ensures" "" (print_exp 1) e
+  | DInvariant e -> print_expression_line id "invariant" "" (print_exp 1) e
+  | DDecreases e -> print_expression_line id "decreases" "" (print_exp 1) e
+  | DReads e -> print_expression_line id "reads" "" (print_exp 1) e
+  | DModifies e -> print_expression_line id "modifies" "" (print_exp 1) e
+
+let print_rhs print_expression = function
+  | [] -> ""
+  | expressions ->
+    let assignment = newcolumn " := " in
+    let values = newcolumn_concat print_expression ", " expressions in
+    String.concat [assignment; values]
 
 let rec print_rets id = function
   | [] -> ""
@@ -351,16 +332,8 @@ let rec print_rets id = function
 
 and print_stmt id = function
   | DEmptyStmt -> ""
-  | DAssume e -> let n = newcolumn (indent id) in 
-    let a = newcolumn "assume" in 
-    let pe = print_exp 1 e in 
-    let ps = (newcolumn ";") in
-    String.concat [n; a; pe; ps]
-  | DAssert e -> let n = newcolumn (indent id) in 
-    let a = newcolumn "assert" in 
-    let pe = print_exp 1 e in 
-    let ps = (newcolumn ";") in
-    String.concat [n; a; pe; ps]
+  | DAssume e -> print_expression_line id "assume" ";" (print_exp 1) e
+  | DAssert e -> print_expression_line id "assert" ";" (print_exp 1) e
   | DBreak -> let n = newcolumn (indent id) in 
     let b = newcolumn "break" in 
     let ps = (newcolumn ";") in
@@ -368,15 +341,12 @@ and print_stmt id = function
   | DAssign (_, [], _) -> ""
   | DAssign (None, first::rest, el) -> let n = newcolumn (indent id) in
     let exists = (lookup (!curr_func) (seg_val first) !vars) in
-    let pre = if exists then "" else (add_vars (first::rest); newcolumn "var ") in
+    let pre = match exists with
+      | true -> ""
+      | false -> add_vars (first::rest); newcolumn "var " in
     let pil = newcolumn_concat (print_ident 0) ", " (first::rest) in
     let pt = "" in
-    let prhs = match el with 
-      | [] -> "" | el -> begin
-        let pa = newcolumn " := " in
-        let pel = newcolumn_concat (print_exp 0) ", " el in
-        String.concat[pa; pel]
-      end in
+    let prhs = print_rhs (print_exp 0) el in
     let ps = newcolumn ";" in 
     String.concat [n; pre; pil; pt; prhs; ps]
   | DAssign (Some tp, il, el) -> let n = newcolumn (indent id) in
@@ -385,12 +355,7 @@ and print_stmt id = function
     let pt = 
       let c = newcolumn ":" in let pt = print_type 1 tp in String.concat [c; pt]
     in
-    let prhs = match el with 
-      | [] -> "" | el -> begin
-        let pa = newcolumn " := " in
-        let pel = newcolumn_concat (print_exp 0) ", " el in
-        String.concat[pa; pel]
-      end in
+    let prhs = print_rhs (print_exp 0) el in
     let ps = newcolumn ";" in 
     String.concat [n; pre; pil; pt; prhs; ps]
   | DCallStmt (e, el) -> let n = newcolumn (indent id) in 
@@ -409,7 +374,9 @@ and print_stmt id = function
     let nl2 = newline () in
     let n2 = newcolumn (indent id) in
     let cb = newcolumn "}" in 
-    let pelif = if List.length sl2 = 0 then "" else begin
+    let pelif = match sl2 with
+      | [] -> ""
+      | _ -> begin
       let res (e, sl) = begin
         let pel = newcolumn " else if" in
         let pe = print_exp 1 e in
@@ -423,7 +390,9 @@ and print_stmt id = function
       end in
       newcolumn_concat res "" sl2
     end in
-    let pelse = if List.length sl3 = 0 then "" else begin
+    let pelse = match sl3 with
+      | [] -> ""
+      | _ -> begin
       let pecb = newcolumn " else {" in 
       let nl = newline () in 
       let pst = newline_concat (print_stmt (id+2)) sl3 in
@@ -435,8 +404,8 @@ and print_stmt id = function
     end in
     String.concat [n; i; pe; ob; nl; pst; nl2; n2; cb; pelif; pelse]
   | DWhile (speclst, e, sl) -> let n = newcolumn (indent id) in
-    let w = newcolumn "while" in 
-    let pe = print_exp 1 e in 
+    let w = newcolumn "while " in
+    let pe = print_exp 0 e in
     let nl = newline () in 
     let psl = newline_concat (print_spec (id+2)) speclst in
     let ob = (newcolumn_h id "{") in 
@@ -543,20 +512,24 @@ let print_prog_with_sourcemap program =
   let source_map = ref (List.map !sm ~f:(fun mapping -> mapping)) in
   source, source_map
 
+let nearest_candidate line column mapping nearest =
+  let ldiff = Int.abs ((fst (fst mapping)) - line) in
+  let l_so_far = Int.abs ((fst (fst nearest)) - line) in
+  match Int.compare ldiff l_so_far with
+  | -1 -> mapping
+  | 0 ->
+    let cdiff = Int.abs ((snd (fst mapping)) - column) in
+    let c_so_far = Int.abs ((snd (fst nearest)) - column) in
+    (match Int.compare cdiff c_so_far with
+     | -1 -> mapping
+     | _ -> nearest)
+  | _ -> nearest
+
 let rec nearest_seg_helper sm line column nearest = 
   match List.hd sm with
   | Some mapping -> 
-    let ldiff = Int.abs ((fst (fst mapping)) - line) in 
-    let l_so_far = Int.abs ((fst (fst nearest)) - line) in
     let rest = List.tl_exn sm in
-    if ldiff < l_so_far then nearest_seg_helper rest line column mapping
-    else if ldiff = l_so_far then begin
-      let cdiff = Int.abs ((snd (fst mapping)) - column) in
-      let c_so_far = Int.abs ((snd (fst nearest)) - column) in
-      if cdiff < c_so_far then nearest_seg_helper rest line column mapping 
-      else nearest_seg_helper rest line column nearest
-    end 
-    else nearest_seg_helper rest line column nearest
+    nearest_seg_helper rest line column (nearest_candidate line column mapping nearest)
   | None -> nearest
 
 (* finds the nearest dafny segment, then returns its corresponding python segment *)

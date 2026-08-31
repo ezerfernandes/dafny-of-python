@@ -18,6 +18,8 @@
     let s = Lexing.lexeme_start_p lb in
     (s, v)
 
+  let emit_lexeme lb = emit_segment lb (Some (Lexing.lexeme lb))
+
   let next_line (lb: Lexing.lexbuf) cols =
     let lcp = lb.lex_curr_p in
     lb.lex_curr_p <- { lcp with
@@ -74,18 +76,18 @@ rule next_token = parse
       String.sub tf 0 ((String.length tf) - 1)
     ) ^ "F" in TYPF (emit_segment lexbuf (Some s)) 
   }
-| int_typ as t { INT_TYP (emit_segment lexbuf (Some t)) }
-| float_typ as t { FLOAT_TYP (emit_segment lexbuf (Some t)) }
-| bool_typ as t { BOOL_TYP (emit_segment lexbuf (Some t)) }
-| str_typ as t { STRING_TYP (emit_segment lexbuf (Some t)) }
-| obj_typ as t { OBJ_TYP (emit_segment lexbuf (Some t)) }
+| int_typ { INT_TYP (emit_lexeme lexbuf) }
+| float_typ { FLOAT_TYP (emit_lexeme lexbuf) }
+| bool_typ { BOOL_TYP (emit_lexeme lexbuf) }
+| str_typ { STRING_TYP (emit_lexeme lexbuf) }
+| obj_typ { OBJ_TYP (emit_lexeme lexbuf) }
 | list_typ { LIST_TYP (emit_segment lexbuf (Some "List")) }
-| dict_typ as t { DICT_TYP (emit_segment lexbuf (Some t)) }
-| set_typ as t { SET_TYP (emit_segment lexbuf (Some t)) }
-| tuple_typ as t { TUPLE_TYP (emit_segment lexbuf (Some t)) }
-| callable_typ as t { CALLABLE_TYP (emit_segment lexbuf (Some t)) }
-| type_typ as t { TYPE_TYP (emit_segment lexbuf (Some t)) }
-| union_typ as t { UNION_TYP (emit_segment lexbuf (Some t)) }
+| dict_typ { DICT_TYP (emit_lexeme lexbuf) }
+| set_typ { SET_TYP (emit_lexeme lexbuf) }
+| tuple_typ { TUPLE_TYP (emit_lexeme lexbuf) }
+| callable_typ { CALLABLE_TYP (emit_lexeme lexbuf) }
+| type_typ { TYPE_TYP (emit_lexeme lexbuf) }
+| union_typ { UNION_TYP (emit_lexeme lexbuf) }
 | indent as s { (next_line lexbuf (String.length s - 1); SPACE (String.length s - 1)) }
 | "import" { comment lexbuf }
 | "from" { comment lexbuf }
@@ -111,48 +113,48 @@ rule next_token = parse
 | ':' { COLON }
 | ';' { SEMICOLON }
 | ',' { COMMA }
-| "old" { OLD (emit_segment lexbuf (Some "old")) }
-| "fresh" { FRESH (emit_segment lexbuf (Some "fresh")) }
-| "len" { LEN (emit_segment lexbuf (Some "len")) } 
-| "max" { MAX (emit_segment lexbuf (Some "max")) }
+| "old" { OLD (emit_lexeme lexbuf) }
+| "fresh" { FRESH (emit_lexeme lexbuf) }
+| "len" { LEN (emit_lexeme lexbuf) }
+| "max" { MAX (emit_lexeme lexbuf) }
 | "filter" { IDENTIFIER (emit_segment lexbuf (Some "filterF")) }
 | "map" { IDENTIFIER (emit_segment lexbuf (Some "mapF")) }
 | "->" { ARROW }
-| "def" { DEF (emit_segment lexbuf (Some "def" )) }
-| "lambda" { LAMBDA (emit_segment lexbuf (Some "lambda" )) }
-| "if" { IF (emit_segment lexbuf (Some "if" )) }
-| "elif" { ELIF (emit_segment lexbuf (Some "elif" )) }
-| "else" { ELSE (emit_segment lexbuf (Some "else" )) }
-| "for" { FOR (emit_segment lexbuf (Some "for" )) }
-| "while" { WHILE (emit_segment lexbuf (Some "while" )) }
-| "break" { BREAK (emit_segment lexbuf (Some "break" )) }
-| "pass" { PASS (emit_segment lexbuf (Some "pass")) }
-| "return" { RETURN (emit_segment lexbuf (Some "return")) }
-| "assert" { ASSERT (emit_segment lexbuf (Some "assert")) }
-| "not in" { NOT_IN (emit_segment lexbuf (Some "not in")) }
-| "in" { IN (emit_segment lexbuf (Some "in")) }
-| "==" { EQEQ (emit_segment lexbuf (Some "==")) }
-| '=' { EQ (emit_segment lexbuf (Some "=")) }
-| "!=" { NEQ (emit_segment lexbuf (Some "!=")) }
-| '+' { PLUS (emit_segment lexbuf (Some "+")) }
-| "+=" { PLUSEQ (emit_segment lexbuf (Some "+=")) }
-| '-' { MINUS (emit_segment lexbuf (Some "-")) }
-| "-=" { MINUSEQ (emit_segment lexbuf (Some "-=")) }
-| '*' { TIMES (emit_segment lexbuf (Some "*")) }
-| "*=" { TIMESEQ (emit_segment lexbuf (Some "*=")) }
-| "/" { DIVIDE (emit_segment lexbuf (Some "/")) }
-| "/=" { DIVIDEEQ (emit_segment lexbuf (Some "/=")) }
-| "%" { MOD (emit_segment lexbuf (Some "%")) }     
-| "<=" { LTE (emit_segment lexbuf (Some "<=")) }
-| '<' { LT (emit_segment lexbuf (Some "<")) }
-| ">=" { GTE (emit_segment lexbuf (Some ">=")) }
-| '>' { GT (emit_segment lexbuf (Some ">")) }
-| "and" { AND (emit_segment lexbuf (Some "and")) }
-| "or" { OR (emit_segment lexbuf (Some "or")) }
-| "not" { NOT (emit_segment lexbuf (Some "not")) }
+| "def" { DEF (emit_lexeme lexbuf) }
+| "lambda" { LAMBDA (emit_lexeme lexbuf) }
+| "if" { IF (emit_lexeme lexbuf) }
+| "elif" { ELIF (emit_lexeme lexbuf) }
+| "else" { ELSE (emit_lexeme lexbuf) }
+| "for" { FOR (emit_lexeme lexbuf) }
+| "while" { WHILE (emit_lexeme lexbuf) }
+| "break" { BREAK (emit_lexeme lexbuf) }
+| "pass" { PASS (emit_lexeme lexbuf) }
+| "return" { RETURN (emit_lexeme lexbuf) }
+| "assert" { ASSERT (emit_lexeme lexbuf) }
+| "not in" { NOT_IN (emit_lexeme lexbuf) }
+| "in" { IN (emit_lexeme lexbuf) }
+| "==" { EQEQ (emit_lexeme lexbuf) }
+| '=' { EQ (emit_lexeme lexbuf) }
+| "!=" { NEQ (emit_lexeme lexbuf) }
+| '+' { PLUS (emit_lexeme lexbuf) }
+| "+=" { PLUSEQ (emit_lexeme lexbuf) }
+| '-' { MINUS (emit_lexeme lexbuf) }
+| "-=" { MINUSEQ (emit_lexeme lexbuf) }
+| '*' { TIMES (emit_lexeme lexbuf) }
+| "*=" { TIMESEQ (emit_lexeme lexbuf) }
+| "/" { DIVIDE (emit_lexeme lexbuf) }
+| "/=" { DIVIDEEQ (emit_lexeme lexbuf) }
+| "%" { MOD (emit_lexeme lexbuf) }
+| "<=" { LTE (emit_lexeme lexbuf) }
+| '<' { LT (emit_lexeme lexbuf) }
+| ">=" { GTE (emit_lexeme lexbuf) }
+| '>' { GT (emit_lexeme lexbuf) }
+| "and" { AND (emit_lexeme lexbuf) }
+| "or" { OR (emit_lexeme lexbuf) }
+| "not" { NOT (emit_lexeme lexbuf) }
 | "True" { TRUE }
 | "False" { FALSE }
-| "None" { NONE (emit_segment lexbuf (Some "None")) }
+| "None" { NONE (emit_lexeme lexbuf) }
 | float as f { FLOAT f }
 | integer as i { INT i }
 | identifier as i { IDENTIFIER (emit_segment lexbuf (Some i)) }
