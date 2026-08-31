@@ -12,6 +12,10 @@ points and is explicitly excluded for the same reason.
 The data-only AST and source-map declarations in `astpy.ml` and `sourcemap.ml`
 similarly suppress only their ppx-generated sexp serializer points; handwritten
 translation and source-map functions remain in the metric.
+The process-level `Stdlib.exit` wrapper in `src/bin/main.ml` is also excluded:
+terminating the CLI prevents Bisect_ppx counters in that process from flushing
+reliably. Its success and exception behavior is exercised by
+`test/cli_test.sh`.
 
 `src/libs/type` and `src/libs/solver` are archived prototypes: they are tracked
 for historical reference, are not included by Dune, and are explicitly

@@ -967,7 +967,7 @@ let test_emitter_paths_and_sourcemaps () =
     (render_type (D.DSet (def_seg, D.DInt def_seg)));
   check string "map type rendering" "map<int, string>"
     (render_type (D.DMap (def_seg, D.DInt def_seg, D.DString def_seg)));
-  check string "array type rendering" "int[]"
+  check string "array type rendering" "array<int>"
     (render_type (D.DArray (def_seg, D.DInt def_seg)));
   check string "tuple type rendering" "(int)"
     (render_type (D.DTuple (def_seg, [ D.DInt def_seg ])));

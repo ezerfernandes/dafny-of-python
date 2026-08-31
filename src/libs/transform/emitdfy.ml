@@ -129,7 +129,7 @@ let print_type id t =
     | DSeq (_, t) -> "seq<" ^ (get_v t) ^ ">"
     | DSet (_, t) -> "set<" ^ (get_v t) ^ ">"
     | DMap (_, t1, t2) -> "map<" ^ (get_v t1) ^ ", " ^ (get_v t2) ^ ">"
-    | DArray (_, t) -> (get_v t) ^ "[]"
+    | DArray (_, t) -> "array<" ^ (get_v t) ^ ">"
     | DTuple (_, tl) -> "(" ^ (String.concat ~sep:", " (List.map ~f:get_v tl)) ^ ")"
     | DFunTyp (_, tl, t) -> "(" ^ (String.concat ~sep:", " (List.map ~f:get_v tl)) ^ ") -> " ^ (get_v t)
     | _ -> ""

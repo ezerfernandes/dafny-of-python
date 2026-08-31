@@ -87,6 +87,9 @@ let main () =
   Run.Report.report ~sourcemap:result.sourcemap result.verification.stdout;
   Run.Pipeline.exit_code result
 
+(* Process termination does not flush Bisect_ppx counters reliably. The CLI
+   behavior of this wrapper is covered by test/cli_test.sh, while the wrapper
+   itself is excluded from expression-point coverage in docs/coverage.md. *)
 [@@@coverage off]
 let () =
   try Stdlib.exit (main ()) with
