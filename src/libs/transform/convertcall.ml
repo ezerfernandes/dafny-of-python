@@ -36,6 +36,10 @@ let rec exp_calls_scoped = function
   | Dot (value, identifier) -> Dot (exp_calls_scoped value, identifier)
   | BinaryExp (left, operator, right) ->
     BinaryExp (exp_calls_scoped left, operator, exp_calls_scoped right)
+  | CompareChain (first, comparisons) ->
+    CompareChain
+      ( exp_calls_scoped first
+      , List.map comparisons ~f:(fun (operator, operand) -> operator, exp_calls_scoped operand) )
   | UnaryExp (operator, value) -> UnaryExp (operator, exp_calls_scoped value)
   | Call (callee, arguments) ->
     Call (exp_calls_scoped callee, List.map arguments ~f:exp_calls_scoped)
@@ -45,6 +49,7 @@ let rec exp_calls_scoped = function
   | Dict entries ->
     Dict (List.map entries ~f:(fun (key, value) -> exp_calls_scoped key, exp_calls_scoped value))
   | Tuple values -> Tuple (List.map values ~f:exp_calls_scoped)
+  | SingletonTuple (comma, value) -> SingletonTuple (comma, exp_calls_scoped value)
   | Subscript (value, selector) -> Subscript (exp_calls_scoped value, exp_calls_scoped selector)
   | Index value -> Index (exp_calls_scoped value)
   | Slice (lower, upper) ->
@@ -67,6 +72,10 @@ let rec exp_calls = function
     let al1, n_e1 = exp_calls e1 in
     let al2, n_e2 = exp_calls e2 in
     (al1@al2, BinaryExp (n_e1, op, n_e2))
+  | CompareChain (first, comparisons) ->
+    [], CompareChain
+      ( exp_calls_scoped first
+      , List.map comparisons ~f:(fun (operator, operand) -> operator, exp_calls_scoped operand) )
   | UnaryExp (op, e) -> let al, n_e = exp_calls e in (al, UnaryExp (op, n_e))
   | Call (e, el) -> (* handle recursive case *)
     let al, n_e = exp_calls e in
@@ -91,6 +100,9 @@ let rec exp_calls = function
         ~init:([], [])
     in
     (al, Tuple n_el)
+  | SingletonTuple (comma, value) ->
+    let al, value = exp_calls value in
+    (al, SingletonTuple (comma, value))
   | Subscript (e1, e2) -> 
     let al1, n_e1 = exp_calls e1 in
     let al2, n_e2 = exp_calls e2 in

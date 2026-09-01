@@ -10,7 +10,8 @@ menhir --list-errors
   open Astpy
 %}
 
-%token EOF INDENT DEDENT NEWLINE LPAREN RPAREN LBRACE RBRACE LBRACK RBRACK DOT COLON SEMICOLON COMMA TRUE FALSE ARROW
+%token EOF INDENT DEDENT NEWLINE LPAREN RPAREN LBRACE RBRACE LBRACK RBRACK DOT COLON SEMICOLON TRUE FALSE ARROW
+%token <Sourcemap.segment> COMMA
 %token <Sourcemap.segment> NONE
 %token <int> SPACE
 %token <Sourcemap.segment> DEF IF ELIF ELSE WHILE FOR BREAK RETURN NOT_IN IN ASSERT LAMBDA PASS
@@ -96,7 +97,7 @@ elif_star:
 star_exps:
   | e=exp; el=star_exps_rest; COMMA { Tuple (e::el) }
   | e=exp; el=star_exps_rest { Tuple (e::el) }
-  | e=exp; COMMA { Tuple [e] }
+  | e=exp; c=COMMA { SingletonTuple (c, e) }
   | e=exp { e }
   ;
 
@@ -152,15 +153,28 @@ inversion:
   ;
 
 comparison:
-  | c=comparison; s=EQEQ; e=sum { BinaryExp (c, EqEq s, e) }
-  | c=comparison; s=NEQ; e=sum { BinaryExp (c, NEq s, e) }
-  | c=comparison; s=LTE; e=sum { BinaryExp (c, LEq s, e) }
-  | c=comparison; s=LT; e=sum { BinaryExp (c, Lt s, e) }
-  | c=comparison; s=GTE; e=sum { BinaryExp (c, GEq s, e) }
-  | c=comparison; s=GT; e=sum { BinaryExp (c, Gt s, e) }
-  | c=comparison; s=NOT_IN; e=sum { BinaryExp (c, NotIn s, e) }
-  | c=comparison; s=IN; e=sum { BinaryExp (c, In s, e) }
-  | s=sum { s }
+  | first=sum; rest=comparison_rest {
+      match rest with
+      | [] -> first
+      | _ -> CompareChain (first, rest)
+    }
+  ;
+
+comparison_rest:
+  | operator=comparison_operator; operand=sum; rest=comparison_rest
+    { (operator, operand)::rest }
+  | { [] }
+  ;
+
+comparison_operator:
+  | s=EQEQ { EqEq s }
+  | s=NEQ { NEq s }
+  | s=LTE { LEq s }
+  | s=LT { Lt s }
+  | s=GTE { GEq s }
+  | s=GT { Gt s }
+  | s=NOT_IN { NotIn s }
+  | s=IN { In s }
   ;
 
 sum:
@@ -207,7 +221,11 @@ atom:
   | NONE { Literal (NoneLit) }
   | FORALL; il=id_star; DOUBLECOLON; e=exp { Forall (il, e) }
   | EXISTS; il=id_star; DOUBLECOLON; e=exp { Exists (il, e) }
-  | LPAREN; e=exp; COMMA; el=exp_star; RPAREN { Tuple (e::el) }
+  | LPAREN; e=exp; c=COMMA; el=exp_star; RPAREN {
+      match el with
+      | [] -> SingletonTuple (c, e)
+      | _ -> Tuple (e::el)
+    }
   | LPAREN; e=exp; RPAREN; { e }
   | l=lst_exp { l }
   | s=set_exp { s }

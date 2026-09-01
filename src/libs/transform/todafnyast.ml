@@ -97,6 +97,18 @@ let rec exp_dfy e =
   | Identifier s -> DIdentifier s
   | Dot (e, ident) -> DDot (exp_dfy e, ident)
   | BinaryExp (e1, op, e2) -> DBinary ((exp_dfy e1), (binaryop_dfy op), (exp_dfy e2))
+  | CompareChain (first, comparisons) ->
+    let rec chain left = function
+      | [] -> left
+      | (operator, right)::rest ->
+        let comparison = DBinary (left, binaryop_dfy operator, exp_dfy right) in
+        begin
+          match rest with
+          | [] -> comparison
+          | _ -> DBinary (comparison, DAnd def_seg, chain (exp_dfy right) rest)
+        end
+    in
+    chain (exp_dfy first) comparisons
   | UnaryExp (op, e) -> DUnary ((unaryop_dfy op), (exp_dfy e))
   | Literal l -> literal_dfy l
   | Call (e, el) -> let d_args = List.map ~f:exp_dfy el in DCallExpr (exp_dfy e, d_args)
@@ -107,6 +119,7 @@ let rec exp_dfy e =
   | Dict eel -> DMapExpr (List.map ~f:(fun (k,v) -> (exp_dfy k, exp_dfy v)) eel)
   | Tuple (e::[]) -> exp_dfy e (* Dafny does not have 1-tuples *)
   | Tuple el -> DTupleExpr (List.map ~f:exp_dfy el)  
+  | SingletonTuple (_, e) -> exp_dfy e
   | Subscript (e1, e2) -> DSubscript (exp_dfy e1, exp_dfy e2)
   | Index e -> DIndex (exp_dfy e)
   | Slice (e1, e2) -> begin
@@ -251,7 +264,7 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
   match body with
   | [ Return expression ] | [ Exp expression ] ->
     let lowered = Lowering.expression ~environment:function_environment expression in
-    if List.is_empty lowered.prelude then
+    if List.is_empty lowered.prelude && not lowered.effectful then
       DFuncMeth (specifications, name, generics, parameters, return_type, Some lowered.result)
     else
       DMeth
@@ -274,6 +287,7 @@ let prog_dfy p =
   (* Keep temporary/source-map state deterministic for callers that mix the
      compatibility conversion APIs with whole-program lowering. *)
   Convertcall.reset ();
+  let p = Semantic.normalize_program p in
   let (n_p, gens) = Generics.prog p in
   let environment = Semantic.analyze n_p in
   let p = Convertfor.prog n_p in

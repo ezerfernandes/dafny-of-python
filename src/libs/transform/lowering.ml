@@ -17,6 +17,7 @@ type lowered =
   ; result : D.dExpr
   ; resolved_type : Py.typ
   ; control_flow : bool
+  ; effectful : bool
   }
 
 type lvalue =
@@ -144,6 +145,7 @@ and lower_collection context constructor expressions resolved_type =
   ; result = constructor (results lowered)
   ; resolved_type
   ; control_flow = List.exists lowered ~f:(fun value -> value.control_flow)
+  ; effectful = List.exists lowered ~f:(fun value -> value.effectful)
   }
 
 and lower_list context elements =
@@ -161,6 +163,7 @@ and lower_list context elements =
     ; result = D.DIdentifier identifier
     ; resolved_type
     ; control_flow = List.exists lowered ~f:(fun value -> value.control_flow)
+    ; effectful = List.exists lowered ~f:(fun value -> value.effectful)
     }
 
 and lower_call context callee arguments =
@@ -169,6 +172,13 @@ and lower_call context callee arguments =
   let call = D.DCallExpr (lowered_callee.result, results lowered_arguments) in
   let prelude = lowered_callee.prelude @ join_preludes lowered_arguments in
   let resolved_type = Sem.infer context.environment (Py.Call (callee, arguments)) in
+  let effectful =
+    lowered_callee.effectful
+    || List.exists lowered_arguments ~f:(fun value -> value.effectful)
+    || match Sem.callable_kind context.environment callee with
+       | Sem.Method | Sem.Constructor | Sem.Generator -> true
+       | Sem.PureFunction -> false
+  in
   match Sem.callable_kind context.environment callee, context.evaluation with
   | (Sem.Method | Sem.Generator), Eager ->
     let identifier = fresh_temp () in
@@ -176,9 +186,10 @@ and lower_call context callee arguments =
     ; result = D.DIdentifier identifier
     ; resolved_type
     ; control_flow = false
+    ; effectful
     }
   | _ ->
-    { prelude; result = call; resolved_type; control_flow = false }
+    { prelude; result = call; resolved_type; control_flow = false; effectful }
 
 and lower_selector context = function
   | Py.Index index ->
@@ -201,6 +212,7 @@ and lower_selector context = function
      ; result = D.DSlice (lower_result, upper_result)
      ; resolved_type = Sem.infer context.environment (Py.Slice (None, None))
      ; control_flow = List.exists lowered ~f:(fun value -> value.control_flow)
+     ; effectful = List.exists lowered ~f:(fun value -> value.effectful)
      }, SliceSelector (kind, arguments))
   | _ -> fail "subscript selector must be an index or slice"
 
@@ -248,7 +260,69 @@ and lower_subscript context value selector =
   ; result
   ; resolved_type = result_type
   ; control_flow = lowered_value.control_flow || lowered_selector.control_flow
+  ; effectful = lowered_value.effectful || lowered_selector.effectful
   }
+
+and lower_compare_chain context first comparisons =
+  match comparisons with
+  | [] -> fail "comparison chains require at least one comparison operator"
+  | _ ->
+    let lower_raw evaluation operand = lower evaluation operand in
+    let lower_operand evaluation operand =
+      try lower_raw evaluation operand with
+      | LoweringError message -> fail ("comparison-chain operand: " ^ message)
+    in
+    let lower_initial operand =
+      match context.evaluation with
+      | Eager ->
+        begin
+          try lower_raw (scoped context) operand with
+          | LoweringError _ -> lower_operand context operand
+        end
+      | Scoped -> lower_operand (scoped context) operand
+    in
+    let lowered_first = lower_initial first in
+    let first_identifier = fresh_temp () in
+    let effectful = ref lowered_first.effectful in
+    let initial_prelude = ref lowered_first.prelude in
+    let rec chain current_identifier first_comparison comparisons =
+      let operator, operand = List.hd_exn comparisons in
+      let rest = List.tl_exn comparisons in
+      let lowered =
+        if first_comparison then lower_initial operand
+        else lower_operand (scoped context) operand
+      in
+      if first_comparison then initial_prelude := !initial_prelude @ lowered.prelude;
+      effectful := !effectful || lowered.effectful;
+      let next_identifier = fresh_temp () in
+      match rest with
+      | [] ->
+        D.DLet
+          ( next_identifier
+          , lowered.result
+          , D.DBinary
+              ( D.DIdentifier current_identifier
+              , binary_operator operator
+              , D.DIdentifier next_identifier ) )
+      | _ ->
+        let comparison =
+          D.DBinary
+            ( D.DIdentifier current_identifier
+            , binary_operator operator
+            , D.DIdentifier next_identifier )
+        in
+        D.DLet
+          ( next_identifier
+          , lowered.result
+          , D.DIfElseExpr (comparison, chain next_identifier false rest, D.DFalse) )
+    in
+    let result = D.DLet (first_identifier, lowered_first.result, chain first_identifier true comparisons) in
+    { prelude = !initial_prelude
+    ; result
+    ; resolved_type = Py.TBool S.def_seg
+    ; control_flow = true
+    ; effectful = !effectful
+    }
 
 and lower context expression =
   let environment = context.environment in
@@ -256,19 +330,20 @@ and lower context expression =
   | Py.Typ typ ->
     begin
       match typ with
-      | Py.TNone _ -> { prelude = []; result = D.DNull; resolved_type = Sem.normalize_type typ; control_flow = false }
+      | Py.TNone _ -> { prelude = []; result = D.DNull; resolved_type = Sem.normalize_type typ; control_flow = false; effectful = false }
       | _ -> fail "Type in expression context only allowed as right-hand-side of assignment"
     end
   | Py.Literal literal ->
-    { prelude = []; result = literal_dfy literal; resolved_type = Sem.infer environment expression; control_flow = false }
+    { prelude = []; result = literal_dfy literal; resolved_type = Sem.infer environment expression; control_flow = false; effectful = false }
   | Py.Identifier identifier ->
-    { prelude = []; result = D.DIdentifier identifier; resolved_type = Sem.infer environment expression; control_flow = false }
+    { prelude = []; result = D.DIdentifier identifier; resolved_type = Sem.infer environment expression; control_flow = false; effectful = false }
   | Py.Dot (value, identifier) ->
     let lowered = lower context value in
     { prelude = lowered.prelude
     ; result = D.DDot (lowered.result, identifier)
     ; resolved_type = Sem.infer environment expression
     ; control_flow = lowered.control_flow
+    ; effectful = lowered.effectful
     }
   | Py.BinaryExp (left, operator, right) ->
     let left_context = context in
@@ -283,6 +358,7 @@ and lower context expression =
     ; result = D.DBinary (lowered_left.result, binary_operator operator, lowered_right.result)
     ; resolved_type = Sem.infer environment expression
     ; control_flow = lowered_left.control_flow || lowered_right.control_flow
+    ; effectful = lowered_left.effectful || lowered_right.effectful
     }
   | Py.UnaryExp (operator, value) ->
     let lowered = lower context value in
@@ -290,8 +366,10 @@ and lower context expression =
     ; result = D.DUnary (unary_operator operator, lowered.result)
     ; resolved_type = Sem.infer environment expression
     ; control_flow = lowered.control_flow
+    ; effectful = lowered.effectful
     }
   | Py.Call (callee, arguments) -> lower_call context callee arguments
+  | Py.CompareChain (first, comparisons) -> lower_compare_chain context first comparisons
   | Py.Lst elements -> lower_list context elements
   | Py.Array elements -> lower_collection context (fun values -> D.DArrayExpr values) elements (Sem.infer environment expression)
   | Py.Set elements -> lower_collection context (fun values -> D.DSetExpr values) elements (Sem.infer environment expression)
@@ -302,6 +380,7 @@ and lower context expression =
     ; result = D.DMapExpr key_values
     ; resolved_type = Sem.infer environment expression
     ; control_flow = List.exists lowered ~f:(fun (key, value) -> key.control_flow || value.control_flow)
+    ; effectful = List.exists lowered ~f:(fun (key, value) -> key.effectful || value.effectful)
     }
   | Py.Tuple elements ->
     begin
@@ -309,16 +388,17 @@ and lower context expression =
       | [ element ] -> lower context element
       | _ -> lower_collection context (fun values -> D.DTupleExpr values) elements (Sem.infer environment expression)
     end
+  | Py.SingletonTuple (_, element) -> lower context element
   | Py.Subscript (value, selector) -> lower_subscript context value selector
   | Py.Index value -> lower context value
   | Py.Slice (lower_bound, upper_bound) ->
     fst (lower_selector context (Py.Slice (lower_bound, upper_bound)))
   | Py.Forall (identifiers, body) ->
     let lowered = lower (scoped context) body in
-    { prelude = []; result = D.DForall (identifiers, lowered.result); resolved_type = Py.TBool S.def_seg; control_flow = true }
+    { prelude = []; result = D.DForall (identifiers, lowered.result); resolved_type = Py.TBool S.def_seg; control_flow = true; effectful = lowered.effectful }
   | Py.Exists (identifiers, body) ->
     let lowered = lower (scoped context) body in
-    { prelude = []; result = D.DExists (identifiers, lowered.result); resolved_type = Py.TBool S.def_seg; control_flow = true }
+    { prelude = []; result = D.DExists (identifiers, lowered.result); resolved_type = Py.TBool S.def_seg; control_flow = true; effectful = lowered.effectful }
   | Py.Len (segment, value) ->
     let lowered = lower (scoped context) value in
     let result =
@@ -326,24 +406,25 @@ and lower context expression =
       | "list" -> D.DCallExpr (D.DDot (lowered.result, (fst segment, Some "len")), [])
       | _ -> D.DLen (segment, lowered.result)
     in
-    { prelude = lowered.prelude; result; resolved_type = Py.TInt S.def_seg; control_flow = lowered.control_flow }
+    { prelude = lowered.prelude; result; resolved_type = Py.TInt S.def_seg; control_flow = lowered.control_flow; effectful = lowered.effectful }
   | Py.Max (segment, value) ->
     let lowered = lower context value in
     { prelude = lowered.prelude
     ; result = D.DCallExpr (D.DDot (lowered.result, segment), [])
     ; resolved_type = Sem.infer environment expression
     ; control_flow = lowered.control_flow
+    ; effectful = lowered.effectful
     }
   | Py.Old (segment, value) ->
     let lowered = lower (scoped context) value in
-    { prelude = []; result = D.DOld (segment, lowered.result); resolved_type = Sem.infer environment expression; control_flow = true }
+    { prelude = []; result = D.DOld (segment, lowered.result); resolved_type = Sem.infer environment expression; control_flow = true; effectful = lowered.effectful }
   | Py.Fresh (segment, value) ->
     let lowered = lower (scoped context) value in
-    { prelude = []; result = D.DFresh (segment, lowered.result); resolved_type = Sem.infer environment expression; control_flow = true }
+    { prelude = []; result = D.DFresh (segment, lowered.result); resolved_type = Sem.infer environment expression; control_flow = true; effectful = lowered.effectful }
   | Py.Lambda (identifiers, body) ->
     let lowered = lower (scoped context) body in
     let parameters = List.map identifiers ~f:(fun identifier -> identifier, D.DVoid) in
-    { prelude = []; result = D.DLambda (parameters, [], lowered.result); resolved_type = Sem.infer environment expression; control_flow = true }
+    { prelude = []; result = D.DLambda (parameters, [], lowered.result); resolved_type = Sem.infer environment expression; control_flow = true; effectful = lowered.effectful }
   | Py.IfElseExp (when_true, condition, when_false) ->
     let lowered_condition = lower context condition in
     let lowered_true = lower (scoped context) when_true in
@@ -352,6 +433,7 @@ and lower context expression =
     ; result = D.DIfElseExpr (lowered_condition.result, lowered_true.result, lowered_false.result)
     ; resolved_type = Sem.infer environment expression
     ; control_flow = true
+    ; effectful = lowered_condition.effectful || lowered_true.effectful || lowered_false.effectful
     }
 
 let expression ?(environment = Sem.empty) expression =

@@ -9,6 +9,10 @@ open Pyparse.Sourcemap
 
 type callable_kind = PureFunction | Method | Constructor | Generator
 
+exception SemanticError of string
+
+let fail message = raise (SemanticError message)
+
 type callable_signature =
   { name : string
   ; parameters : (string * typ) list
@@ -68,6 +72,7 @@ let rec normalize_type = function
     generic "map" (List.map args ~f:normalize_type)
   | TSet (_, element) ->
     generic "set" (Option.to_list element |> List.map ~f:normalize_type)
+  | TTuple (_, Some [ element ]) -> normalize_type element
   | TTuple (_, elements) ->
     generic "tuple"
       (Option.value_map elements ~default:[] ~f:(List.map ~f:normalize_type))
@@ -76,8 +81,98 @@ let rec normalize_type = function
   | TType (_, element) ->
     generic "type" (Option.to_list element |> List.map ~f:normalize_type)
   | TGeneric (segment, arguments) ->
-    TGeneric (segment, List.map arguments ~f:normalize_type)
+    begin
+      match segment_name segment, arguments with
+      | "tuple", [ element ] -> normalize_type element
+      | _, _ -> TGeneric (segment, List.map arguments ~f:normalize_type)
+    end
   | typ -> typ
+
+let rec normalize_param (identifier, annotation_expression) =
+  identifier, normalize_exp annotation_expression
+
+and normalize_exp = function
+  | Typ typ -> Typ (normalize_type typ)
+  | Literal _ as expression -> expression
+  | Identifier _ as expression -> expression
+  | Dot (value, identifier) -> Dot (normalize_exp value, identifier)
+  | BinaryExp (left, operator, right) ->
+    BinaryExp (normalize_exp left, operator, normalize_exp right)
+  | CompareChain (first, comparisons) ->
+    CompareChain
+      ( normalize_exp first
+      , List.map comparisons ~f:(fun (operator, operand) -> operator, normalize_exp operand) )
+  | UnaryExp (operator, value) -> UnaryExp (operator, normalize_exp value)
+  | Call (callee, arguments) -> Call (normalize_exp callee, List.map arguments ~f:normalize_exp)
+  | Lst elements -> Lst (List.map elements ~f:normalize_exp)
+  | Array elements -> Array (List.map elements ~f:normalize_exp)
+  | Set elements -> Set (List.map elements ~f:normalize_exp)
+  | Dict entries ->
+    Dict (List.map entries ~f:(fun (key, value) -> normalize_exp key, normalize_exp value))
+  | Tuple [] -> fail "empty tuples are unsupported"
+  | Tuple [ element ] -> normalize_exp element
+  | Tuple elements -> Tuple (List.map elements ~f:normalize_exp)
+  | SingletonTuple (_, element) -> normalize_exp element
+  | Subscript (value, selector) -> Subscript (normalize_exp value, normalize_exp selector)
+  | Index value -> Index (normalize_exp value)
+  | Slice (lower_bound, upper_bound) ->
+    Slice (Option.map lower_bound ~f:normalize_exp, Option.map upper_bound ~f:normalize_exp)
+  | Forall (identifiers, body) -> Forall (identifiers, normalize_exp body)
+  | Exists (identifiers, body) -> Exists (identifiers, normalize_exp body)
+  | Len (segment, value) -> Len (segment, normalize_exp value)
+  | Max (segment, value) -> Max (segment, normalize_exp value)
+  | Old (segment, value) -> Old (segment, normalize_exp value)
+  | Fresh (segment, value) -> Fresh (segment, normalize_exp value)
+  | Lambda (identifiers, body) -> Lambda (identifiers, normalize_exp body)
+  | IfElseExp (when_true, condition, when_false) ->
+    IfElseExp (normalize_exp when_true, normalize_exp condition, normalize_exp when_false)
+
+let normalize_spec = function
+  | Pre value -> Pre (normalize_exp value)
+  | Post value -> Post (normalize_exp value)
+  | Invariant value -> Invariant (normalize_exp value)
+  | Decreases value -> Decreases (normalize_exp value)
+  | Reads value -> Reads (normalize_exp value)
+  | Modifies value -> Modifies (normalize_exp value)
+
+let rec normalize_statement = function
+  | IfElse (condition, first, alternatives, last) ->
+    IfElse
+      ( normalize_exp condition
+      , List.map first ~f:normalize_statement
+      , List.map alternatives ~f:(fun (condition, body) ->
+          normalize_exp condition, List.map body ~f:normalize_statement)
+      , List.map last ~f:normalize_statement )
+  | For (specifications, identifiers, iterable, body) ->
+    For
+      ( List.map specifications ~f:normalize_spec
+      , identifiers
+      , normalize_exp iterable
+      , List.map body ~f:normalize_statement )
+  | While (specifications, condition, body) ->
+    While
+      ( List.map specifications ~f:normalize_spec
+      , normalize_exp condition
+      , List.map body ~f:normalize_statement )
+  | Assign (annotation, targets, values) ->
+    Assign
+      ( Option.map annotation ~f:normalize_exp
+      , List.map targets ~f:normalize_exp
+      , List.map values ~f:normalize_exp )
+  | Function (specifications, name, parameters, return_type, body) ->
+    Function
+      ( List.map specifications ~f:normalize_spec
+      , name
+      , List.map parameters ~f:normalize_param
+      , normalize_exp return_type
+      , List.map body ~f:normalize_statement )
+  | Return value -> Return (normalize_exp value)
+  | Assert value -> Assert (normalize_exp value)
+  | Exp value -> Exp (normalize_exp value)
+  | (Break | Continue | Pass) as statement -> statement
+
+let normalize_program (Program statements) =
+  Program (List.map statements ~f:normalize_statement)
 
 let type_name typ =
   match typ with
@@ -218,6 +313,8 @@ let rec infer env = function
       | NotIn _ | In _ | BiImpl _ | Implies _ | Explies _ -> TBool def_seg
       | Plus _ | Minus _ | Times _ | Divide _ | Mod _ -> numeric_type (infer env left) (infer env right)
     end
+  | CompareChain _ -> TBool def_seg
+  | SingletonTuple (_, value) -> infer env value
   | Call (callee, arguments) ->
     begin
       match callee with
@@ -324,6 +421,7 @@ let rec type_of_target env = function
   | Identifier identifier -> lookup env (Option.value (snd identifier) ~default:"") |> Option.value ~default:(TIdent identifier)
   | Dot (value, field_name) -> infer env (Dot (value, field_name))
   | Subscript (value, selector) -> infer env (Subscript (value, selector))
+  | Tuple [ target ] -> type_of_target env target
   | Tuple targets -> generic "tuple" (List.map targets ~f:(type_of_target env))
   | _ -> TIdent def_seg
 
@@ -394,5 +492,7 @@ and infer_spec env = function
   | Pre value | Post value | Invariant value | Decreases value | Reads value | Modifies value -> infer env value
 
 let analyze (Program statements) =
-  let env = collect_functions empty statements in
-  analyze_statements env statements
+  match normalize_program (Program statements) with
+  | Program statements ->
+    let env = collect_functions empty statements in
+    analyze_statements env statements

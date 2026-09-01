@@ -85,8 +85,14 @@ def first(xs: list[int]) -> int:
 def increment(x: int) -> int:
   return x + 1
 
+def ordered(a: int, b: int, c: int) -> bool:
+  return a < b < c
+
 assert first([1]) == 1
 assert increment(1) == 2
+assert ordered(1, 2, 3)
+singleton_parenthesized = (1,)
+singleton_trailing = 2,
 PYTHON
 
 set +e
@@ -105,6 +111,8 @@ set -e
 test "$status" -eq 0
 grep -q 'function first' "$workdir/valid_output"
 grep -q 'function increment' "$workdir/valid_output"
+grep -q 'function ordered' "$workdir/valid_output"
+grep -q 'if ' "$workdir/valid_output"
 grep -q 'verifier finished with [0-9][0-9]* verified, 0 error' "$workdir/valid_output"
 # Dafny 4.11 reports harmless warnings (for example, an `old` expression that
 # does not dereference the heap) on stderr. A zero exit code and a zero-error

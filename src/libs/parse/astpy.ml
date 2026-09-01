@@ -118,6 +118,7 @@ type exp =
   | Identifier of identifier
   | Dot of exp * identifier
   | BinaryExp of exp * binaryop * exp
+  | CompareChain of exp * (binaryop * exp) list
   | UnaryExp of unaryop * exp
   | Call of exp * exp list
   | Lst of exp list
@@ -126,6 +127,9 @@ type exp =
   (* | SetComp of exp * exp * exp * exp list result, target, domain, conditions *)
   | Dict of (exp * exp) list
   | Tuple of exp list
+  (* The comma is retained until semantic normalization so source locations
+     for `(value,)` and `value,` remain distinguishable from `(value)`. *)
+  | SingletonTuple of segment * exp
   | Subscript of exp * exp (* value, slice *)
   | Index of exp
   | Slice of exp option * exp option (* lower, upper *)

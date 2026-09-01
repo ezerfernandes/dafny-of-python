@@ -20,6 +20,10 @@ let rec exp_lst = function
     let al1, n_e1 = exp_lst e1 in
     let al2, n_e2 = exp_lst e2 in
     (al1@al2, BinaryExp (n_e1, op, n_e2))
+  | CompareChain (first, comparisons) ->
+    [], CompareChain
+      ( exp_lst first |> snd
+      , List.map comparisons ~f:(fun (operator, operand) -> operator, exp_lst operand |> snd) )
   | UnaryExp (op, e) -> let al, n_e = exp_lst e in (al, UnaryExp (op, n_e))
   | Call (e, el) ->
     let als_nes = List.map ~f:exp_lst el in
@@ -43,6 +47,9 @@ let rec exp_lst = function
         ~init:([], [])
     in
     (al, Tuple n_el)
+  | SingletonTuple (comma, value) ->
+    let al, value = exp_lst value in
+    (al, SingletonTuple (comma, value))
   | Array el -> 
     let als_nes = List.map ~f:exp_lst el in
     let al, n_el =

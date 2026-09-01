@@ -81,6 +81,7 @@ type dExpr =
   | DOld of segment * dExpr
   | DFresh of segment * dExpr
   | DLambda of dParam list * dSpec list * dExpr
+  | DLet of dId * dExpr * dExpr
   | DIfElseExpr of dExpr * dExpr * dExpr
   | DTupleExpr of dExpr list
 

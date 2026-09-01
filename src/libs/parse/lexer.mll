@@ -112,7 +112,7 @@ rule next_token = parse
 | '.' { DOT }
 | ':' { COLON }
 | ';' { SEMICOLON }
-| ',' { COMMA }
+| ',' { COMMA (emit_lexeme lexbuf) }
 | "old" { OLD (emit_lexeme lexbuf) }
 | "fresh" { FRESH (emit_lexeme lexbuf) }
 | "len" { LEN (emit_lexeme lexbuf) }

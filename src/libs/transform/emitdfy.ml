@@ -307,6 +307,16 @@ let rec print_exp id = function
     let op = newcolumn " =>" in
     let pe = print_exp 1 e in
     String.concat [n; ob; pfl; cb; psl; op; pe]
+  | DLet (identifier, value, body) -> let n = newcolumn (indent id) in
+    let ob = newcolumn "(" in
+    let var = newcolumn "var " in
+    let pi = print_ident 0 identifier in
+    let assign = newcolumn " := " in
+    let pv = print_exp 0 value in
+    let semi = newcolumn "; " in
+    let pb = print_exp 0 body in
+    let cb = newcolumn ")" in
+    String.concat [n; ob; var; pi; assign; pv; semi; pb; cb]
   | DIfElseExpr (c, e1, e2) -> let n = newcolumn (indent id) in
     let i = newcolumn "if " in
     let pc = print_exp 0 c in

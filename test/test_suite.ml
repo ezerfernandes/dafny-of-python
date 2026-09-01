@@ -302,6 +302,34 @@ let test_parser_expression_and_type_forms () =
      check int "all parameterized types" 9 (List.length params)
    | _ -> fail "the type grammar did not preserve parameterized types")
 
+let test_phase2_parser_forms () =
+  let open Ast in
+  let singleton source =
+    match parse_program source with
+    | [ Exp (SingletonTuple (comma, Identifier (_, Some "value"))) ] ->
+      check string "singleton tuple comma source" "," (seg_val comma)
+    | _ -> fail "comma-bearing singleton tuple was not preserved"
+  in
+  singleton "value,\n";
+  singleton "(value,)\n";
+  (match parse_program "(value)\n" with
+   | [ Exp (Identifier (_, Some "value")) ] -> ()
+   | _ -> fail "parenthesized expressions should not become tuples");
+  (match parse_program "value = (first, second)\n" with
+   | [ Assign (_, _, [ Tuple [ Identifier (_, Some "first"); Identifier (_, Some "second") ] ]) ] -> ()
+   | _ -> fail "multi-element tuples should remain tuples");
+  (match parse_program "value = first < second > third\n" with
+   | [ Assign (_, _, [ CompareChain (_, [ (Lt _, _); (Gt _, _) ]) ]) ] -> ()
+   | _ -> fail "comparison chains should use a flat source node");
+  (match parse_program "value = first in values != missing\n" with
+   | [ Assign (_, _, [ CompareChain (_, [ (In _, _); (NEq _, _) ]) ]) ] -> ()
+   | _ -> fail "membership comparison chains should preserve operators");
+  (try
+     ignore (Pyparse.Parser.parse_string "()\n");
+     fail "empty tuple should remain unsupported"
+   with
+   | Pyparse.Parser.ParseError _ -> ())
+
 let test_ast_utilities () =
   let open Ast in
   let int_type = TInt Pyparse.Sourcemap.def_seg in
@@ -470,9 +498,11 @@ let test_convertlist_paths () =
     (fun expression -> ignore (Transform.Convertlist.exp_lst expression))
     [ Dot (xs, segment "field")
     ; BinaryExp (xs, Plus def_seg, Literal (IntLit "1"))
+    ; CompareChain (xs, [ Lt def_seg, xs; Gt def_seg, xs ])
     ; UnaryExp (Not def_seg, xs)
     ; Call (xs, [ list ])
     ; Tuple [ xs ]
+    ; SingletonTuple (segment ",", xs)
     ; Old (def_seg, xs)
     ; Fresh (def_seg, xs)
     ; Forall ([ segment "k" ], xs)
@@ -499,6 +529,8 @@ let test_convertlist_paths () =
     (Call (xs, [ nested_list ]));
   expect_list_assignment "tuple rewrites nested lists"
     (Tuple [ nested_list ]);
+  expect_list_assignment "singleton tuple rewrites nested lists"
+    (SingletonTuple (segment ",", nested_list));
   expect_list_assignment "old rewrites nested lists"
     (Old (def_seg, nested_list));
   expect_list_assignment "forall rewrites nested lists"
@@ -615,9 +647,11 @@ let test_convertcall_expression_paths () =
   let expressions =
     [ Dot (x, segment "field")
     ; BinaryExp (x, Plus def_seg, x)
+    ; CompareChain (x, [ Lt def_seg, call "middle"; Gt def_seg, call "last" ])
     ; UnaryExp (Not def_seg, x)
     ; Lst [ x ]
     ; Tuple [ x ]
+    ; SingletonTuple (segment ",", x)
     ; Subscript (x, Index (Literal (IntLit "0")))
     ; Index x
     ; Slice (Some x, Some x)
@@ -638,6 +672,10 @@ let test_convertcall_expression_paths () =
     ]
   in
   List.iter (fun expression -> ignore (Transform.Convertcall.exp_calls expression)) expressions;
+  ignore
+    (Transform.Convertcall.exp_calls_scoped
+       (CompareChain (x, [ Lt def_seg, SingletonTuple (segment ",", x) ])));
+  ignore (Transform.Convertcall.exp_calls_scoped (SingletonTuple (segment ",", x)));
   let assignments, rewritten = Transform.Convertcall.exp_calls (IfElseExp (call "if_true", call "condition", call "if_false")) in
   check int "conditional calls are rewritten" 3 (List.length assignments);
   (match rewritten with
@@ -1125,7 +1163,189 @@ let test_semantic_lowering_paths () =
             (D.DAssignLvalue
                (None,
                 [ D.TupleTarget [ D.Local (segment "first"); D.Local (segment "second") ] ],
-                [ D.DTupleExpr [ D.DIntLit "1"; D.DIntLit "2" ] ])))
+               [ D.DTupleExpr [ D.DIntLit "1"; D.DIntLit "2" ] ])))
+
+let test_phase2_semantics_and_chains () =
+  let open Ast in
+  let int_type = TInt def_seg in
+  let identifier name = Ast.Identifier (segment name) in
+  let singleton = SingletonTuple (segment ",", identifier "value") in
+  (match Transform.Semantic.normalize_exp singleton with
+   | Identifier (_, Some "value") -> ()
+   | _ -> fail "singleton tuple normalization should return its element");
+  (match Transform.Semantic.normalize_exp (Tuple [ singleton ]) with
+   | Identifier (_, Some "value") -> ()
+   | _ -> fail "one-element tuple normalization should be recursive");
+  (match Transform.Semantic.normalize_type (TTuple (def_seg, Some [ int_type ])) with
+   | TInt _ -> ()
+   | _ -> fail "one-element tuple types should normalize to their element");
+  (match Transform.Semantic.normalize_type (TTuple (def_seg, Some [ int_type; TStr def_seg ])) with
+   | TGeneric (_, [ TInt _; TStr _ ]) -> ()
+   | _ -> fail "multi-element tuple types should remain tuples");
+  (match Transform.Semantic.normalize_type (TGeneric (segment "tuple", [ int_type ])) with
+   | TInt _ -> ()
+   | _ -> fail "generic singleton tuple types should normalize to their element");
+  check bool "singleton tuple inference follows its element" true
+    (match Transform.Semantic.infer Transform.Semantic.empty singleton with
+     | TIdent (_, Some "value") -> true
+     | _ -> false);
+  check bool "singleton tuple targets follow their element" true
+    (match Transform.Semantic.type_of_target Transform.Semantic.empty (Tuple [ identifier "value" ]) with
+     | TIdent (_, Some "value") -> true
+     | _ -> false);
+  expect_exception "manual empty tuples are unsupported" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> Transform.Semantic.normalize_exp (Tuple []));
+  List.iter
+    (fun expression -> ignore (Transform.Semantic.normalize_exp expression))
+    [ BinaryExp (singleton, Plus def_seg, singleton)
+    ; CompareChain (singleton, [ EqEq def_seg, singleton ])
+    ; UnaryExp (Not def_seg, singleton)
+    ; Call (singleton, [ singleton ])
+    ; Lst [ singleton ]; Array [ singleton ]; Set [ singleton ]
+    ; Dict [ singleton, singleton ]; Tuple [ singleton; singleton ]
+    ; Subscript (singleton, Index singleton); Index singleton
+    ; Slice (Some singleton, Some singleton)
+    ; Forall ([ segment "bound" ], singleton); Exists ([ segment "bound" ], singleton)
+    ; Len (def_seg, singleton); Max (def_seg, singleton)
+    ; Old (def_seg, singleton); Fresh (def_seg, singleton)
+    ; Lambda ([ segment "bound" ], singleton)
+    ; IfElseExp (singleton, singleton, singleton)
+    ];
+  List.iter
+    (fun specification -> ignore (Transform.Semantic.normalize_spec specification))
+    [ Pre singleton; Post singleton; Invariant singleton; Decreases singleton
+    ; Reads singleton; Modifies singleton ];
+  ignore
+    (Transform.Semantic.normalize_program
+       (Program
+          [ IfElse (singleton, [ Exp singleton ], [ (singleton, [ Assert singleton ]) ], [ Return singleton ])
+          ; For ([ Pre singleton ], [ segment "item" ], singleton, [ Pass ])
+          ; While ([ Post singleton ], singleton, [ Break ])
+          ; Assign (Some singleton, [ singleton ], [ singleton ])
+          ; Function ([], segment "nested", [ segment "argument", singleton ], singleton, [ Continue ])
+          ; Pass ]));
+  let environment =
+    Transform.Semantic.empty
+    |> fun environment -> Transform.Semantic.bind environment "first" int_type
+    |> fun environment -> Transform.Semantic.bind environment "middle" int_type
+    |> fun environment -> Transform.Semantic.bind environment "last" int_type
+    |> fun environment -> Transform.Semantic.bind environment "values" (TLst (def_seg, Some int_type))
+  in
+  let chain =
+    CompareChain
+      ( identifier "first"
+      , [ Lt def_seg, identifier "middle"; Gt def_seg, identifier "last" ] )
+  in
+  check bool "comparison chains infer booleans" true
+    (eqtyp (Transform.Semantic.infer environment chain) (TBool def_seg));
+  let lowered = Transform.Lowering.expression ~environment chain in
+  check int "each chain operand is locally bound" 3
+    (let rec count = function
+       | D.DLet (_, _, body) -> 1 + count body
+       | D.DIfElseExpr (_, when_true, when_false) -> count when_true + count when_false
+       | _ -> 0
+     in count lowered.result);
+  check bool "comparison chains do not need eager preludes" true (lowered.prelude = []);
+  Transform.Emitdfy.reset ();
+  let rendered = Transform.Emitdfy.print_exp 0 lowered.result in
+  check bool "comparison chains use a lazy conditional" true (has_substring rendered "if ");
+  check bool "comparison chains use the false branch" true (has_substring rendered "else false");
+  let initial_list_chain =
+    CompareChain
+      ( Call (identifier "first", [ Lst [ Literal (IntLit "1") ] ])
+      , [ Lt def_seg, identifier "last" ] )
+  in
+  let lowered_initial_list = Transform.Lowering.expression ~environment initial_list_chain in
+  check bool "initial chain setup remains in the outer prelude" true
+    (List.length lowered_initial_list.prelude > 0);
+  let scoped_chain =
+    BinaryExp
+      ( Literal TrueLit
+      , And def_seg
+      , CompareChain (identifier "first", [ Lt def_seg, identifier "middle" ]) )
+  in
+  ignore (Transform.Lowering.expression ~environment scoped_chain);
+  expect_exception "empty comparison chains are unsupported"
+    (function Transform.Lowering.LoweringError message -> has_substring message "at least one" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.expression ~environment (CompareChain (identifier "first", []))));
+  let method_call = Call (Dot (identifier "values", segment "method"), []) in
+  let method_chain = CompareChain (method_call, [ Lt def_seg, Literal (IntLit "1") ]) in
+  let lowered_method = Transform.Lowering.expression ~environment method_chain in
+  check int "effectful chain calls stay scoped" 0 (List.length lowered_method.prelude);
+  check bool "effectful chain calls are marked" true lowered_method.effectful;
+  ignore (Transform.Lowering.expression ~environment (SingletonTuple (segment ",", identifier "first")));
+  let effectful_argument =
+    Transform.Lowering.expression ~environment
+      (Call (identifier "pure", [ method_call ]))
+  in
+  check bool "effectful call arguments are propagated" true effectful_argument.effectful;
+  let effectful_callee =
+    Transform.Lowering.expression ~environment
+      (Call (method_call, []))
+  in
+  check bool "effectful callees are propagated" true effectful_callee.effectful;
+  let effectful_binary =
+    Transform.Lowering.expression ~environment
+      (BinaryExp (method_call, Plus def_seg, Literal (IntLit "1")))
+  in
+  check bool "effectful binary operands are propagated" true effectful_binary.effectful;
+  let effectful_right_binary =
+    Transform.Lowering.expression ~environment
+      (BinaryExp (Literal (IntLit "1"), Plus def_seg, method_call))
+  in
+  check bool "effectful right binary operands are propagated" true effectful_right_binary.effectful;
+  let effectful_subscript =
+    Transform.Lowering.expression ~environment
+      (Subscript (method_call, Index (Literal (IntLit "0"))))
+  in
+  check bool "effectful subscript operands are propagated" true effectful_subscript.effectful;
+  let effectful_selector =
+    Transform.Lowering.expression ~environment
+      (Subscript (identifier "values", Index method_call))
+  in
+  check bool "effectful subscript selectors are propagated" true effectful_selector.effectful;
+  let effectful_dictionary_key =
+    Transform.Lowering.expression ~environment
+      (Dict [ method_call, Literal (IntLit "1") ])
+  in
+  check bool "effectful dictionary keys are propagated" true effectful_dictionary_key.effectful;
+  let method_in_final_operand =
+    Transform.Lowering.expression ~environment
+      (CompareChain
+         ( identifier "first"
+         , [ Lt def_seg, identifier "middle"; Gt def_seg, method_call ] ))
+  in
+  check bool "effectful final chain operands are propagated" true method_in_final_operand.effectful;
+  ignore
+    (Transform.Lowering.expression ~environment
+       (IfElseExp (method_call, Literal TrueLit, Literal FalseLit)));
+  ignore
+    (Transform.Lowering.expression ~environment
+       (IfElseExp (Literal TrueLit, method_call, Literal FalseLit)));
+  ignore
+    (Transform.Lowering.expression ~environment
+       (IfElseExp (Literal TrueLit, Literal TrueLit, method_call)));
+  expect_exception "chain list setup is rejected in a scoped operand"
+    (function Transform.Lowering.LoweringError message -> has_substring message "comparison-chain" | _ -> false)
+    (fun () ->
+       ignore
+         (Transform.Lowering.expression ~environment
+            (CompareChain
+               ( identifier "first"
+               , [ Lt def_seg, identifier "middle"; Lt def_seg, Lst [ Literal (IntLit "2") ] ]))));
+  let normalized_program =
+    Transform.Semantic.normalize_program
+      (Program
+         [ Function
+             ( [ Pre singleton ]
+             , segment "identity"
+             , [ segment "argument", Typ (TTuple (def_seg, Some [ int_type ])) ]
+             , Typ (TTuple (def_seg, Some [ int_type ]))
+             , [ Return singleton ] ) ])
+  in
+  (match normalized_program with
+   | Program [ Function ([ Pre (Identifier _ ) ], _, [ (_, Typ (TInt _)) ], Typ (TInt _), [ Return (Identifier _) ]) ] -> ()
+   | _ -> fail "normalization should visit function specs, parameters, returns, and bodies")
 
 let test_generics_paths () =
   let open Ast in
@@ -1208,6 +1428,8 @@ let test_todafnyast_paths () =
     [ x
     ; Dot (x, segment "field")
     ; BinaryExp (x, Plus def_seg, Literal (IntLit "1"))
+    ; CompareChain (x, [ Lt def_seg, y; Gt def_seg, x ])
+    ; CompareChain (x, [])
     ; UnaryExp (Not def_seg, Literal FalseLit)
     ; Literal TrueLit
     ; Literal (FloatLit "1.5")
@@ -1221,6 +1443,7 @@ let test_todafnyast_paths () =
     ; Tuple []
     ; Tuple [ x ]
     ; Tuple [ x; y ]
+    ; SingletonTuple (segment ",", x)
     ; Subscript (x, Index (Literal (IntLit "0")))
     ; Index x
     ; Slice (Some x, Some y)
@@ -1435,6 +1658,7 @@ let test_emitter_paths_and_sourcemaps () =
     ; D.DExists ([ ds "k" ], D.DFalse); D.DLen (def_seg, id "x")
     ; D.DOld (def_seg, id "x"); D.DFresh (def_seg, id "x")
     ; D.DLambda ([ (ds "x", D.DVoid) ], [], id "x")
+    ; D.DLet (ds "bound", D.DIntLit "1", id "bound")
     ; D.DIfElseExpr (D.DTrue, D.DIntLit "1", D.DIntLit "2")
     ; D.DTupleExpr [ id "x"; id "y" ]
     ]
@@ -1496,6 +1720,8 @@ let test_emitter_paths_and_sourcemaps () =
   check string "lambda specification rendering" "(x)requires true => x"
     (render_exp
        (D.DLambda ([ (ds "x", D.DVoid) ], [ D.DRequires D.DTrue ], id "x")));
+  check string "let rendering" "(var bound := 1; bound)"
+    (render_exp (D.DLet (ds "bound", D.DIntLit "1", id "bound")));
   check string "conditional rendering" "if true then 1 else 2"
     (render_exp (D.DIfElseExpr (D.DTrue, D.DIntLit "1", D.DIntLit "2")));
   check string "tuple rendering" "(x, y)"
@@ -1795,6 +2021,7 @@ let () =
                   ; test_case "entry points and errors" `Quick test_parser_entry_points_and_errors
                   ; test_case "nice parser wrapper" `Quick test_nice_parser_wrapper_paths
                   ; test_case "expression and type forms" `Quick test_parser_expression_and_type_forms
+                  ; test_case "phase 2 parser forms" `Quick test_phase2_parser_forms
                   ; test_case "AST utilities" `Quick test_ast_utilities
                   ; test_case "AST serializers and subtyping" `Quick test_ast_serializers_and_subtyping ])
     ; ("transforms", [ test_case "call state reset" `Quick test_transform_state_resets
@@ -1805,6 +2032,7 @@ let () =
                       ; test_case "call and for conversion" `Quick test_convertcall_and_convertfor_paths
                       ; test_case "for statement paths" `Quick test_convertfor_statement_paths
                       ; test_case "semantic lowering paths" `Quick test_semantic_lowering_paths
+                      ; test_case "phase 2 semantics and chains" `Quick test_phase2_semantics_and_chains
                       ; test_case "generic conversion" `Quick test_generics_paths
                       ; test_case "call expression paths" `Quick test_convertcall_expression_paths
                       ; test_case "Dafny AST conversion" `Quick test_todafnyast_paths
