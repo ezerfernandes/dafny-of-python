@@ -330,6 +330,31 @@ let test_phase2_parser_forms () =
    with
    | Pyparse.Parser.ParseError _ -> ())
 
+let test_phase3_collection_parser_forms () =
+  let open Ast in
+  (match parse_program "values = {1, 2}\n" with
+   | [ Assign (_, _, [ Set [ Literal (IntLit "1"); Literal (IntLit "2") ] ]) ] -> ()
+   | _ -> fail "set displays should preserve their element list");
+  (match parse_program "mapping = {1: 2, 3: 4}\n" with
+   | [ Assign (_, _, [ Dict [ (Literal (IntLit "1"), Literal (IntLit "2")); (Literal (IntLit "3"), Literal (IntLit "4")) ] ]) ] -> ()
+   | _ -> fail "dictionary displays should preserve key/value entries");
+  let call_name source expected =
+    match parse_program source with
+    | [ Assign (_, _, [ Call (Identifier (_, Some name), []) ]) ] ->
+      check bool (source ^ " constructor") true
+        (String.equal (String.lowercase_ascii name) expected
+         || String.equal (String.lowercase_ascii name) (expected ^ "f"))
+    | _ -> fail (source ^ " should parse as a constructor call")
+  in
+  call_name "values = set()\n" "set";
+  call_name "mapping = dict()\n" "dict";
+  (match parse_program "value = left | middle & right\n" with
+   | [ Assign (_, _, [ BinaryExp (Identifier (_, Some "left"), BitOr _, BinaryExp (Identifier (_, Some "middle"), BitAnd _, Identifier (_, Some "right"))) ]) ] -> ()
+   | _ -> fail "set union and intersection precedence should be preserved");
+  (match parse_program "value = key in values | other\n" with
+   | [ Assign (_, _, [ CompareChain (_, [ (In _, BinaryExp (_, BitOr _, _)) ]) ]) ] -> ()
+   | _ -> fail "membership should accept a set algebra expression")
+
 let test_ast_utilities () =
   let open Ast in
   let int_type = TInt Pyparse.Sourcemap.def_seg in
@@ -394,7 +419,8 @@ let test_ast_serializers_and_subtyping () =
     [ TrueLit; FalseLit; IntLit "1"; FloatLit "1.0"; StringLit "s"; NoneLit ];
   let operators =
     [ Plus s; Minus s; Times s; Divide s; Mod s; EqEq s; NEq s; Lt s; LEq s
-    ; Gt s; GEq s; And s; Or s; NotIn s; In s; BiImpl s; Implies s; Explies s ]
+    ; Gt s; GEq s; And s; Or s; NotIn s; In s; BiImpl s; Implies s; Explies s
+    ; BitOr s; BitAnd s ]
   in
   List.iter (fun value -> ignore (sexp_of_binaryop value)) operators;
   let x = Identifier s in
@@ -783,7 +809,7 @@ let test_semantic_lowering_paths () =
   List.iter
     (fun name -> ignore (Transform.Semantic.normalize_type (TIdent (segment name))))
     [ "list"; "seq"; "sequence"; "set"; "dict"; "map"; "tuple"; "array" ];
-  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = [] } "ignored" int_type);
+  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = [] } "ignored" int_type);
   ignore (Transform.Semantic.annotation (Typ int_type));
   ignore (Transform.Semantic.annotation (Identifier (segment "Alias")));
   ignore (Transform.Semantic.annotation (Literal TrueLit));
@@ -848,6 +874,21 @@ let test_semantic_lowering_paths () =
   check int "conditional branches are not evaluated eagerly" 0 (List.length conditional.prelude);
   let nested_dictionary = lower (Dict [ Literal (StringLit "key"), method_call ]) in
   check int "nested method calls are not silently dropped" 1 (List.length nested_dictionary.prelude);
+  let lowered_if_with_prelude =
+    Transform.Lowering.statements ~environment
+      [ IfElse (Literal TrueLit, [], [ (method_call, [ Pass ]) ], []) ]
+  in
+  check bool "elif condition preludes are declared before their condition" true
+    (match lowered_if_with_prelude with
+     | [ D.DIf (_, _, [], D.DAssignLvalue _ :: D.DIf _ :: _) ] -> true
+     | _ -> false);
+  let lowered_while_with_prelude =
+    Transform.Lowering.statements ~environment [ While ([], method_call, [ Pass ]) ]
+  in
+  check bool "while condition preludes are evaluated inside the loop" true
+    (match lowered_while_with_prelude with
+     | [ D.DWhile ([], D.DTrue, D.DAssignLvalue _ :: D.DIf (D.DUnary (D.DNot _, _), [ D.DBreak ], [], []) :: _) ] -> true
+     | _ -> false);
   let explicit_target =
     Transform.Lowering.statements ~environment
       [ Assign (None, [ Dot (xs, segment "field") ], [ Literal (IntLit "1") ]) ]
@@ -901,6 +942,19 @@ let test_semantic_lowering_paths () =
     Transform.Semantic.add_function function_environment generator_signature
     |> fun environment -> Transform.Semantic.add_function environment constructor_signature
   in
+  let list_consumer : Transform.Semantic.callable_signature =
+    { name = "consume"; parameters = [ "items", list_type ]; return_type = int_type
+    ; kind = Transform.Semantic.PureFunction }
+  in
+  let list_call_environment = Transform.Semantic.add_function callable_environment list_consumer in
+  let empty_argument_call =
+    Transform.Lowering.expression ~environment:list_call_environment
+      (Call (identifier "consume", [ Lst [] ]))
+  in
+  check bool "call parameter types provide empty list context" true
+    (match empty_argument_call.prelude with
+     | [ D.DAssignLvalue (_, [ D.Local _ ], [ D.DNew (D.DIdentTyp (_, [ D.DInt _ ]), [ D.DSeqExpr [] ]) ]) ] -> true
+     | _ -> false);
   check int "generator calls use a scoped temporary" 1
     (List.length
        (Transform.Lowering.expression ~environment:callable_environment
@@ -943,7 +997,7 @@ let test_semantic_lowering_paths () =
   ignore (Transform.Semantic.lookup_function environment "missing");
   ignore (Transform.Semantic.lookup_class environment "Missing");
   ignore (Transform.Semantic.leave_scope (Transform.Semantic.enter_scope environment Transform.Semantic.ComprehensionScope));
-  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = [] });
+  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = [] });
   let replacement : Transform.Semantic.callable_signature =
     { name = "pure"; parameters = []; return_type = int_type; kind = Transform.Semantic.Constructor }
   in
@@ -979,7 +1033,8 @@ let test_semantic_lowering_paths () =
             (BinaryExp (Literal (IntLit "1"), operator, Literal (IntLit "2")))))
     [ Minus def_seg; Times def_seg; Divide def_seg; Mod def_seg; EqEq def_seg
     ; NEq def_seg; Lt def_seg; LEq def_seg; Gt def_seg; GEq def_seg; Or def_seg
-    ; NotIn def_seg; In def_seg; BiImpl def_seg; Implies def_seg; Explies def_seg ];
+    ; NotIn def_seg; In def_seg; BiImpl def_seg; Implies def_seg; Explies def_seg
+    ; BitOr def_seg; BitAnd def_seg ];
   ignore (Transform.Semantic.infer_literal TrueLit);
   List.iter (fun literal -> ignore (Transform.Semantic.infer_literal literal))
     [ FalseLit; IntLit "1"; FloatLit "1.0"; StringLit "s"; NoneLit ];
@@ -1011,9 +1066,6 @@ let test_semantic_lowering_paths () =
             (IfElseExp (Literal (FloatLit "1.0"), Literal (IntLit "2"), Literal (FloatLit "3.0"))));
   ignore (Transform.Semantic.infer environment
             (IfElseExp (Literal (FloatLit "1.0"), Literal TrueLit, Literal (IntLit "3"))));
-  List.iter
-    (fun specification -> ignore (Transform.Semantic.infer_spec environment specification))
-    [ Pre xs; Post xs; Invariant xs; Decreases xs; Reads xs; Modifies xs ];
   ignore
     (Transform.Semantic.analyze
        (Program
@@ -1023,7 +1075,7 @@ let test_semantic_lowering_paths () =
           ; IfElse (Literal TrueLit, [ Assert xs ], [ (Literal FalseLit, [ Pass ]) ], [ Exp xs ])
           ; While ([ Invariant xs ], Literal FalseLit, [ Pass ])
           ; For ([ Invariant xs ], [ segment "item" ], xs, [ Pass ])
-          ; For ([], [ segment "item" ], identifier "unknown", [ Break; Continue ])
+          ; For ([], [ segment "item" ], xs, [ Break; Continue ])
           ; Break
           ; Continue
           ; Function ([], segment "local", [ segment "argument", Typ int_type ], Typ int_type, [ Return xs ])
@@ -1046,7 +1098,8 @@ let test_semantic_lowering_paths () =
     (fun operator -> ignore (Transform.Lowering.binary_operator operator))
     [ NotIn def_seg; In def_seg; Plus def_seg; Minus def_seg; Times def_seg; Divide def_seg
     ; Mod def_seg; NEq def_seg; EqEq def_seg; Lt def_seg; LEq def_seg; Gt def_seg; GEq def_seg
-    ; And def_seg; Or def_seg; BiImpl def_seg; Implies def_seg; Explies def_seg ];
+    ; And def_seg; Or def_seg; BiImpl def_seg; Implies def_seg; Explies def_seg
+    ; BitOr def_seg; BitAnd def_seg ];
   ignore (Transform.Lowering.generic_name int_type);
   ignore (Transform.Lowering.generic_arguments int_type);
   ignore (Transform.Lowering.generic_arguments list_type);
@@ -1101,7 +1154,8 @@ let test_semantic_lowering_paths () =
     (fun () -> Transform.Lowering.statements ~environment [ Function ([], segment "f", [], Typ int_type, []) ]);
   ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) xs);
   ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) (Dot (xs, segment "field")));
-  ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) (Subscript (xs, Index (Literal (IntLit "0")))));
+  ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context environment)
+            (Subscript (xs, Index (Literal (IntLit "0")))));
   ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) (Tuple [ xs; sequence ]));
   expect_exception "invalid lvalue" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
     (fun () -> Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) (Literal TrueLit));
@@ -1270,9 +1324,9 @@ let test_phase2_semantics_and_chains () =
     (fun () -> ignore (Transform.Lowering.expression ~environment (CompareChain (identifier "first", []))));
   let method_call = Call (Dot (identifier "values", segment "method"), []) in
   let method_chain = CompareChain (method_call, [ Lt def_seg, Literal (IntLit "1") ]) in
-  let lowered_method = Transform.Lowering.expression ~environment method_chain in
-  check int "effectful chain calls stay scoped" 0 (List.length lowered_method.prelude);
-  check bool "effectful chain calls are marked" true lowered_method.effectful;
+  expect_exception "effectful calls are rejected in comparison chains"
+    (function Transform.Lowering.LoweringError message -> has_substring message "effectful" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.expression ~environment method_chain));
   ignore (Transform.Lowering.expression ~environment (SingletonTuple (segment ",", identifier "first")));
   let effectful_argument =
     Transform.Lowering.expression ~environment
@@ -1310,12 +1364,13 @@ let test_phase2_semantics_and_chains () =
   in
   check bool "effectful dictionary keys are propagated" true effectful_dictionary_key.effectful;
   let method_in_final_operand =
-    Transform.Lowering.expression ~environment
-      (CompareChain
-         ( identifier "first"
-         , [ Lt def_seg, identifier "middle"; Gt def_seg, method_call ] ))
+    CompareChain
+      ( identifier "first"
+      , [ Lt def_seg, identifier "middle"; Gt def_seg, method_call ] )
   in
-  check bool "effectful final chain operands are propagated" true method_in_final_operand.effectful;
+  expect_exception "effectful final chain operands are rejected"
+    (function Transform.Lowering.LoweringError message -> has_substring message "effectful" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.expression ~environment method_in_final_operand));
   ignore
     (Transform.Lowering.expression ~environment
        (IfElseExp (method_call, Literal TrueLit, Literal FalseLit)));
@@ -1346,6 +1401,629 @@ let test_phase2_semantics_and_chains () =
   (match normalized_program with
    | Program [ Function ([ Pre (Identifier _ ) ], _, [ (_, Typ (TInt _)) ], Typ (TInt _), [ Return (Identifier _) ]) ] -> ()
    | _ -> fail "normalization should visit function specs, parameters, returns, and bodies")
+
+let test_phase3_collections () =
+  let open Ast in
+  let int_type = TInt def_seg in
+  let string_type = TStr def_seg in
+  let set_type = TSet (def_seg, Some int_type) in
+  let map_type = TDict (def_seg, Some int_type, Some string_type) in
+  let list_type = TLst (def_seg, Some int_type) in
+  let sequence_type = TGeneric (segment "seq", [ int_type ]) in
+  let identifier name = Ast.Identifier (segment name) in
+  let values = identifier "values" in
+  let mapping = identifier "mapping" in
+  let list = identifier "list_value" in
+  let sequence = identifier "sequence" in
+  let known_map = Dict [ Literal (IntLit "1"), Literal (StringLit "value") ] in
+  let env =
+    Transform.Semantic.empty
+    |> fun env -> Transform.Semantic.bind env "values" set_type
+    |> fun env -> Transform.Semantic.bind env "mapping" map_type
+    |> fun env -> Transform.Semantic.bind env "list_value" list_type
+    |> fun env -> Transform.Semantic.bind env "sequence" sequence_type
+    |> fun env -> Transform.Semantic.bind env "text" string_type
+    |> fun env -> Transform.Semantic.bind env "array_value" (TGeneric (segment "array", [ int_type ]))
+    |> fun env -> Transform.Semantic.bind env "tuple_value" (TTuple (def_seg, Some [ int_type; int_type ]))
+  in
+  let kind name expected typ =
+    check bool name true (Transform.Semantic.collection_kind typ = expected)
+  in
+  kind "set collection classification" Transform.Semantic.SetCollection set_type;
+  kind "map collection classification" Transform.Semantic.MapCollection map_type;
+  kind "list collection classification" Transform.Semantic.ListCollection list_type;
+  kind "sequence collection classification" Transform.Semantic.SequenceCollection sequence_type;
+  kind "array collection classification" Transform.Semantic.ArrayCollection
+    (TGeneric (segment "array", [ int_type ]));
+  kind "tuple collection classification" Transform.Semantic.TupleCollection
+    (TTuple (def_seg, Some [ int_type; string_type ]));
+  kind "string collection classification" Transform.Semantic.StringCollection string_type;
+  kind "unknown generic classification" Transform.Semantic.UnknownCollection
+    (TGeneric (segment "custom", [ int_type ]));
+  kind "unknown identifier classification" Transform.Semantic.UnknownCollection
+    (TIdent (segment "Unknown"));
+  kind "non-collection classification" Transform.Semantic.NonCollection int_type;
+  check bool "set element type" true
+    (match Transform.Semantic.collection_element_type set_type with
+     | Some typ -> Transform.Semantic.compatible_types typ int_type
+     | None -> false);
+  List.iter
+    (fun typ -> ignore (Transform.Semantic.collection_element_type typ))
+    [ list_type; sequence_type; TGeneric (segment "array", [ int_type ])
+    ; TTuple (def_seg, Some [ int_type; int_type ]); map_type
+    ; TGeneric (segment "custom", []) ];
+  check bool "empty tuple has no membership type" true
+    (Option.is_none
+       (Transform.Semantic.membership_type env (TTuple (def_seg, Some []))));
+  check bool "map key and value types" true
+    (match Transform.Semantic.map_types map_type with
+     | Some (key, value) -> Transform.Semantic.compatible_types key int_type
+                            && Transform.Semantic.compatible_types value string_type
+     | None -> false);
+  check bool "map source element is its key" true
+    (match Transform.Semantic.set_source_element_type map_type with
+     | Some typ -> Transform.Semantic.compatible_types typ int_type
+     | None -> false);
+  check bool "tuple membership has a common type" true
+    (match Transform.Semantic.membership_type env (TTuple (def_seg, Some [ int_type; int_type ])) with
+     | Some typ -> Transform.Semantic.compatible_types typ int_type
+     | None -> false);
+  ignore (Transform.Semantic.collection_element_type (TTuple (def_seg, Some [ int_type; string_type ])));
+  ignore (Transform.Semantic.membership_type env (TTuple (def_seg, Some [ int_type; string_type ])));
+  check bool "string membership uses strings" true
+    (match Transform.Semantic.membership_type env string_type with
+     | Some typ -> Transform.Semantic.compatible_types typ string_type
+     | None -> false);
+  check bool "unknown membership has no inferred type" true
+    (Option.is_none
+       (Transform.Semantic.membership_type env (TGeneric (segment "custom", []))));
+  ignore (Transform.Semantic.collection_element_type (TTuple (def_seg, Some [])));
+  ignore (Transform.Semantic.membership_type env sequence_type);
+  ignore (Transform.Semantic.membership_type env (TGeneric (segment "array", [ int_type ])));
+  ignore (Transform.Semantic.membership_type env (TGeneric (segment "set", [])));
+  List.iter
+    (fun typ -> ignore (Transform.Semantic.membership_type env typ))
+    [ TGeneric (segment "map", []); TGeneric (segment "list", [])
+    ; TGeneric (segment "seq", []); TGeneric (segment "array", []) ];
+  ignore (Transform.Semantic.set_source_element_type set_type);
+  ignore (Transform.Semantic.map_types int_type);
+  ignore (Transform.Semantic.identifier_name (Literal TrueLit));
+  ignore (Transform.Semantic.is_unknown_type (TIdent (segment "unknown")));
+  check bool "concrete types compare equal" true
+    (Transform.Semantic.compatible_types int_type int_type);
+  ignore (Transform.Semantic.compatible_types (TIdent (segment "unknown")) int_type);
+  ignore (Transform.Semantic.compatible_types int_type (TIdent (segment "unknown")));
+  check bool "incompatible concrete types are rejected" false
+    (Transform.Semantic.compatible_types int_type string_type);
+  expect_exception "incomplete set operation type"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> Transform.Semantic.require_set_elements
+                 (TGeneric (segment "set", [])) set_type "incomplete");
+  List.iter
+    (fun kind -> Transform.Semantic.require_collection kind "collection")
+    [ Transform.Semantic.UnknownCollection; Transform.Semantic.ListCollection
+    ; Transform.Semantic.SequenceCollection; Transform.Semantic.ArrayCollection
+    ; Transform.Semantic.SetCollection; Transform.Semantic.MapCollection
+    ; Transform.Semantic.TupleCollection; Transform.Semantic.StringCollection ];
+  expect_exception "non-collection requirement"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> Transform.Semantic.require_collection Transform.Semantic.NonCollection "collection");
+  let membership_env = Transform.Semantic.add_membership env "key" "mapping" in
+  ignore (Transform.Semantic.add_membership membership_env "key" "mapping");
+  ignore (Transform.Semantic.add_membership env "key" "");
+  ignore (Transform.Semantic.infer env (Call (identifier "setF", [ list ])));
+  ignore (Transform.Semantic.infer env (Call (identifier "dictF", [])));
+  List.iter
+    (fun literal ->
+       check bool "literal map keys are recognized" true
+         (Option.is_some (Transform.Semantic.literal_key (Literal literal))))
+    [ IntLit "1"; FloatLit "1.0"; StringLit "key"; TrueLit; FalseLit; NoneLit ];
+  check bool "non-literal map keys are unknown" true
+    (Option.is_none (Transform.Semantic.literal_key values));
+  ignore (Transform.Semantic.known_literal_key env known_map (Literal TrueLit));
+  ignore (Transform.Semantic.known_literal_key env known_map values);
+  ignore
+    (Transform.Semantic.known_literal_key env
+       (Dict [ values, Literal (StringLit "value") ]) (Literal (IntLit "1")));
+  ignore (Transform.Semantic.known_literal_key env (Literal TrueLit) (Literal TrueLit));
+  let lower expression = Transform.Lowering.expression ~environment:env expression in
+  (match (lower (Call (identifier "set", []))).result with
+   | D.DSetExpr [] -> ()
+   | _ -> fail "set() should lower to an empty set value");
+  (match (lower (Call (identifier "setF", []))).result with
+   | D.DSetExpr [] -> ()
+   | _ -> fail "setF() should share set() lowering");
+  (match (lower (Call (identifier "dict", []))).result with
+   | D.DMapExpr [] -> ()
+   | _ -> fail "dict() should lower to an empty map value");
+  (match (lower (Call (identifier "dictF", []))).result with
+   | D.DMapExpr [] -> ()
+   | _ -> fail "dictF() should share dict() lowering");
+  (match (lower (Call (identifier "set", [ list ]))).result with
+   | D.DCallExpr (D.DIdentifier (_, Some "setFromSeq"), [ D.DDot (_, (_, Some "lst")) ]) -> ()
+   | _ -> fail "set(list) should use the sequence conversion helper");
+  check bool "set conversion keeps its resolved type" true
+    (Transform.Semantic.collection_kind
+       (lower (Call (identifier "set", [ list ]))).resolved_type
+     = Transform.Semantic.SetCollection);
+  (match (lower (Call (identifier "set", [ sequence ]))).result with
+   | D.DCallExpr (D.DIdentifier (_, Some "setFromSeq"), [ D.DIdentifier _ ]) -> ()
+   | _ -> fail "set(sequence) should use the sequence conversion helper");
+  (match (lower (Call (identifier "set", [ mapping ]))).result with
+   | D.DMapKeys (D.DIdentifier (_, Some "mapping")) -> ()
+   | _ -> fail "set(map) should use map keys");
+  (match (lower (Call (identifier "set", [ values ]))).result with
+   | D.DIdentifier (_, Some "values") -> ()
+   | _ -> fail "set(set) should preserve the set value");
+  (match (lower (Dict [ Literal (IntLit "1"), Literal (StringLit "first")
+                    ; Literal (IntLit "1"), Literal (StringLit "last") ])).result with
+   | D.DMapUpdate
+       (D.DMapUpdate (D.DMapExpr [], D.DIntLit "1", D.DStringLit "first"),
+        D.DIntLit "1", D.DStringLit "last") -> ()
+   | _ -> fail "dictionary displays should apply updates left to right");
+  let set_union = lower (BinaryExp (values, BitOr def_seg, values)) in
+  let set_intersection = lower (BinaryExp (values, BitAnd def_seg, values)) in
+  let set_difference = lower (BinaryExp (values, Minus def_seg, values)) in
+  check bool "set union lowering" true
+    (match set_union.result with D.DBinary (_, D.DSetUnion _, _) -> true | _ -> false);
+  check bool "set intersection lowering" true
+    (match set_intersection.result with D.DBinary (_, D.DSetIntersection _, _) -> true | _ -> false);
+  check bool "set difference lowering" true
+    (match set_difference.result with D.DBinary (_, D.DSetDifference _, _) -> true | _ -> false);
+  check bool "set algebra inference" true
+    (Transform.Semantic.collection_kind set_union.resolved_type = Transform.Semantic.SetCollection);
+  check bool "set length uses cardinality" true
+    (match (lower (Len (def_seg, values))).result with D.DLen (_, _) -> true | _ -> false);
+  check bool "map length uses cardinality" true
+    (match (lower (Len (def_seg, mapping))).result with D.DLen (_, _) -> true | _ -> false);
+  let list_membership = lower (BinaryExp (Literal (IntLit "1"), In def_seg, list)) in
+  check bool "list membership uses the runtime contains function" true
+    (match list_membership.result with
+     | D.DCallExpr (D.DDot (D.DIdentifier (_, Some "list_value"), (_, Some "contains")),
+                    [ D.DIntLit "1" ]) -> true
+     | _ -> false);
+  let list_nonmembership = lower (BinaryExp (Literal (IntLit "1"), NotIn def_seg, list)) in
+  check bool "list non-membership negates the runtime contains function" true
+    (match list_nonmembership.result with
+     | D.DUnary (D.DNot _, D.DCallExpr (D.DDot (_, (_, Some "contains")), _)) -> true
+     | _ -> false);
+  expect_exception "untyped empty list literals are rejected"
+    (function Transform.Lowering.LoweringError message -> has_substring message "concrete list" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.expression ~environment:env (Lst [])));
+  expect_exception "empty lists need a concrete element type"
+    (function Transform.Lowering.LoweringError message -> has_substring message "concrete element" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.expression ~environment:env
+                         ~expected_type:(TGeneric (segment "list", [])) (Lst [])));
+  expect_exception "empty lists need a list expected type"
+    (function Transform.Lowering.LoweringError message -> has_substring message "list type" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.expression ~environment:env
+                         ~expected_type:int_type (Lst [])));
+  let typed_empty_assignment =
+    Transform.Lowering.statements ~environment:env
+      [ Assign (Some (Typ list_type), [ identifier "empty_list" ], [ Lst [] ]) ]
+  in
+  check bool "typed empty list assignments construct a typed runtime List" true
+    (match typed_empty_assignment with
+     | [ D.DAssignLvalue
+           ( None
+           , [ D.Local _ ]
+           , [ D.DNew (D.DIdentTyp (_, [ D.DInt _ ]), [ D.DSeqExpr [] ]) ] )
+       ; D.DAssignLvalue
+           ( Some (D.DIdentTyp (_, [ D.DInt _ ]))
+           , [ D.Local (_, Some "empty_list") ]
+           , [ D.DIdentifier _ ] ) ] -> true
+     | _ -> false);
+  let typed_empty_return =
+    Transform.Lowering.expression ~environment:env ~expected_type:list_type (Lst [])
+  in
+  check bool "expected return types propagate into empty list literals" true
+    (match typed_empty_return.prelude with
+     | [ D.DAssignLvalue (_, [ D.Local _ ], [ D.DNew (D.DIdentTyp (_, [ D.DInt _ ]), [ D.DSeqExpr [] ]) ]) ] -> true
+     | _ -> false);
+  (match (Transform.Lowering.expression ~environment:env
+           (Subscript (known_map, Index (Literal (IntLit "1"))))).result with
+   | D.DNativeIndex (D.DMapUpdate _, D.DIntLit "1") -> ()
+   | _ -> fail "map lookup should remain native map indexing");
+  let map_update =
+    Transform.Lowering.statements ~environment:env
+      [ Assign (None, [ Subscript (mapping, Index (Literal (IntLit "1"))) ],
+                [ Literal (StringLit "updated") ]) ]
+  in
+  (match map_update with
+   | [ D.DAssignLvalue (_, [ D.Local (_, Some "mapping") ],
+                       [ D.DMapUpdate (D.DIdentifier (_, Some "mapping"), D.DIntLit "1", D.DStringLit "updated") ]) ] -> ()
+   | _ -> fail "map assignment should lower to a functional update");
+  let ordinary_binary = lower (BinaryExp (list, Plus def_seg, list)) in
+  check bool "non-set binary operations keep their original operator" true
+    (match ordinary_binary.result with D.DBinary (_, D.DPlus _, _) -> true | _ -> false);
+  ignore (Transform.Lowering.collection_binary_operator env list (Plus def_seg) list);
+  ignore (Transform.Lowering.collection_binary_operator env list (Minus def_seg) list);
+  expect_exception "List indexed assignments are rejected by lowering"
+    (function Transform.Lowering.LoweringError message -> has_substring message "List" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.statements ~environment:env
+                         [ Assign (None, [ Subscript (list, Index (Literal (IntLit "0"))) ],
+                                   [ Literal (IntLit "1") ]) ]));
+  expect_exception "List indexed assignments are rejected semantically"
+    (function Transform.Semantic.SemanticError message -> has_substring message "List" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ Assign (None, [ Subscript (list, Index (Literal (IntLit "0"))) ],
+                                   [ Literal (IntLit "1") ]) ]));
+  List.iter
+    (fun expression ->
+       expect_exception "unsupported set constructor lowering"
+         (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+         (fun () -> ignore (Transform.Lowering.expression ~environment:env expression)))
+    [ Call (identifier "set", [ Literal (IntLit "1") ])
+    ; Call (identifier "set", [ list; sequence ])
+    ; Call (identifier "dict", [ Literal (IntLit "1") ]) ];
+  expect_exception "unsupported collection loop lowering"
+    (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Lowering.statements ~environment:env
+                         [ For ([], [ segment "item" ], identifier "text", [ Pass ]) ]));
+  expect_exception "non-map functional update lowering"
+    (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Lowering.lower_map_assignment
+                         (Transform.Lowering.context env) (segment "list_value")
+                         (Literal (IntLit "0")) (Literal (IntLit "1"))));
+  ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context env)
+            (Subscript (sequence, Index (Literal (IntLit "0")))));
+  ignore (Transform.Lowering.lower_assignment (Transform.Lowering.context env) None
+            [ Subscript (identifier "unknown", Index (Literal (IntLit "0"))) ]
+            [ Literal (IntLit "1") ]);
+  expect_exception "List indexed assignments are rejected directly"
+    (function Transform.Lowering.LoweringError message -> has_substring message "List" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.lower_assignment (Transform.Lowering.context env)
+                         (Some (Typ int_type))
+                         [ Subscript (list, Index (Literal (IntLit "0"))) ]
+                         [ Literal (IntLit "1") ]));
+  expect_exception "unknown collection loop lowering"
+    (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Lowering.lower_for (Transform.Lowering.context env) []
+                         [ segment "item" ] (identifier "unknown") [ Pass ]));
+  expect_exception "missing collection loop target"
+    (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Lowering.lower_for (Transform.Lowering.context env) []
+                         [] values [ Pass ]));
+  let specs =
+    [ Pre (Literal TrueLit); Post (Literal TrueLit); Invariant (Literal TrueLit)
+    ; Decreases (Literal (IntLit "1")); Reads (Literal TrueLit); Modifies (Literal TrueLit) ]
+  in
+  ignore (Transform.Semantic.validate_specs env specs);
+  let set_loop =
+    Transform.Lowering.statements ~environment:env
+      [ For ([], [ segment "item" ], values, [ Assert (BinaryExp (identifier "item", In def_seg, values)) ]) ]
+  in
+  let map_loop =
+    Transform.Lowering.statements ~environment:env
+      [ For ([], [ segment "key" ], mapping, [ Assert (BinaryExp (identifier "key", In def_seg, mapping)) ]) ]
+  in
+  let indexed_loop_specs =
+    [ Invariant (Literal TrueLit); Decreases (Literal (IntLit "1")) ]
+  in
+  let list_loop =
+    Transform.Lowering.statements ~environment:env
+      [ For (indexed_loop_specs, [ segment "item" ], list, [ Pass ]) ]
+  in
+  let sequence_loop =
+    Transform.Lowering.statements ~environment:env
+      [ For ([], [ segment "item" ], sequence, [ Pass ]) ]
+  in
+  let has_choose statements =
+    List.exists (function
+      | D.DWhile (_, _, D.DAssignSuchThat _ :: _) -> true
+      | _ -> false) statements
+  in
+  check bool "set loops choose from a remaining set" true (has_choose set_loop);
+  check bool "map loops choose from remaining keys" true (has_choose map_loop);
+  check bool "list loops use indexed lowering" true
+    (has_substring (Transform.Emitdfy.print_stmt 0 (List.hd list_loop)) "lowered_");
+  check bool "sequence loops use indexed lowering" true
+    (has_substring (Transform.Emitdfy.print_stmt 0 (List.hd sequence_loop)) "lowered_");
+  ignore (Transform.Lowering.lower_for (Transform.Lowering.context env) indexed_loop_specs
+            [ segment "item" ] list [ Pass ]);
+  ignore (Transform.Lowering.lower_for (Transform.Lowering.context env) []
+            [ segment "item" ] sequence [ Pass ]);
+  List.iter
+    (fun specification ->
+       expect_exception "invalid loop specifications are rejected"
+         (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+         (fun () -> ignore (Transform.Semantic.validate_statements env
+                              [ For ([ specification ], [ segment "item" ], list, [ Pass ]) ]));
+       expect_exception "invalid loop specifications cannot be lowered"
+         (function Transform.Lowering.LoweringError _ -> true | _ -> false)
+         (fun () -> ignore (Transform.Lowering.lower_for (Transform.Lowering.context env)
+                              [ specification ] [ segment "item" ] list [ Pass ]));
+       expect_exception "invalid while specifications are rejected"
+         (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+         (fun () -> ignore (Transform.Semantic.validate_statements env
+                              [ While ([ specification ], Literal FalseLit, [ Pass ]) ])))
+    [ Pre (Literal TrueLit); Post (Literal TrueLit); Reads (Literal TrueLit); Modifies (Literal TrueLit) ];
+  let last_set_statement =
+    match List.rev set_loop with
+    | statement :: _ -> statement
+    | [] -> fail "set loop lowering should produce statements"
+  in
+  check bool "set loops remove their chosen item" true
+    (has_substring
+       (Transform.Emitdfy.print_stmt 0 last_set_statement)
+       "- {item}");
+  let valid_map_program =
+    [ Assign (Some (Typ map_type), [ mapping ], [ known_map ])
+    ; Assert (Subscript (mapping, Index (Literal (IntLit "1"))))
+    ; Assign (None, [ Subscript (mapping, Index (Literal (IntLit "2"))) ],
+              [ Literal (StringLit "another") ])
+    ; Assign (None, [ Subscript (mapping, Index (Literal (IntLit "2"))) ],
+              [ Literal (StringLit "again") ]) ]
+  in
+  ignore (Transform.Semantic.validate_statements Transform.Semantic.empty valid_map_program);
+  ignore
+    (Transform.Semantic.validate_statements env
+       [ For ([], [ segment "key" ], mapping, [ Pass ])
+       ; For ([], [ segment "item" ], list, [ Pass ])
+       ; For ([], [ segment "item" ], sequence, [ Pass ])
+       ; For ([], [ segment "first"; segment "second" ], list, [ Pass ]) ]);
+  ignore
+    (Transform.Semantic.validate_statements
+       (Transform.Semantic.bind Transform.Semantic.empty "untyped_list"
+          (TGeneric (segment "list", [])))
+       [ For ([], [ segment "item" ], identifier "untyped_list", [ Pass ]) ]);
+  let lookup_function =
+    Function
+      ( [ Pre (BinaryExp (identifier "key", In def_seg, identifier "mapping")) ]
+      , segment "lookup"
+      , [ segment "mapping", Typ map_type; segment "key", Typ int_type ]
+      , Typ string_type
+      , [ Return (Subscript (identifier "mapping", Index (identifier "key"))) ] )
+  in
+  ignore (Transform.Semantic.analyze (Program [ lookup_function ]));
+  ignore
+    (Transform.Semantic.validate_statements
+       (Transform.Semantic.bind Transform.Semantic.empty "values" set_type)
+       [ For ([], [ segment "item" ], values, [ Pass ]) ]);
+  ignore
+    (Transform.Semantic.validate_statements env
+       [ Assert (UnaryExp (Not def_seg, Literal FalseLit))
+       ; Assert (CompareChain (Literal (IntLit "1"), [ (Lt def_seg, Literal (IntLit "2")) ]))
+       ; Assert (Array [ Literal (IntLit "1") ])
+       ; Assert (Set [ Literal (IntLit "1") ])
+       ; Assert (Dict [ (Literal (IntLit "1"), Literal (StringLit "value")) ])
+       ; Assert (Tuple [ Literal (IntLit "1"); Literal (IntLit "2") ])
+       ; Assert (SingletonTuple (segment ",", Literal (IntLit "1")))
+       ; Assert (Index (Literal (IntLit "1")))
+       ; Assert (Slice (Some (Literal (IntLit "0")), None))
+       ; Assert (Forall ([ segment "bound" ], BinaryExp (identifier "bound", EqEq def_seg, identifier "bound")))
+       ; Assert (Exists ([ segment "bound" ], BinaryExp (identifier "bound", EqEq def_seg, identifier "bound")))
+       ; Assert (Len (def_seg, values))
+       ; Assert (Max (def_seg, values))
+       ; Assert (Old (def_seg, values))
+       ; Assert (Fresh (def_seg, values))
+       ; Assert (Lambda ([ segment "bound" ], identifier "bound"))
+       ; Assert (IfElseExp (Literal TrueLit, Literal TrueLit, Literal FalseLit))
+       ; Assert (Subscript (sequence, Index (Literal (IntLit "0"))))
+       ; Assert (Subscript (identifier "unknown", Index (Literal (IntLit "0"))))
+       ; Assert (Subscript (sequence, Slice (None, None)))
+       ; Assert (Subscript (known_map, Index (Literal (IntLit "1"))))
+       ; Assert (BinaryExp (values, EqEq def_seg, values))
+       ; Assert (BinaryExp (mapping, EqEq def_seg, mapping))
+       ; Assert (BinaryExp (Literal (IntLit "1"), NotIn def_seg, list))
+       ; Assert (BinaryExp (values, Minus def_seg, values))
+       ; Assert (BinaryExp (values, BitOr def_seg, values))
+       ; Assert (BinaryExp (values, BitAnd def_seg, values))
+       ; Exp (Call (identifier "setF", []))
+       ; Exp (Call (identifier "setF", [ list ]))
+       ; Exp (Call (identifier "setF", [ sequence ]))
+       ; Exp (Call (identifier "setF", [ values ]))
+       ; Exp (Call (identifier "setF", [ mapping ]))
+       ; Exp (Call (identifier "dictF", []))
+       ; Exp (Call (identifier "map", []))
+       ; Exp (Call (identifier "ordinary", []))
+       ; Exp (Call (Dot (values, segment "contains"), [ Literal (IntLit "1") ]))
+       ; Exp (BinaryExp (Literal (IntLit "1"), Minus def_seg, Literal (IntLit "2")))
+       ; Exp (BinaryExp (Literal (IntLit "1"), Plus def_seg, Literal (IntLit "2")))
+       ; Exp (BinaryExp (Literal TrueLit, EqEq def_seg, Literal TrueLit))
+       ; Pass; Break; Continue ]);
+  List.iter
+    (fun expression -> Transform.Semantic.validate_exp env expression)
+    [ Dot (values, segment "field")
+    ; BinaryExp (values, NEq def_seg, values)
+    ; Tuple [ Literal (IntLit "1"); Literal (IntLit "2") ]
+    ; Array [ Literal (IntLit "1"); Literal (IntLit "2") ]
+    ; Set [ Literal (IntLit "1"); Literal (IntLit "2") ]
+    ; Dict [ (Literal (IntLit "1"), Literal (StringLit "a")); (Literal (IntLit "2"), Literal (StringLit "b")) ]
+    ; Subscript (identifier "array_value", Index (Literal (IntLit "0")))
+    ; Subscript (identifier "tuple_value", Index (Literal (IntLit "0")))
+    ; Subscript (identifier "list_value", Slice (None, None))
+    ; Subscript (identifier "array_value", Slice (None, None))
+    ; Subscript (identifier "tuple_value", Slice (None, None))
+    ; Subscript (identifier "unknown", Slice (Some (Literal (IntLit "0")), Some (Literal (IntLit "1"))))
+    ; Forall ([ segment "bound" ], Literal TrueLit)
+    ; Exists ([ segment "bound" ], Literal TrueLit)
+    ; Len (def_seg, list)
+    ; Max (def_seg, list)
+    ; Old (def_seg, list)
+    ; Fresh (def_seg, list)
+    ; Lambda ([ segment "bound" ], identifier "bound")
+    ; IfElseExp (Literal TrueLit, Literal TrueLit, Literal FalseLit) ];
+  List.iter
+    (fun expression -> Transform.Semantic.validate_exp env expression)
+    [ Lst []; Array []; Set []; Dict []
+    ; Subscript (identifier "array_value", Index (Literal (IntLit "0")))
+    ; Subscript (identifier "tuple_value", Index (Literal (IntLit "0"))) ];
+  ignore
+    (Transform.Semantic.validate_statements env
+       [ IfElse (Literal TrueLit, [ Pass ], [ (Literal FalseLit, [ Exp values ]) ], [ Pass ])
+       ; While ([ Invariant (Literal TrueLit); Decreases (Literal (IntLit "1")) ], Literal FalseLit, [ Pass ])
+       ; Assign (None, [ Dot (values, segment "field") ], [ Literal (IntLit "1") ])
+       ; Assign (None, [ Tuple [ identifier "left"; identifier "right" ] ],
+                 [ Tuple [ Literal (IntLit "1"); Literal (IntLit "2") ] ])
+       ; Assign (None, [ Subscript (identifier "unknown", Index (Literal (IntLit "0"))) ],
+                 [ Literal (IntLit "1") ])
+       ; Return values ]);
+  ignore (Transform.Semantic.validate_target env (Tuple [ identifier "left"; identifier "right" ]));
+  ignore (Transform.Semantic.validate_target env
+            (Subscript (identifier "unknown", Slice (None, None))));
+  ignore (Transform.Semantic.validate_target env
+            (Subscript (identifier "unknown", Index (Literal (IntLit "0")))));
+  expect_exception "List indexed target validation is rejected"
+    (function Transform.Semantic.SemanticError message -> has_substring message "List" | _ -> false)
+    (fun () -> Transform.Semantic.validate_target env
+                (Subscript (list, Index (Literal (IntLit "0")))));
+  ignore
+    (Transform.Semantic.assume_membership env
+       (CompareChain (identifier "key", [ (In def_seg, mapping) ])));
+  ignore (Transform.Semantic.known_literal_key env known_map (identifier "dynamic"));
+  ignore (Transform.Semantic.add_membership env "" "");
+  ignore (Transform.Semantic.add_map_key env "mapping" values);
+  ignore (Transform.Semantic.bind_value env "alias" map_type mapping);
+  ignore (Transform.Semantic.bind (Transform.Semantic.bind_value env "alias" map_type mapping)
+            "alias" map_type);
+  expect_exception "invalid assignment target" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ Assign (None, [ Literal TrueLit ], [ Literal TrueLit ]) ]));
+  expect_exception "invalid subscript target" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ Assign (None, [ Subscript (values, Literal TrueLit) ], [ Literal (IntLit "1") ]) ]));
+  expect_exception "non-indexable value" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ Assert (Subscript (Literal TrueLit, Index (Literal (IntLit "0")))) ]));
+  expect_exception "unsupported slice" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ Assert (Subscript (values, Slice (None, None))) ]));
+  let semantic_error name expression =
+    expect_exception name
+      (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+      (fun () -> ignore (Transform.Semantic.validate_statements env [ Assert expression ]))
+  in
+  semantic_error "incompatible membership" (BinaryExp (Literal (StringLit "bad"), In def_seg, values));
+  semantic_error "non-collection membership" (BinaryExp (Literal (IntLit "1"), In def_seg, Literal TrueLit));
+  semantic_error "set algebra needs sets" (BinaryExp (list, BitOr def_seg, values));
+  let string_set_env = Transform.Semantic.bind env "other_set" (TSet (def_seg, Some string_type)) in
+  expect_exception "incompatible set algebra elements"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements string_set_env
+                         [ Assert (BinaryExp (values, BitAnd def_seg, identifier "other_set")) ]));
+  ignore (Transform.Semantic.validate_binary env (Literal (IntLit "1")) (Minus def_seg)
+            (Literal (IntLit "2")));
+  expect_exception "set difference requires a set on the left"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_binary env (Literal (IntLit "1"))
+                         (Minus def_seg) values));
+  expect_exception "incompatible collection elements"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> Transform.Semantic.validate_exp env
+                 (Lst [ Literal (IntLit "1"); Literal (StringLit "bad") ]));
+  expect_exception "incompatible dictionary keys"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> Transform.Semantic.validate_exp env
+                 (Dict [ (Literal (IntLit "1"), Literal (StringLit "ok"));
+                         (Literal (StringLit "bad"), Literal (StringLit "ok")) ]));
+  expect_exception "incompatible dictionary values"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> Transform.Semantic.validate_exp env
+                 (Dict [ (Literal (IntLit "1"), Literal (StringLit "ok"));
+                         (Literal (IntLit "2"), Literal (IntLit "bad")) ]));
+  semantic_error "set and map equality" (BinaryExp (values, EqEq def_seg, mapping));
+  expect_exception "incompatible map equality keys"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_equality
+                         (TGeneric (segment "map", [ int_type; string_type ]))
+                         (TGeneric (segment "map", [ string_type; string_type ]))));
+  expect_exception "incomplete map equality"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_equality
+                         (TGeneric (segment "map", [])) map_type));
+  let incomplete_map_env =
+    Transform.Semantic.bind Transform.Semantic.empty "incomplete_map"
+      (TGeneric (segment "map", []))
+  in
+  expect_exception "incomplete map update"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements incomplete_map_env
+                         [ Assign
+                             ( None
+                             , [ Subscript (identifier "incomplete_map",
+                                             Index (Literal (IntLit "1"))) ]
+                             , [ Literal (StringLit "value") ] ) ]));
+  expect_exception "incomplete map lookup"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements incomplete_map_env
+                         [ Assert (Subscript (identifier "incomplete_map",
+                                              Index (Literal (IntLit "1")))) ]));
+  ignore (Transform.Semantic.validate_equality int_type int_type);
+  ignore (Transform.Semantic.validate_equality map_type map_type);
+  ignore (Transform.Semantic.validate_map_lookup env (identifier "unknown") (Literal (IntLit "1")));
+  ignore (Transform.Semantic.validate_map_lookup env list (Literal (IntLit "0")));
+  expect_exception "reverse set/map equality"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_equality map_type set_type));
+  List.iter
+    (fun (left, right) ->
+       expect_exception "mixed collection equality"
+         (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+         (fun () -> ignore (Transform.Semantic.validate_equality left right)))
+    [ set_type, int_type; int_type, set_type; map_type, int_type; int_type, map_type ];
+  semantic_error "map lookup needs a proof" (Subscript (mapping, Index (Literal (IntLit "1"))));
+  semantic_error "map lookup key type" (Subscript (mapping, Index (Literal TrueLit)));
+  semantic_error "set constructor arity" (Call (identifier "set", [ list; sequence ]));
+  semantic_error "set constructor source" (Call (identifier "set", [ Literal (IntLit "1") ]));
+  semantic_error "set constructor array" (Call (identifier "set", [ identifier "array_value" ]));
+  semantic_error "set constructor tuple" (Call (identifier "set", [ identifier "tuple_value" ]));
+  semantic_error "set constructor string" (Call (identifier "set", [ identifier "text" ]));
+  semantic_error "set constructor unknown" (Call (identifier "set", [ identifier "unknown" ]));
+  semantic_error "dict constructor arguments" (Call (identifier "dict", [ Literal (IntLit "1") ]));
+  semantic_error "map constructor arguments" (Call (identifier "map", [ Literal (IntLit "1") ]));
+  semantic_error "set mutation" (Call (Dot (values, segment "add"), [ Literal (IntLit "1") ]));
+  semantic_error "map mutation" (Call (Dot (mapping, segment "setdefault"), [ Literal (IntLit "1") ]));
+  List.iter
+    (fun method_name ->
+       semantic_error ("set mutation " ^ method_name)
+         (Call (Dot (values, segment method_name), [ Literal (IntLit "1") ])))
+    [ "remove"; "discard"; "pop"; "clear"; "update"; "intersection_update"; "difference_update" ];
+  List.iter
+    (fun method_name ->
+       semantic_error ("map mutation " ^ method_name)
+         (Call (Dot (mapping, segment method_name), [ Literal (IntLit "1") ])))
+    [ "pop"; "popitem"; "update"; "clear" ];
+  Transform.Semantic.validate_exp env (Call (Literal TrueLit, []));
+  let class_env =
+    let definition : Transform.Semantic.class_definition =
+      { class_name = "Holder"
+      ; fields = [ { field_name = "mapping"; field_type = map_type } ]
+      ; methods = [] }
+    in
+    Transform.Semantic.add_class env definition
+    |> fun env -> Transform.Semantic.bind env "holder" (TGeneric (segment "Holder", []))
+  in
+  expect_exception "map field update" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements class_env
+                         [ Assign (None, [ Subscript (Dot (identifier "holder", segment "mapping"), Index (Literal (IntLit "1"))) ],
+                                   [ Literal (StringLit "value") ]) ]));
+  expect_exception "nested map update" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements
+                         (Transform.Semantic.validate_statements Transform.Semantic.empty
+                            [ Assign (Some (Typ map_type), [ mapping ], [ known_map ]) ])
+                         [ Assign (None, [ Subscript (Subscript (mapping, Index (Literal (IntLit "1"))),
+                                                   Index (Literal (IntLit "2"))) ],
+                                   [ Literal (StringLit "value") ]) ]));
+  let alias_program =
+    [ Assign (None, [ identifier "alias" ], [ mapping ])
+    ; Assign (None, [ Subscript (identifier "alias", Index (Literal (IntLit "1"))) ],
+              [ Literal (StringLit "value") ]) ]
+  in
+  expect_exception "map alias update" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env alias_program));
+  expect_exception "multi-target set loop" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ For ([], [ segment "first"; segment "second" ], values, [ Pass ]) ]));
+  expect_exception "unsupported string loop" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ For ([], [ segment "character" ], identifier "text", [ Pass ]) ]));
+  List.iter
+    (fun iterable ->
+       expect_exception "unsupported typed loop" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+         (fun () -> ignore (Transform.Semantic.validate_statements env
+                              [ For ([], [ segment "item" ], iterable, [ Pass ]) ])))
+    [ identifier "array_value"; identifier "tuple_value"; identifier "unknown"; Literal TrueLit ]
 
 let test_generics_paths () =
   let open Ast in
@@ -1466,7 +2144,8 @@ let test_todafnyast_paths () =
     [ NotIn def_seg; In def_seg; Plus def_seg; Minus def_seg; Times def_seg
     ; Divide def_seg; Mod def_seg; NEq def_seg; EqEq def_seg; Lt def_seg
     ; LEq def_seg; Gt def_seg; GEq def_seg; And def_seg; Or def_seg
-    ; BiImpl def_seg; Implies def_seg; Explies def_seg ]
+    ; BiImpl def_seg; Implies def_seg; Explies def_seg
+    ; BitOr def_seg; BitAnd def_seg ]
   in
   List.iter
     (fun operator -> ignore (Transform.Todafnyast.exp_dfy (BinaryExp (x, operator, y))))
@@ -1584,6 +2263,8 @@ let test_emitter_paths_and_sourcemaps () =
     ; D.DMod def_seg; D.DLt def_seg; D.DLEq def_seg; D.DGt def_seg
     ; D.DGEq def_seg; D.DAnd def_seg; D.DOr def_seg; D.DNot def_seg
     ; D.DBiImpl def_seg; D.DImplies def_seg; D.DExplies def_seg
+    ; D.DSetUnion def_seg; D.DSetIntersection def_seg; D.DSetDifference def_seg
+    ; D.DSetSubset def_seg
     ]
   in
   List.iter (fun operator -> ignore (Transform.Emitdfy.print_op 0 operator)) operators;
@@ -1651,7 +2332,9 @@ let test_emitter_paths_and_sourcemaps () =
     ; D.DCallExpr (id "f", [ id "x" ]); D.DSeqExpr [ id "x" ]
     ; D.DNew (D.DIdentTyp (ds "List", [ D.DInt def_seg ]), [ D.DSeqExpr [ id "x" ] ])
     ; D.DArrayExpr [ id "x" ]; D.DSetExpr [ id "x" ]
-    ; D.DMapExpr [ (id "x", D.DIntLit "1") ]; D.DSubscript (id "x", D.DIndex (D.DIntLit "0"))
+    ; D.DMapExpr [ (id "x", D.DIntLit "1") ]; D.DMapKeys (id "mapping")
+    ; D.DMapUpdate (D.DMapExpr [], D.DIntLit "1", D.DIntLit "2")
+    ; D.DSubscript (id "x", D.DIndex (D.DIntLit "0"))
     ; D.DIndex (id "x"); D.DSlice (Some (D.DIntLit "1"), Some (D.DIntLit "2"))
     ; D.DSlice (Some (D.DIntLit "1"), None); D.DSlice (None, Some (D.DIntLit "2"))
     ; D.DSlice (None, None); D.DForall ([ ds "k" ], D.DTrue)
@@ -1698,6 +2381,10 @@ let test_emitter_paths_and_sourcemaps () =
     (render_exp (D.DSetExpr [ id "x"; id "y" ]));
   check string "map rendering" "map[x := 1, y := 2]"
     (render_exp (D.DMapExpr [ (id "x", D.DIntLit "1"); (id "y", D.DIntLit "2") ]));
+  check string "map keys rendering" "mapping.Keys"
+    (render_exp (D.DMapKeys (id "mapping")));
+  check string "map update rendering" "map[][1 := 2]"
+    (render_exp (D.DMapUpdate (D.DMapExpr [], D.DIntLit "1", D.DIntLit "2")));
   check string "subscript rendering" "x0"
     (render_exp (D.DSubscript (id "x", D.DIndex (D.DIntLit "0"))));
   check string "index rendering" "x" (render_exp (D.DIndex (id "x")));
@@ -1769,6 +2456,13 @@ let test_emitter_paths_and_sourcemaps () =
     (Transform.Emitdfy.print_stmt 0 (D.DCallStmt (id "f", [ D.DIntLit "1" ])));
   check string "return statement rendering" "return 1;"
     (Transform.Emitdfy.print_stmt 0 (D.DReturn [ D.DIntLit "1" ]));
+  check string "choose assignment rendering" "var item: int :| (item in remaining);"
+    (Transform.Emitdfy.print_stmt 0
+       (D.DAssignSuchThat (Some (D.DInt def_seg), D.Local (ds "item"),
+                           D.DBinary (id "item", D.DIn def_seg, id "remaining"))));
+  check string "choose field assignment rendering" "var object.field :| true;"
+    (Transform.Emitdfy.print_stmt 0
+       (D.DAssignSuchThat (None, D.Field (id "object", ds "field"), D.DTrue)));
   check string "if statement rendering" "if true {\n  break;\n}"
     (Transform.Emitdfy.print_stmt 0 (D.DIf (D.DTrue, [ D.DBreak ], [], [])));
   check string "if else statement rendering"
@@ -1826,6 +2520,8 @@ let test_emitter_paths_and_sourcemaps () =
     ; D.DIf (D.DTrue, [ D.DAssert D.DTrue ], [ (D.DFalse, [ D.DBreak ]) ], [ D.DEmptyStmt ])
     ; D.DWhile ([ D.DInvariant D.DTrue ], D.DTrue, [ D.DBreak ])
     ; D.DReturn [ D.DIntLit "1" ]
+    ; D.DAssignSuchThat (Some (D.DInt def_seg), D.Local (ds "item"),
+                         D.DBinary (id "item", D.DIn def_seg, id "remaining"))
     ]
   in
   Transform.Emitdfy.reset ();
@@ -2022,6 +2718,7 @@ let () =
                   ; test_case "nice parser wrapper" `Quick test_nice_parser_wrapper_paths
                   ; test_case "expression and type forms" `Quick test_parser_expression_and_type_forms
                   ; test_case "phase 2 parser forms" `Quick test_phase2_parser_forms
+                  ; test_case "phase 3 collection parser forms" `Quick test_phase3_collection_parser_forms
                   ; test_case "AST utilities" `Quick test_ast_utilities
                   ; test_case "AST serializers and subtyping" `Quick test_ast_serializers_and_subtyping ])
     ; ("transforms", [ test_case "call state reset" `Quick test_transform_state_resets
@@ -2033,6 +2730,7 @@ let () =
                       ; test_case "for statement paths" `Quick test_convertfor_statement_paths
                       ; test_case "semantic lowering paths" `Quick test_semantic_lowering_paths
                       ; test_case "phase 2 semantics and chains" `Quick test_phase2_semantics_and_chains
+                      ; test_case "phase 3 collections" `Quick test_phase3_collections
                       ; test_case "generic conversion" `Quick test_generics_paths
                       ; test_case "call expression paths" `Quick test_convertcall_expression_paths
                       ; test_case "Dafny AST conversion" `Quick test_todafnyast_paths

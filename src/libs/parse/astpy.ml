@@ -110,6 +110,8 @@ type binaryop =
   | BiImpl of segment
   | Implies of segment
   | Explies of segment
+  | BitOr of segment
+  | BitAnd of segment
   [@@deriving sexp]
 
 type exp =

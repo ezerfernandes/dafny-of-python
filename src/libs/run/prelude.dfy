@@ -61,3 +61,8 @@ method intF(n: int) returns (res: int)
 {
   return n;
 }
+
+function setFromSeq<T(==)>(values: seq<T>): set<T>
+{
+  set value | value in values
+}

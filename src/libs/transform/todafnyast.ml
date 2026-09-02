@@ -90,6 +90,8 @@ let binaryop_dfy = function
   | BiImpl s -> DBiImpl s
   | Implies s -> DImplies s
   | Explies s -> DExplies s
+  | BitOr s -> DSetUnion s
+  | BitAnd s -> DSetIntersection s
   
 let rec exp_dfy e =
   (* (match check e (Bool default_segment) [] with | Some (_, ctx) -> print ctx | None -> ()); *)
@@ -251,6 +253,8 @@ let semantic_params parameters =
 
 let semantic_function generics environment (speclst, name, parameters, return_type, body) =
   let function_environment = semantic_function_env environment name parameters return_type in
+  let function_environment = Semantic.validate_specs function_environment speclst in
+  let body_environment = Semantic.validate_statements function_environment body in
   let parameters = semantic_params parameters in
   let list_reads =
     List.filter_map parameters ~f:(fun (identifier, typ) ->
@@ -260,10 +264,16 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
       | _ -> None)
   in
   let specifications = semantic_specs function_environment speclst @ list_reads in
-  let return_type = Lowering.type_dfy (Semantic.annotation return_type) in
+  let return_typ = Semantic.annotation return_type in
+  let return_type = Lowering.type_dfy return_typ in
   match body with
   | [ Return expression ] | [ Exp expression ] ->
-    let lowered = Lowering.expression ~environment:function_environment expression in
+    let lowered =
+      Lowering.expression
+        ~environment:body_environment
+        ~expected_type:return_typ
+        expression
+    in
     if List.is_empty lowered.prelude && not lowered.effectful then
       DFuncMeth (specifications, name, generics, parameters, return_type, Some lowered.result)
     else
@@ -272,9 +282,13 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
          Some (lowered.prelude @ [ DReturn [ lowered.result ] ]))
   | [ Pass ] -> DFuncMeth (specifications, name, generics, parameters, return_type, None)
   | _ ->
-    DMeth
-      (specifications, name, generics, parameters, [ return_type ],
-       Some (Lowering.statements ~environment:function_environment body))
+      DMeth
+         (specifications, name, generics, parameters, [ return_type ],
+         Some
+           (Lowering.statements
+              ~environment:body_environment
+              ~return_type:return_typ
+              body))
 
 let semantic_toplevel generics environment statement =
   match statement with
@@ -290,7 +304,9 @@ let prog_dfy p =
   let p = Semantic.normalize_program p in
   let (n_p, gens) = Generics.prog p in
   let environment = Semantic.analyze n_p in
-  let p = Convertfor.prog n_p in
+  (* Typed lowering owns loop translation so set/map iterables can use their
+     value semantics instead of the list-specific indexed conversion. *)
+  let p = n_p in
   let (Program sl) = p in
   let d_funcs = List.fold ~f:(fun so_far s ->
     match s with

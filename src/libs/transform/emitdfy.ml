@@ -115,6 +115,10 @@ let print_op id = function
   | DBiImpl s -> add_op id s "<==>"
   | DImplies s -> add_op id s "==>"
   | DExplies s -> add_op id s "<=="
+  | DSetUnion s -> add_op id s "+"
+  | DSetIntersection s -> add_op id s "*"
+  | DSetDifference s -> add_op id s "-"
+  | DSetSubset s -> add_op id s "<="
 
 let rec type_parts t =
   match t with
@@ -238,6 +242,19 @@ let rec print_exp id = function
       ) ", " eel in 
     let cb = (newcolumn "]") in 
     String.concat [n; m; peel; cb]
+  | DMapKeys value -> let n = newcolumn (indent id) in
+    let pv = print_exp 0 value in
+    let dot = newcolumn "." in
+    let keys = newcolumn "Keys" in
+    String.concat [n; pv; dot; keys]
+  | DMapUpdate (value, key, update) -> let n = newcolumn (indent id) in
+    let pv = print_exp 0 value in
+    let ob = newcolumn "[" in
+    let pk = print_exp 0 key in
+    let assign = newcolumn " := " in
+    let pu = print_exp 0 update in
+    let cb = newcolumn "]" in
+    String.concat [n; pv; ob; pk; assign; pu; cb]
   | DSubscript (e1, e2) -> let n = newcolumn (indent id) in
     let pe1 = print_exp id e1 in 
     let pe2 = print_exp 0 e2 in
@@ -408,6 +425,21 @@ and print_stmt id = function
     let prhs = print_rhs (print_exp 0) el in
     let ps = newcolumn ";" in
     String.concat [n; pre; lhs; colon; printed_type; prhs; ps]
+  | DAssignSuchThat (typ, target, predicate) ->
+    let n = newcolumn (indent id) in
+    let locals = match target with Local identifier -> [ identifier ] | _ -> [] in
+    add_vars locals;
+    let var = newcolumn "var " in
+    let lhs = print_lvalue 0 target in
+    let type_annotation =
+      match typ with
+      | None -> ""
+      | Some typ -> newcolumn ":" ^ print_type 1 typ
+    in
+    let such_that = newcolumn " :| " in
+    let pp = print_exp 0 predicate in
+    let ps = newcolumn ";" in
+    String.concat [n; var; lhs; type_annotation; such_that; pp; ps]
   | DCallStmt (e, el) -> let n = newcolumn (indent id) in 
     let pident = print_exp 0 e in 
     let ob = newcolumn "(" in 

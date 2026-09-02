@@ -26,6 +26,10 @@ type dOp =
   | DBiImpl of segment
   | DImplies of segment
   | DExplies of segment
+  | DSetUnion of segment
+  | DSetIntersection of segment
+  | DSetDifference of segment
+  | DSetSubset of segment
   [@@deriving sexp]
 
 type dTyp = 
@@ -67,6 +71,8 @@ type dExpr =
   | DSetExpr of dExpr list
   (* | DSetComp of dId list * dExpr * dExpr list * dExpr variables, target, conditions, result *)
   | DMapExpr of (dExpr * dExpr) list
+  | DMapKeys of dExpr
+  | DMapUpdate of dExpr * dExpr * dExpr
   | DArrayExpr of dExpr list
   | DSubscript of dExpr * dExpr (* value, slice *)
   | DIndex of dExpr
@@ -103,6 +109,7 @@ type dStmt =
      New lowering uses explicit targets, so field/index/tuple assignments
      cannot be accidentally printed as local-variable assignments. *)
   | DAssignLvalue of dTyp option * dLvalue list * dExpr list
+  | DAssignSuchThat of dTyp option * dLvalue * dExpr
   | DIf of dExpr * dStmt list * (dExpr * dStmt list) list * dStmt list
   | DWhile of dSpec list * dExpr * dStmt list
   | DReturn of dExpr list

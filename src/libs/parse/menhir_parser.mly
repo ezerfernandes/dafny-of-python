@@ -18,13 +18,15 @@ menhir --list-errors
 %token <Sourcemap.segment> AND OR NOT 
 %token <Sourcemap.segment> TYPF IDENTIFIER INT_TYP FLOAT_TYP BOOL_TYP STRING_TYP LIST_TYP DICT_TYP SET_TYP TUPLE_TYP CALLABLE_TYP UNION_TYP TYPE_TYP OBJ_TYP
 %token <string> STRING INT FLOAT
-%token <Sourcemap.segment> IMPLIES EXPLIES BIIMPL PLUS EQEQ EQ NEQ LTE LT GTE GT PLUSEQ MINUS MINUSEQ TIMES TIMESEQ DIVIDE DIVIDEEQ MOD
+%token <Sourcemap.segment> IMPLIES EXPLIES BIIMPL PLUS EQEQ EQ NEQ LTE LT GTE GT PLUSEQ MINUS MINUSEQ TIMES TIMESEQ DIVIDE DIVIDEEQ MOD BIT_OR BIT_AND
 %token PRE POST INVARIANT FORALL EXISTS DECREASES READS MODIFIES DOUBLECOLON 
 %token <Sourcemap.segment> LEN MAX OLD FRESH 
 
 %left BIIMPL IMPLIES EXPLIES 
 %left OR 
 %left AND
+%left BIT_OR
+%left BIT_AND
 %left EQEQ NEQ
 %left LT LTE GT GTE
 %right EQ PLUSEQ MINUSEQ DIVIDEEQ TIMESEQ
@@ -152,8 +154,18 @@ inversion:
   | c=comparison { c }
   ;
 
+set_union:
+  | e=set_union; s=BIT_OR; t=set_intersection { BinaryExp (e, BitOr s, t) }
+  | e=set_intersection { e }
+  ;
+
+set_intersection:
+  | e=set_intersection; s=BIT_AND; t=sum { BinaryExp (e, BitAnd s, t) }
+  | e=sum { e }
+  ;
+
 comparison:
-  | first=sum; rest=comparison_rest {
+  | first=set_union; rest=comparison_rest {
       match rest with
       | [] -> first
       | _ -> CompareChain (first, rest)
@@ -161,7 +173,7 @@ comparison:
   ;
 
 comparison_rest:
-  | operator=comparison_operator; operand=sum; rest=comparison_rest
+  | operator=comparison_operator; operand=set_union; rest=comparison_rest
     { (operator, operand)::rest }
   | { [] }
   ;
@@ -221,6 +233,17 @@ atom:
   | NONE { Literal (NoneLit) }
   | FORALL; il=id_star; DOUBLECOLON; e=exp { Forall (il, e) }
   | EXISTS; il=id_star; DOUBLECOLON; e=exp { Exists (il, e) }
+  | s=TYPF; el=arguments; RPAREN {
+      let name =
+        match snd s with
+        | Some "setF" -> Some "set"
+        | Some "dictF" -> Some "dict"
+        | _ -> snd s
+      in
+      Call (Identifier (fst s, name), el)
+    }
+  | s=SET_TYP; LPAREN; el=arguments; RPAREN { Call (Identifier s, el) }
+  | s=DICT_TYP; LPAREN; el=arguments; RPAREN { Call (Identifier s, el) }
   | LPAREN; e=exp; c=COMMA; el=exp_star; RPAREN {
       match el with
       | [] -> SingletonTuple (c, e)

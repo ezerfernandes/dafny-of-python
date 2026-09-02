@@ -10,6 +10,8 @@ type evaluation = Eager | Scoped
 type context =
   { environment : Sem.environment
   ; evaluation : evaluation
+  ; expected_type : Py.typ option
+  ; return_type : Py.typ option
   }
 
 type lowered =
@@ -46,9 +48,14 @@ let fresh_temp () =
   Int.incr temp_number;
   (S.def_pos, Some ("lowered_" ^ Int.to_string !temp_number))
 
-let context environment = { environment; evaluation = Eager }
+let context environment =
+  { environment; evaluation = Eager; expected_type = None; return_type = None }
 
 let scoped context = { context with evaluation = Scoped }
+
+let with_expected_type context expected_type = { context with expected_type = Some expected_type }
+
+let with_return_type context return_type = { context with return_type = Some return_type }
 
 let generic_name typ =
   match Sem.normalize_type typ with
@@ -131,6 +138,48 @@ let binary_operator = function
   | Py.BiImpl segment -> D.DBiImpl segment
   | Py.Implies segment -> D.DImplies segment
   | Py.Explies segment -> D.DExplies segment
+  | Py.BitOr segment -> D.DSetUnion segment
+  | Py.BitAnd segment -> D.DSetIntersection segment
+
+let collection_binary_operator environment left operator right =
+  let is_set expression =
+    match Sem.collection_kind (Sem.infer environment expression) with
+    | Sem.SetCollection -> true
+    | _ -> false
+  in
+  match operator with
+  | Py.Minus segment when is_set left && is_set right -> D.DSetDifference segment
+  | Py.BitOr segment -> D.DSetUnion segment
+  | Py.BitAnd segment -> D.DSetIntersection segment
+  | _ -> binary_operator operator
+
+let binary_expression environment left operator right left_result right_result =
+  match operator, Sem.collection_kind (Sem.infer environment right) with
+  | Py.In _, Sem.ListCollection ->
+    D.DCallExpr
+      (D.DDot (right_result, (S.def_pos, Some "contains")), [ left_result ])
+  | Py.NotIn segment, Sem.ListCollection ->
+    D.DUnary
+      (D.DNot segment,
+       D.DCallExpr
+         (D.DDot (right_result, (S.def_pos, Some "contains")), [ left_result ]))
+  | _ ->
+    D.DBinary
+      (left_result, collection_binary_operator environment left operator right, right_result)
+
+let empty_list_type expected_type =
+  match expected_type with
+  | None -> fail "empty list literals require a concrete list type"
+  | Some expected_type ->
+    let expected_type = Sem.normalize_type expected_type in
+    begin
+      match Sem.collection_kind expected_type, Sem.collection_element_type expected_type with
+      | Sem.ListCollection, Some _ -> expected_type
+      | Sem.ListCollection, None -> fail "empty list literals require a concrete element type"
+      | _ -> fail "empty list literals require a list type"
+    end
+
+let reject_list_assignment () = fail "indexed assignment into List is unsupported"
 
 let join_preludes (lowered : lowered list) =
   List.concat_map lowered ~f:(fun value -> value.prelude)
@@ -148,13 +197,35 @@ and lower_collection context constructor expressions resolved_type =
   ; effectful = List.exists lowered ~f:(fun value -> value.effectful)
   }
 
+and lower_map context entries =
+  let lowered = List.map entries ~f:(fun (key, value) -> lower context key, lower context value) in
+  let result =
+    List.fold lowered ~init:(D.DMapExpr []) ~f:(fun result (key, value) ->
+      D.DMapUpdate (result, key.result, value.result))
+  in
+  { prelude = List.concat_map lowered ~f:(fun (key, value) -> key.prelude @ value.prelude)
+  ; result
+  ; resolved_type = Sem.infer context.environment (Py.Dict entries)
+  ; control_flow = List.exists lowered ~f:(fun (key, value) -> key.control_flow || value.control_flow)
+  ; effectful = List.exists lowered ~f:(fun (key, value) -> key.effectful || value.effectful)
+  }
+
 and lower_list context elements =
-  let lowered = lower_many context elements in
+  let resolved_type =
+    match elements, context.expected_type with
+    | [], expected_type -> empty_list_type expected_type
+    | _, _ -> Sem.infer context.environment (Py.Lst elements)
+  in
+  let element_context =
+    Option.value_map (Sem.collection_element_type resolved_type)
+      ~default:context
+      ~f:(with_expected_type context)
+  in
+  let lowered = lower_many element_context elements in
   match context.evaluation with
   | Scoped -> fail "list literals cannot be constructed inside a scoped expression"
   | Eager ->
     let identifier = fresh_temp () in
-    let resolved_type = Sem.infer context.environment (Py.Lst elements) in
     { prelude =
         join_preludes lowered
         @ [ D.DAssignLvalue
@@ -166,9 +237,77 @@ and lower_list context elements =
     ; effectful = List.exists lowered ~f:(fun value -> value.effectful)
     }
 
+and lower_set_constructor context callee arguments =
+  let resolved_type = Sem.infer context.environment (Py.Call (callee, arguments)) in
+  match arguments with
+  | [] ->
+    { prelude = []; result = D.DSetExpr []; resolved_type; control_flow = false; effectful = false }
+  | [ iterable ] ->
+    let lowered = lower context iterable in
+    begin
+      match Sem.collection_kind lowered.resolved_type with
+      | Sem.SetCollection -> lowered
+      | Sem.MapCollection ->
+        { lowered with
+          result = D.DMapKeys lowered.result
+        ; resolved_type = resolved_type
+        }
+      | Sem.ListCollection ->
+        { lowered with
+          result = D.DCallExpr (D.DIdentifier (S.def_pos, Some "setFromSeq"),
+                                [ D.DDot (lowered.result, (S.def_pos, Some "lst")) ])
+        ; resolved_type
+        }
+      | Sem.SequenceCollection ->
+        { lowered with
+          result = D.DCallExpr (D.DIdentifier (S.def_pos, Some "setFromSeq"), [ lowered.result ])
+        ; resolved_type
+        }
+      | _ -> fail "set() expects a set, list, sequence, or map"
+    end
+  | _ -> fail "set() accepts zero or one argument"
+
+and lower_dict_constructor context callee arguments =
+  match arguments with
+  | [] ->
+    { prelude = []; result = D.DMapExpr []; resolved_type = Sem.infer context.environment (Py.Call (callee, arguments)); control_flow = false; effectful = false }
+  | _ -> fail "dict() accepts no arguments in the value-style subset"
+
 and lower_call context callee arguments =
+  match callee with
+  | Py.Identifier identifier
+    when List.mem [ "set"; "setf" ] (Option.value (snd identifier) ~default:"" |> String.lowercase)
+         ~equal:String.equal ->
+    lower_set_constructor context (Py.Identifier identifier) arguments
+  | Py.Identifier identifier
+    when List.mem [ "dict"; "dictf" ] (Option.value (snd identifier) ~default:"" |> String.lowercase)
+         ~equal:String.equal ->
+    lower_dict_constructor context (Py.Identifier identifier) arguments
+  | _ -> lower_regular_call context callee arguments
+
+and lower_regular_call context callee arguments =
   let lowered_callee = lower context callee in
-  let lowered_arguments = lower_many context arguments in
+  let parameter_types =
+    match Sem.normalize_type (Sem.infer context.environment callee) with
+    | Py.TCallable (_, parameters, _) -> parameters
+    | _ -> []
+  in
+  let rec lower_arguments parameter_types = function
+    | [] -> []
+    | argument :: rest ->
+      let argument_context =
+        match parameter_types with
+        | parameter_type :: _ -> with_expected_type context parameter_type
+        | [] -> context
+      in
+      lower argument_context argument ::
+      lower_arguments
+        (match parameter_types with
+         | _ :: rest_parameters -> rest_parameters
+         | [] -> [])
+        rest
+  in
+  let lowered_arguments = lower_arguments parameter_types arguments in
   let call = D.DCallExpr (lowered_callee.result, results lowered_arguments) in
   let prelude = lowered_callee.prelude @ join_preludes lowered_arguments in
   let resolved_type = Sem.infer context.environment (Py.Call (callee, arguments)) in
@@ -272,6 +411,10 @@ and lower_compare_chain context first comparisons =
       try lower_raw evaluation operand with
       | LoweringError message -> fail ("comparison-chain operand: " ^ message)
     in
+    let validate_operand _ lowered =
+      if lowered.effectful then
+        fail "effectful calls are unsupported in comparison chains"
+    in
     let lower_initial operand =
       match context.evaluation with
       | Eager ->
@@ -282,10 +425,10 @@ and lower_compare_chain context first comparisons =
       | Scoped -> lower_operand (scoped context) operand
     in
     let lowered_first = lower_initial first in
+    validate_operand true lowered_first;
     let first_identifier = fresh_temp () in
-    let effectful = ref lowered_first.effectful in
     let initial_prelude = ref lowered_first.prelude in
-    let rec chain current_identifier first_comparison comparisons =
+    let rec chain current_identifier previous first_comparison comparisons =
       let operator, operand = List.hd_exn comparisons in
       let rest = List.tl_exn comparisons in
       let lowered =
@@ -293,36 +436,135 @@ and lower_compare_chain context first comparisons =
         else lower_operand (scoped context) operand
       in
       if first_comparison then initial_prelude := !initial_prelude @ lowered.prelude;
-      effectful := !effectful || lowered.effectful;
+      validate_operand first_comparison lowered;
       let next_identifier = fresh_temp () in
       match rest with
       | [] ->
         D.DLet
           ( next_identifier
           , lowered.result
-          , D.DBinary
-              ( D.DIdentifier current_identifier
-              , binary_operator operator
-              , D.DIdentifier next_identifier ) )
+          , binary_expression
+              context.environment
+              previous
+              operator
+              operand
+              (D.DIdentifier current_identifier)
+              (D.DIdentifier next_identifier) )
       | _ ->
         let comparison =
-          D.DBinary
-            ( D.DIdentifier current_identifier
-            , binary_operator operator
-            , D.DIdentifier next_identifier )
+          binary_expression
+            context.environment
+            previous
+            operator
+            operand
+            (D.DIdentifier current_identifier)
+            (D.DIdentifier next_identifier)
         in
         D.DLet
           ( next_identifier
           , lowered.result
-          , D.DIfElseExpr (comparison, chain next_identifier false rest, D.DFalse) )
+          , D.DIfElseExpr (comparison, chain next_identifier operand false rest, D.DFalse) )
     in
-    let result = D.DLet (first_identifier, lowered_first.result, chain first_identifier true comparisons) in
+    let result = D.DLet (first_identifier, lowered_first.result, chain first_identifier first true comparisons) in
     { prelude = !initial_prelude
     ; result
     ; resolved_type = Py.TBool S.def_seg
     ; control_flow = true
-    ; effectful = !effectful
+    ; effectful = false
     }
+
+and lower_for context specifications identifiers iterable body =
+  let lowered_iterable = lower context iterable in
+  let iterable_type = Sem.infer context.environment iterable in
+  let kind = Sem.collection_kind iterable_type in
+  let target =
+    match identifiers with
+    | [ identifier ] -> identifier
+    | _ -> raise (LoweringError "collection iteration requires one loop target")
+  in
+  let target_name = Option.value (snd target) ~default:"" in
+  let element_type =
+    match kind, Sem.collection_arguments iterable_type with
+    | Sem.MapCollection, key :: _ -> key
+    | _, element :: _ -> element
+    | _ -> Py.TIdent S.def_seg
+  in
+  let loop_environment =
+    Sem.enter_scope context.environment Sem.ComprehensionScope
+    |> fun environment -> Sem.bind environment target_name element_type
+  in
+  let loop_context = { context with environment = loop_environment } in
+  let lower_specs () =
+    let lowered = List.map specifications ~f:(lower_loop_spec (scoped context))
+    in
+    List.concat_map lowered ~f:fst, List.map lowered ~f:snd
+  in
+  let target_lvalue = D.Local target in
+  let lower_indexed_loop length element =
+    let counter = fresh_temp () in
+    let limit = fresh_temp () in
+    let counter_expression = D.DIdentifier counter in
+    let limit_expression = D.DIdentifier limit in
+    let invariant =
+      D.DInvariant
+        (D.DBinary
+           ( D.DBinary (D.DIntLit "0", D.DLEq S.def_seg, counter_expression)
+           , D.DAnd S.def_seg
+           , D.DBinary (counter_expression, D.DLEq S.def_seg, limit_expression) ))
+    in
+    let loop_body =
+      lower_statements loop_context body
+      |> fun statements ->
+      [ D.DAssignLvalue (None, [ target_lvalue ], [ element counter_expression ]) ]
+      @ statements
+      @ [ D.DAssignLvalue
+            (None, [ D.Local counter ]
+            , [ D.DBinary (counter_expression, D.DPlus S.def_seg, D.DIntLit "1") ]) ]
+    in
+    let user_prelude, user_specs = lower_specs () in
+    lowered_iterable.prelude
+    @ user_prelude
+    @ [ D.DAssignLvalue (None, [ D.Local counter ], [ D.DIntLit "0" ])
+      ; D.DAssignLvalue (None, [ D.Local limit ], [ length ])
+      ; D.DWhile (invariant :: user_specs, D.DBinary (counter_expression, D.DLt S.def_seg, limit_expression), loop_body) ]
+  in
+  let lower_value_loop initial =
+    let remaining = fresh_temp () in
+    let remaining_expression = D.DIdentifier remaining in
+    let target_expression = D.DIdentifier target in
+    let nonempty = D.DBinary (D.DLen (S.def_seg, remaining_expression), D.DGt S.def_seg, D.DIntLit "0") in
+    let subset = D.DInvariant (D.DBinary (remaining_expression, D.DSetSubset S.def_seg, initial)) in
+    let decreasing = D.DDecreases (D.DLen (S.def_seg, remaining_expression)) in
+    let choose =
+      D.DAssignSuchThat
+        ( Some (type_dfy element_type)
+        , target_lvalue
+        , D.DBinary (target_expression, D.DIn S.def_seg, remaining_expression) )
+    in
+    let remove =
+      D.DAssignLvalue
+        ( None
+        , [ D.Local remaining ]
+        , [ D.DBinary (remaining_expression, D.DSetDifference S.def_seg, D.DSetExpr [ target_expression ]) ] )
+    in
+    let user_prelude, user_specs = lower_specs () in
+    lowered_iterable.prelude
+    @ user_prelude
+    @ [ D.DAssignLvalue (None, [ D.Local remaining ], [ initial ])
+      ; D.DWhile (subset :: decreasing :: user_specs, nonempty, choose :: lower_statements loop_context body @ [ remove ]) ]
+  in
+  match kind with
+  | Sem.ListCollection ->
+    lower_indexed_loop
+      (D.DCallExpr (D.DDot (lowered_iterable.result, (S.def_pos, Some "len")), []))
+      (fun index -> D.DCallExpr (D.DDot (lowered_iterable.result, (S.def_pos, Some "atIndex")), [ index ]))
+  | Sem.SequenceCollection ->
+    lower_indexed_loop
+      (D.DLen (S.def_seg, lowered_iterable.result))
+      (fun index -> D.DNativeIndex (lowered_iterable.result, index))
+  | Sem.SetCollection -> lower_value_loop lowered_iterable.result
+  | Sem.MapCollection -> lower_value_loop (D.DMapKeys lowered_iterable.result)
+  | _ -> fail "for loop iterable is not a supported collection"
 
 and lower context expression =
   let environment = context.environment in
@@ -355,7 +597,7 @@ and lower context expression =
     let lowered_left = lower left_context left in
     let lowered_right = lower right_context right in
     { prelude = lowered_left.prelude @ lowered_right.prelude
-    ; result = D.DBinary (lowered_left.result, binary_operator operator, lowered_right.result)
+    ; result = binary_expression environment left operator right lowered_left.result lowered_right.result
     ; resolved_type = Sem.infer environment expression
     ; control_flow = lowered_left.control_flow || lowered_right.control_flow
     ; effectful = lowered_left.effectful || lowered_right.effectful
@@ -373,15 +615,7 @@ and lower context expression =
   | Py.Lst elements -> lower_list context elements
   | Py.Array elements -> lower_collection context (fun values -> D.DArrayExpr values) elements (Sem.infer environment expression)
   | Py.Set elements -> lower_collection context (fun values -> D.DSetExpr values) elements (Sem.infer environment expression)
-  | Py.Dict entries ->
-    let lowered = List.map entries ~f:(fun (key, value) -> lower context key, lower context value) in
-    let key_values = List.map lowered ~f:(fun (key, value) -> key.result, value.result) in
-    { prelude = List.concat_map lowered ~f:(fun (key, value) -> key.prelude @ value.prelude)
-    ; result = D.DMapExpr key_values
-    ; resolved_type = Sem.infer environment expression
-    ; control_flow = List.exists lowered ~f:(fun (key, value) -> key.control_flow || value.control_flow)
-    ; effectful = List.exists lowered ~f:(fun (key, value) -> key.effectful || value.effectful)
-    }
+  | Py.Dict entries -> lower_map context entries
   | Py.Tuple elements ->
     begin
       match elements with
@@ -436,11 +670,7 @@ and lower context expression =
     ; effectful = lowered_condition.effectful || lowered_true.effectful || lowered_false.effectful
     }
 
-let expression ?(environment = Sem.empty) expression =
-  reset ();
-  lower (context environment) expression
-
-let lower_spec context = function
+and lower_spec context = function
   | Py.Pre value -> let lowered = lower (scoped context) value in lowered.prelude, D.DRequires lowered.result
   | Py.Post value -> let lowered = lower (scoped context) value in lowered.prelude, D.DEnsures lowered.result
   | Py.Invariant value -> let lowered = lower (scoped context) value in lowered.prelude, D.DInvariant lowered.result
@@ -448,7 +678,13 @@ let lower_spec context = function
   | Py.Reads value -> let lowered = lower (scoped context) value in lowered.prelude, D.DReads lowered.result
   | Py.Modifies value -> let lowered = lower (scoped context) value in lowered.prelude, D.DModifies lowered.result
 
-let rec lower_lvalue context target =
+and lower_loop_spec context = function
+  | Py.Invariant value -> let lowered = lower (scoped context) value in lowered.prelude, D.DInvariant lowered.result
+  | Py.Decreases value -> let lowered = lower (scoped context) value in lowered.prelude, D.DDecreases lowered.result
+  | Py.Pre _ | Py.Post _ | Py.Reads _ | Py.Modifies _ ->
+    fail "loop specifications support only invariant and decreases"
+
+and lower_lvalue context target =
   match target with
   | Py.Identifier identifier -> { prelude = []; target = D.Local identifier }
   | Py.Dot (value, identifier) ->
@@ -467,7 +703,7 @@ let rec lower_lvalue context target =
     }
   | _ -> fail "assignment target is not an explicit lvalue"
 
-let lower_expression_statement context expression =
+and lower_expression_statement context expression =
   match expression with
   | Py.Call (callee, arguments) ->
     let lowered_callee = lower context callee in
@@ -478,9 +714,59 @@ let lower_expression_statement context expression =
     let lowered = lower context expression in
     lowered.prelude, [ D.DAssert lowered.result ]
 
-let rec statements ?(environment = Sem.empty) statements =
+and lower_map_assignment context map key value =
+  let map_expression = Py.Identifier map in
+  begin
+    match Sem.collection_kind (Sem.infer context.environment map_expression) with
+    | Sem.MapCollection -> ()
+    | _ -> raise (LoweringError "indexed assignment target is not a map")
+  end;
+  let lowered_key = lower context key in
+  let lowered_value = lower context value in
+  lowered_key.prelude
+  @ lowered_value.prelude
+  @ [ D.DAssignLvalue
+        ( None
+        , [ D.Local map ]
+        , [ D.DMapUpdate (D.DIdentifier map, lowered_key.result, lowered_value.result) ] ) ]
+
+and lower_assignment context annotation targets values =
+  let lower_regular_assignment () =
+    let value_context =
+      match annotation, values with
+      | Some annotation, [ _ ] ->
+        with_expected_type context (Sem.normalize_type (annotation_type annotation))
+      | _ -> context
+    in
+    let lowered_values = lower_many value_context values in
+    let lowered_targets = List.map targets ~f:(lower_lvalue context) in
+    let type_annotation =
+      Option.map annotation ~f:(fun value ->
+        type_dfy (Sem.normalize_type (annotation_type value)))
+    in
+    join_preludes lowered_values
+    @ List.concat_map lowered_targets ~f:(fun value -> value.prelude)
+    @ [ D.DAssignLvalue
+          (type_annotation, List.map lowered_targets ~f:(fun value -> value.target),
+           results lowered_values) ]
+  in
+  match targets, values with
+  | [ Py.Subscript (Py.Identifier map, Py.Index key) ], [ value ] ->
+    begin
+      match Sem.collection_kind (Sem.infer context.environment (Py.Identifier map)) with
+      | Sem.MapCollection -> lower_map_assignment context map key value
+      | Sem.ListCollection -> reject_list_assignment ()
+      | _ -> lower_regular_assignment ()
+    end
+  | _ -> lower_regular_assignment ()
+
+and statements ?(environment = Sem.empty) ?return_type statements =
   reset ();
-  lower_statements (context environment) statements
+  let context =
+    Option.value_map return_type ~default:(context environment)
+      ~f:(with_return_type (context environment))
+  in
+  lower_statements context statements
 
 and lower_statements context statements =
   List.concat_map statements ~f:(lower_statement context)
@@ -497,30 +783,59 @@ and lower_statement context statement =
     let lowered = lower context expression in
     lowered.prelude @ [ D.DAssert lowered.result ]
   | Py.Return expression ->
+    let context =
+      Option.value_map context.return_type ~default:context ~f:(with_expected_type context)
+    in
     let lowered = lower context expression in
     lowered.prelude @ [ D.DReturn [ lowered.result ] ]
   | Py.Assign (annotation, targets, values) ->
-    let lowered_values = lower_many context values in
-    let lowered_targets = List.map targets ~f:(lower_lvalue context) in
-    let type_annotation = Option.map annotation ~f:(fun value -> type_dfy (Sem.normalize_type (annotation_type value))) in
-    join_preludes lowered_values
-    @ List.concat_map lowered_targets ~f:(fun value -> value.prelude)
-    @ [ D.DAssignLvalue (type_annotation, List.map lowered_targets ~f:(fun value -> value.target), results lowered_values) ]
+    lower_assignment context annotation targets values
   | Py.IfElse (condition, first, alternatives, last) ->
     let lowered_condition = lower context condition in
     let first = lower_statements context first in
     let alternatives = List.map alternatives ~f:(fun (condition, body) ->
       let lowered = lower context condition in
       lowered.prelude, lowered.result, lower_statements context body) in
-    let alternatives = List.map alternatives ~f:(fun (prelude, condition, body) ->
-      if List.is_empty prelude then condition, body
-      else condition, prelude @ body) in
-    lowered_condition.prelude @ [ D.DIf (lowered_condition.result, first, alternatives, lower_statements context last) ]
+    let last = lower_statements context last in
+    if List.for_all alternatives ~f:(fun (prelude, _, _) -> List.is_empty prelude) then
+      lowered_condition.prelude
+      @ [ D.DIf
+            ( lowered_condition.result
+            , first
+            , List.map alternatives ~f:(fun (_, condition, body) -> condition, body)
+            , last ) ]
+    else
+      let rec nested = function
+        | [] -> last
+        | (prelude, condition, body) :: rest ->
+          prelude @ [ D.DIf (condition, body, [], nested rest) ]
+      in
+      lowered_condition.prelude @ [ D.DIf (lowered_condition.result, first, [], nested alternatives) ]
   | Py.While (specifications, condition, body) ->
     let lowered_condition = lower context condition in
-    let specifications = List.map specifications ~f:(lower_spec (scoped context)) in
+    let specifications = List.map specifications ~f:(lower_loop_spec (scoped context)) in
     let spec_prelude = List.concat_map specifications ~f:fst in
     let specifications = List.map specifications ~f:snd in
-    lowered_condition.prelude @ spec_prelude @ [ D.DWhile (specifications, lowered_condition.result, lower_statements context body) ]
-  | Py.For _ -> fail "for loops must be lowered before expression lowering"
+    let body = lower_statements context body in
+    if List.is_empty lowered_condition.prelude then
+      spec_prelude @ [ D.DWhile (specifications, lowered_condition.result, body) ]
+    else
+      let guard =
+        D.DIf
+          ( D.DUnary (D.DNot S.def_seg, lowered_condition.result)
+          , [ D.DBreak ]
+          , []
+          , [] )
+      in
+      spec_prelude
+      @ [ D.DWhile (specifications, D.DTrue, lowered_condition.prelude @ [ guard ] @ body) ]
+  | Py.For (specifications, identifiers, iterable, body) ->
+    lower_for context specifications identifiers iterable body
   | Py.Function _ -> fail "nested function declarations are not Dafny statements"
+
+let expression ?(environment = Sem.empty) ?expected_type expression =
+  reset ();
+  let context =
+    Option.value_map expected_type ~default:(context environment) ~f:(with_expected_type (context environment))
+  in
+  lower context expression

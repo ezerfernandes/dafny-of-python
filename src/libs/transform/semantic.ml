@@ -42,9 +42,19 @@ type environment =
   { scopes : scope list
   ; functions : callable_signature list
   ; classes : class_definition list
+  ; memberships : (string * string) list
+  ; known_map_keys : (string * string list) list
+  ; map_aliases : string list
   }
 
-let empty = { scopes = [ { kind = Global; bindings = [] } ]; functions = []; classes = [] }
+let empty =
+  { scopes = [ { kind = Global; bindings = [] } ]
+  ; functions = []
+  ; classes = []
+  ; memberships = []
+  ; known_map_keys = []
+  ; map_aliases = []
+  }
 
 let generic name args = TGeneric ((def_pos, Some name), args)
 
@@ -196,6 +206,94 @@ let generic_arguments typ =
   | TGeneric (_, arguments) -> arguments
   | _ -> []
 
+type collection_kind =
+  | ListCollection
+  | SequenceCollection
+  | ArrayCollection
+  | SetCollection
+  | MapCollection
+  | TupleCollection
+  | StringCollection
+  | UnknownCollection
+  | NonCollection
+
+let collection_kind typ =
+  match normalize_type typ with
+  | TGeneric (segment, _) ->
+    begin
+      match segment_name segment with
+      | "list" -> ListCollection
+      | "seq" -> SequenceCollection
+      | "array" -> ArrayCollection
+      | "set" -> SetCollection
+      | "map" -> MapCollection
+      | "tuple" -> TupleCollection
+      | _ -> UnknownCollection
+    end
+  | TStr _ -> StringCollection
+  | TIdent _ -> UnknownCollection
+  | _ -> NonCollection
+
+let collection_arguments typ = generic_arguments typ
+
+let collection_element_type typ =
+  match collection_kind typ, collection_arguments typ with
+  | (ListCollection | SequenceCollection | ArrayCollection | SetCollection), element :: _ -> Some element
+  | TupleCollection, [] -> None
+  | TupleCollection, first :: rest ->
+    Some (List.fold rest ~init:first ~f:(fun common element ->
+      if eqtyp common element then common else TIdent def_seg))
+  | _ -> None
+
+let map_types typ =
+  match collection_kind typ, collection_arguments typ with
+  | MapCollection, key :: value :: _ -> Some (key, value)
+  | _ -> None
+
+let set_source_element_type typ =
+  match collection_kind typ with
+  | MapCollection -> Option.map (map_types typ) ~f:fst
+  | _ -> collection_element_type typ
+
+let identifier_name = function
+  | Identifier segment -> Option.value (snd segment) ~default:""
+  | _ -> ""
+
+let literal_key = function
+  | Literal (IntLit value) -> Some ("int:" ^ value)
+  | Literal (FloatLit value) -> Some ("float:" ^ value)
+  | Literal (StringLit value) -> Some ("string:" ^ value)
+  | Literal TrueLit -> Some "bool:true"
+  | Literal FalseLit -> Some "bool:false"
+  | Literal NoneLit -> Some "none"
+  | _ -> None
+
+let map_keys env name =
+  Option.value (List.Assoc.find env.known_map_keys name ~equal:String.equal) ~default:[]
+
+let set_map_keys env name keys =
+  let known_map_keys =
+    (name, keys) :: List.Assoc.remove env.known_map_keys name ~equal:String.equal
+  in
+  { env with known_map_keys }
+
+let add_membership env key map =
+  if String.is_empty key || String.is_empty map then env
+  else { env with memberships = (key, map) :: List.filter env.memberships ~f:(fun (old_key, old_map) -> not (String.equal old_key key && String.equal old_map map)) }
+
+let has_membership env key map =
+  List.exists env.memberships ~f:(fun (old_key, old_map) -> String.equal old_key key && String.equal old_map map)
+
+let membership_assumption = function
+  | BinaryExp (Identifier key, (In _), Identifier map) -> Some (identifier_name (Identifier key), identifier_name (Identifier map))
+  | CompareChain (Identifier key, [ (In _, Identifier map) ]) -> Some (identifier_name (Identifier key), identifier_name (Identifier map))
+  | _ -> None
+
+let assume_membership env expression =
+  match membership_assumption expression with
+  | Some (key, map) -> add_membership env key map
+  | None -> env
+
 let rec find_binding name = function
   | [] -> None
   | scope :: rest ->
@@ -223,10 +321,33 @@ let bind env name typ =
   | [] -> env
   | scope :: rest ->
     let bindings = (name, normalize_type typ) :: List.Assoc.remove scope.bindings name ~equal:String.equal in
-    { env with scopes = { scope with bindings } :: rest }
+    { env with
+      scopes = { scope with bindings } :: rest
+    ; known_map_keys = List.Assoc.remove env.known_map_keys name ~equal:String.equal
+    ; map_aliases = List.filter env.map_aliases ~f:(fun old -> not (String.equal old name))
+    }
 
 let bind_many env bindings =
   List.fold bindings ~init:env ~f:(fun env (name, typ) -> bind env name typ)
+
+let bind_value env name typ value =
+  let env = bind env name typ in
+  let keys =
+    match value with
+    | Dict entries -> List.filter_map entries ~f:(fun (key, _) -> literal_key key)
+    | _ -> []
+  in
+  let env = set_map_keys env name keys in
+  match value, collection_kind typ with
+  | Identifier _, MapCollection -> { env with map_aliases = name :: env.map_aliases }
+  | _ -> env
+
+let add_map_key env name key =
+  match literal_key key with
+  | None -> env
+  | Some key ->
+    set_map_keys env name
+      (key :: List.filter (map_keys env name) ~f:(fun old -> not (String.equal old key)))
 
 let enter_scope env kind = { env with scopes = { kind; bindings = [] } :: env.scopes }
 
@@ -312,6 +433,7 @@ let rec infer env = function
       | EqEq _ | NEq _ | Lt _ | LEq _ | Gt _ | GEq _ | And _ | Or _
       | NotIn _ | In _ | BiImpl _ | Implies _ | Explies _ -> TBool def_seg
       | Plus _ | Minus _ | Times _ | Divide _ | Mod _ -> numeric_type (infer env left) (infer env right)
+      | BitOr _ | BitAnd _ -> infer env left
     end
   | CompareChain _ -> TBool def_seg
   | SingletonTuple (_, value) -> infer env value
@@ -320,7 +442,7 @@ let rec infer env = function
       match callee with
       | Identifier segment ->
         begin
-          match Option.value (snd segment) ~default:"" with
+          match Option.value (snd segment) ~default:"" |> String.lowercase with
           | "len" -> TInt def_seg
           | "list" ->
             let element = match arguments with
@@ -328,8 +450,14 @@ let rec infer env = function
               | _ -> None
             in
             generic "list" (Option.to_list element)
-          | "set" -> generic "set" []
-          | "dict" | "map" -> generic "map" []
+          | "set" | "setf" ->
+            begin
+              match arguments with
+              | [ argument ] ->
+                generic "set" (Option.to_list (set_source_element_type (infer env argument)))
+              | _ -> generic "set" []
+            end
+          | "dict" | "dictf" | "map" -> generic "map" []
           | _ ->
             begin
               match lookup_function env (Option.value (snd segment) ~default:"") with
@@ -445,54 +573,384 @@ let rec collect_functions env statements =
     | While (_, _, body) | For (_, _, _, body) -> collect_functions env body
     | _ -> env)
 
-let rec analyze_statements env statements =
+let is_unknown_type typ =
+  match normalize_type typ with
+  | TIdent _ -> true
+  | _ -> false
+
+let compatible_types left right =
+  is_unknown_type left || is_unknown_type right || eqtyp (normalize_type left) (normalize_type right)
+
+let require condition message = if not condition then fail message
+
+let require_compatible left right message = require (compatible_types left right) message
+
+let require_set_elements left right message =
+  match collection_element_type left, collection_element_type right with
+  | Some left, Some right -> require_compatible left right message
+  | _ -> fail "set operation requires a concrete element type"
+
+let require_collection kind message =
+  require
+    (match kind with
+     | UnknownCollection | ListCollection | SequenceCollection | ArrayCollection
+     | SetCollection | MapCollection | TupleCollection | StringCollection -> true
+     | NonCollection -> false)
+    message
+
+let require_set_source kind message =
+  require
+    (match kind with
+     | ListCollection | SequenceCollection | SetCollection | MapCollection -> true
+     | _ -> false)
+    message
+
+let membership_type _env value_type =
+  match collection_kind value_type, collection_arguments value_type with
+  | SetCollection, element :: _ -> Some element
+  | MapCollection, key :: _ -> Some key
+  | ListCollection, element :: _ -> Some element
+  | SequenceCollection, element :: _ -> Some element
+  | ArrayCollection, element :: _ -> Some element
+  | TupleCollection, elements ->
+    begin
+      match elements with
+      | [] -> None
+      | first :: rest -> Some (List.fold rest ~init:first ~f:(fun common element ->
+          if compatible_types common element then common else TIdent def_seg))
+    end
+  | StringCollection, _ -> Some (TStr def_seg)
+  | UnknownCollection, _ -> None
+  | NonCollection, _ -> None
+  | (SetCollection | MapCollection | ListCollection | SequenceCollection | ArrayCollection), [] -> None
+
+let known_literal_key env value key =
+  match value with
+  | Dict entries ->
+    begin
+      match literal_key key with
+      | Some key ->
+        List.exists (List.filter_map entries ~f:(fun (key, _) -> literal_key key)) ~f:(String.equal key)
+      | None -> false
+    end
+  | Identifier _ ->
+    begin
+      match literal_key key with
+      | Some key -> List.exists (map_keys env (identifier_name value)) ~f:(String.equal key)
+      | None -> has_membership env (identifier_name key) (identifier_name value)
+    end
+  | _ -> false
+
+let validate_membership env left right =
+  let right_type = infer env right in
+  match membership_type env right_type with
+  | Some element -> require_compatible (infer env left) element "membership operand has an incompatible type"
+  | None ->
+    require (is_unknown_type right_type) "right operand of membership must be a collection"
+
+let validate_map_lookup env value key =
+  match collection_kind (infer env value) with
+  | MapCollection ->
+    begin
+      match map_types (infer env value) with
+      | Some (key_type, _) ->
+        require_compatible (infer env key) key_type "map lookup key has an incompatible type";
+        require
+          (known_literal_key env value key)
+          "map lookup requires a key-membership precondition"
+      | None -> fail "map lookup requires concrete key and value types"
+    end
+  | UnknownCollection -> ()
+  | _ -> ()
+
+let validate_equality left_type right_type =
+  match collection_kind left_type, collection_kind right_type with
+  | SetCollection, SetCollection ->
+    require_set_elements left_type right_type "set equality operands have incompatible element types"
+  | MapCollection, MapCollection ->
+    begin
+      match map_types left_type, map_types right_type with
+      | Some (left_key, left_value), Some (right_key, right_value) ->
+        require_compatible left_key right_key "map equality keys have incompatible types";
+        require_compatible left_value right_value "map equality values have incompatible types"
+      | _ -> fail "map equality requires concrete key and value types"
+    end
+  | (SetCollection | MapCollection), _ | _, (SetCollection | MapCollection) ->
+    fail "set and map values can only be compared with the same collection kind"
+  | _ -> ()
+
+let validate_binary env left operator right =
+  let left_type = infer env left in
+  let right_type = infer env right in
+  let is_set typ = match collection_kind typ with SetCollection -> true | _ -> false in
+  match operator with
+  | BitOr _ | BitAnd _ ->
+    require (is_set left_type && is_set right_type)
+      "set algebra requires two sets";
+    require_set_elements left_type right_type "set algebra operands have incompatible element types"
+  | Minus _ when is_set left_type || is_set right_type ->
+    require (is_set left_type && is_set right_type)
+      "set difference requires two sets";
+    require_set_elements left_type right_type "set difference operands have incompatible element types"
+  | In _ | NotIn _ -> validate_membership env left right
+  | EqEq _ | NEq _ -> validate_equality left_type right_type
+  | _ -> ()
+
+let rec validate_call env callee arguments =
+  match callee with
+  | Identifier _ ->
+    begin
+      let name = String.lowercase (identifier_name callee) in
+      let name =
+        match name with
+        | "setf" -> "set"
+        | "dictf" -> "dict"
+        | name -> name
+      in
+      match name, arguments with
+      | "set", [] -> ()
+      | "set", [ iterable ] ->
+        begin
+          validate_exp env iterable;
+          require_set_source (collection_kind (infer env iterable))
+            "set() expects a supported typed iterable"
+        end
+      | "set", _ -> fail "set() accepts zero or one argument"
+      | "dict", [] | "map", [] -> ()
+      | "dict", _ | "map", _ -> fail "dict() accepts no arguments in the value-style subset"
+      | _, _ -> ()
+    end
+  | Dot (value, method_name) ->
+    let collection = collection_kind (infer env value) in
+    let method_name = String.lowercase (Option.value (snd method_name) ~default:"") in
+    begin
+      match collection, method_name with
+      | SetCollection, ("add" | "remove" | "discard" | "pop" | "clear" | "update"
+                        | "intersection_update" | "difference_update")
+      | MapCollection, ("pop" | "popitem" | "setdefault" | "update" | "clear") ->
+        fail ("mutating collection method is unsupported: " ^ method_name)
+      | _ -> ()
+    end
+  | _ -> ()
+
+and validate_exp env = function
+  | Typ _ | Literal _ | Identifier _ -> ()
+  | Dot (value, _) -> validate_exp env value
+  | BinaryExp (left, operator, right) ->
+    validate_exp env left;
+    validate_exp env right;
+    validate_binary env left operator right
+  | CompareChain (first, comparisons) ->
+    validate_exp env first;
+    let rec validate_chain previous = function
+      | [] -> ()
+      | (operator, operand) :: rest ->
+        validate_exp env operand;
+        validate_binary env previous operator operand;
+        validate_chain operand rest
+    in
+    validate_chain first comparisons
+  | UnaryExp (_, value) -> validate_exp env value
+  | Call (callee, arguments) ->
+    validate_exp env callee;
+    List.iter arguments ~f:(validate_exp env);
+    validate_call env callee arguments
+  | Lst elements | Array elements | Set elements ->
+    List.iter elements ~f:(validate_exp env);
+    begin
+      match elements with
+      | [] -> ()
+      | first :: rest ->
+        let first_type = infer env first in
+        List.iter rest ~f:(fun element -> require_compatible first_type (infer env element) "collection elements have incompatible types")
+    end
+  | Dict entries ->
+    List.iter entries ~f:(fun (key, value) -> validate_exp env key; validate_exp env value);
+    begin
+      match entries with
+      | [] -> ()
+      | (first_key, first_value) :: rest ->
+        let key_type = infer env first_key in
+        let value_type = infer env first_value in
+        List.iter rest ~f:(fun (key, value) ->
+          require_compatible key_type (infer env key) "dictionary keys have incompatible types";
+          require_compatible value_type (infer env value) "dictionary values have incompatible types")
+    end
+  | Tuple elements -> List.iter elements ~f:(validate_exp env)
+  | SingletonTuple (_, value) -> validate_exp env value
+  | Subscript (value, selector) ->
+    validate_exp env value;
+    validate_exp env selector;
+    begin
+      match selector, collection_kind (infer env value) with
+      | Index key, MapCollection -> validate_map_lookup env value key
+      | Index key, (ListCollection | SequenceCollection | ArrayCollection | TupleCollection) ->
+        ignore (infer env key)
+      | Index _, UnknownCollection -> ()
+      | Index _, _ -> fail "value is not indexable"
+      | Slice _, (ListCollection | SequenceCollection | ArrayCollection | TupleCollection | UnknownCollection) -> ()
+      | Slice _, _ -> fail "value does not support slicing"
+      | _, _ -> fail "subscript selector must be an index or slice"
+    end
+  | Index value -> validate_exp env value
+  | Slice (lower, upper) ->
+    Option.iter lower ~f:(validate_exp env);
+    Option.iter upper ~f:(validate_exp env)
+  | Forall (identifiers, body) | Exists (identifiers, body) ->
+    let scoped = enter_scope env ComprehensionScope in
+    let scoped = bind_many scoped (List.map identifiers ~f:(fun identifier -> identifier_name (Identifier identifier), TIdent identifier)) in
+    validate_exp scoped body
+  | Len (_, value) ->
+    validate_exp env value;
+    require_collection (collection_kind (infer env value)) "len() expects a known collection"
+  | Max (_, value) -> validate_exp env value
+  | Old (_, value) | Fresh (_, value) -> validate_exp env value
+  | Lambda (identifiers, body) ->
+    let scoped = enter_scope env (FunctionScope "lambda") in
+    let scoped = bind_many scoped (List.map identifiers ~f:(fun identifier -> identifier_name (Identifier identifier), TIdent identifier)) in
+    validate_exp scoped body
+  | IfElseExp (when_true, condition, when_false) ->
+    validate_exp env condition;
+    validate_exp env when_true;
+    validate_exp env when_false
+
+and validate_spec env = function
+  | Pre value -> validate_exp env value; assume_membership env value
+  | Post value | Invariant value | Decreases value | Reads value | Modifies value ->
+    validate_exp env value;
+    env
+
+and validate_specs env specifications =
+  List.fold specifications ~init:env ~f:(fun env specification -> validate_spec env specification)
+
+and validate_loop_specs env specifications =
+  List.fold specifications ~init:env ~f:(fun env specification ->
+    match specification with
+    | Invariant value | Decreases value ->
+      validate_exp env value;
+      env
+    | Pre _ | Post _ | Reads _ | Modifies _ ->
+      fail "loop specifications support only invariant and decreases")
+
+and validate_target env = function
+  | Identifier _ -> ()
+  | Dot (value, _) -> validate_exp env value
+  | Subscript (value, Index key) ->
+    validate_exp env value;
+    validate_exp env key;
+    begin
+      require
+        (match value with
+         | Subscript _ -> false
+         | _ -> true)
+        "nested map updates are unsupported";
+      match collection_kind (infer env value) with
+      | MapCollection ->
+        require (match value with Identifier _ -> true | _ -> false)
+          "map updates require a local map variable";
+        require
+          (not (List.exists env.map_aliases ~f:(String.equal (identifier_name value))))
+          "map updates through aliases are unsupported";
+        begin
+          match map_types (infer env value) with
+          | Some (key_type, _) ->
+            require_compatible (infer env key) key_type "map update key has an incompatible type"
+          | None -> fail "map update requires concrete key and value types"
+        end
+      | ListCollection -> fail "indexed assignment into List is unsupported"
+      | _ -> ()
+    end
+  | Subscript (value, selector) -> validate_exp env (Subscript (value, selector))
+  | Tuple targets -> List.iter targets ~f:(validate_target env)
+  | _ -> fail "assignment target is not supported"
+
+and validate_assignment env annotation_opt targets values =
+  Option.iter annotation_opt ~f:(validate_exp env);
+  List.iter targets ~f:(validate_target env);
+  List.iter values ~f:(validate_exp env);
+  let declared = Option.map annotation_opt ~f:annotation in
+  let bindings = List.map2_exn targets values ~f:(fun target value -> target, value, infer env value) in
+  let env =
+    List.fold bindings ~init:env ~f:(fun env (target, value, value_type) ->
+      match target, value, value_type with
+      | Identifier _, value, value_type ->
+        let name = identifier_name target in
+        let value_type = Option.value declared ~default:value_type in
+        bind_value env name value_type value
+      | Subscript (Identifier map, Index key), _, value_type ->
+        begin
+          match collection_kind (infer env (Identifier map)) with
+          | MapCollection ->
+            let expected_value_type =
+              Option.value_map (map_types (infer env (Identifier map)))
+                ~default:(TIdent def_seg) ~f:snd
+            in
+            require_compatible value_type expected_value_type "map update value has an incompatible type";
+            add_map_key env (identifier_name (Identifier map)) key
+          | _ -> env
+        end
+      | _ -> env)
+  in
+  env
+
+and validate_statements env statements =
   List.fold statements ~init:env ~f:(fun env statement ->
     match statement with
-    | Assign (annotation_opt, targets, values) ->
-      let values = List.map values ~f:(infer env) in
-      let declared =
-        match annotation_opt with
-        | Some value -> annotation value
-        | None -> TIdent def_seg
-      in
-      let bindings = List.map2_exn targets values ~f:(fun target value ->
-        let value = if String.equal (type_name declared) "" then value else declared in
-        match target with
-        | Identifier identifier -> Option.value (snd identifier) ~default:"", value
-        | _ -> "", value)
-      in
-      bind_many env (List.filter bindings ~f:(fun (name, _) -> not (String.is_empty name)))
-    | Function (_, name, _parameters, return_type, body) ->
-      let signature = Option.value_exn (lookup_function env (Option.value (snd name) ~default:"")) in
+    | Assign (annotation_opt, targets, values) -> validate_assignment env annotation_opt targets values
+    | Function (specifications, name, _parameters, return_type, body) ->
+      let signature = Option.value_exn (lookup_function env (identifier_name (Identifier name))) in
       let function_env = enter_scope env (FunctionScope signature.name) in
       let function_env = bind_many function_env signature.parameters in
       let function_env = bind function_env "return" (annotation return_type) in
-      ignore (analyze_statements function_env body);
+      let function_env = validate_specs function_env specifications in
+      ignore (validate_statements function_env body);
       env
     | IfElse (condition, first, alternatives, last) ->
-      ignore (infer env condition);
-      let env = analyze_statements env first in
-      let env = List.fold alternatives ~init:env ~f:(fun env (condition, body) -> ignore (infer env condition); analyze_statements env body) in
-      analyze_statements env last
+      validate_exp env condition;
+      let env = validate_statements env first in
+      let env = List.fold alternatives ~init:env ~f:(fun env (condition, body) -> validate_exp env condition; validate_statements env body) in
+      validate_statements env last
     | While (specifications, condition, body) ->
-      List.iter specifications ~f:(fun specification -> ignore (infer_spec env specification));
-      ignore (infer env condition);
-      analyze_statements env body
-    | For (specifications, identifiers, iterable, body) ->
-      List.iter specifications ~f:(fun specification -> ignore (infer_spec env specification));
-      let element = match generic_arguments (infer env iterable) with | element :: _ -> element | [] -> TIdent def_seg in
-      let loop_env = enter_scope env ComprehensionScope in
-      let loop_env = bind_many loop_env (List.map identifiers ~f:(fun identifier -> Option.value (snd identifier) ~default:"", element)) in
-      ignore (analyze_statements loop_env body);
+      let env = validate_loop_specs env specifications in
+      validate_exp env condition;
+      ignore (validate_statements env body);
       env
-    | Assert value | Exp value | Return value -> ignore (infer env value); env
+    | For (specifications, identifiers, iterable, body) ->
+      let env = validate_loop_specs env specifications in
+      validate_exp env iterable;
+      begin
+        match collection_kind (infer env iterable) with
+        | SetCollection ->
+          require (Option.is_some (collection_element_type (infer env iterable)))
+            "set iteration requires a concrete element type";
+          require (List.length identifiers = 1) "set/map iteration requires one loop target"
+        | MapCollection ->
+          require (Option.is_some (map_types (infer env iterable)))
+            "map iteration requires concrete key and value types";
+          require (List.length identifiers = 1) "set/map iteration requires one loop target"
+        | ListCollection | SequenceCollection -> ()
+        | UnknownCollection -> raise (SemanticError "for loop iterable requires a known type")
+        | ArrayCollection | TupleCollection | StringCollection | NonCollection ->
+          raise (SemanticError "for loop iterable is not supported")
+      end;
+      let element =
+        match collection_kind (infer env iterable), collection_arguments (infer env iterable) with
+        | MapCollection, key :: _ -> key
+        | _, element :: _ -> element
+        | _ -> TIdent def_seg
+      in
+      let loop_env = enter_scope env ComprehensionScope in
+      let loop_env = match identifiers with
+        | [ identifier ] -> bind loop_env (identifier_name (Identifier identifier)) element
+        | _ -> loop_env
+      in
+      ignore (validate_statements loop_env body);
+      env
+    | Return value | Assert value | Exp value -> validate_exp env value; env
     | Break | Continue | Pass -> env)
-
-and infer_spec env = function
-  | Pre value | Post value | Invariant value | Decreases value | Reads value | Modifies value -> infer env value
 
 let analyze (Program statements) =
   match normalize_program (Program statements) with
   | Program statements ->
     let env = collect_functions empty statements in
-    analyze_statements env statements
+    validate_statements env statements
