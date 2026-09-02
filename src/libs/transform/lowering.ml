@@ -549,7 +549,8 @@ and lower_for context specifications identifiers iterable body =
       match kind, iterable with
       | Sem.ListCollection, Py.Identifier source
         when not (String.equal (Option.value (snd source) ~default:"") target_name) ->
-        Option.value (snd source) ~default:"" :: context.iterated_lists
+        Sem.list_aliases_for context.environment (Option.value (snd source) ~default:"")
+        @ context.iterated_lists
       | _ -> context.iterated_lists
     in
     { context with
@@ -630,7 +631,9 @@ and lower_for context specifications identifiers iterable body =
   | Sem.SetCollection ->
     lowered_iterable.prelude @ [ snapshot_binding ] @ lower_value_loop snapshot_expression
   | Sem.MapCollection ->
-    fail "map iteration is unsupported because Dafny maps do not preserve Python insertion order"
+    lowered_iterable.prelude
+    @ [ snapshot_binding ]
+    @ lower_value_loop (D.DMapKeys snapshot_expression)
   | _ -> fail "for loop iterable is not a supported collection"
 
 and lower context expression =
@@ -798,10 +801,10 @@ and lower_map_assignment context map key value =
     | Sem.MapCollection -> ()
     | _ -> raise (LoweringError "indexed assignment target is not a map")
   end;
-  let lowered_key = lower context key in
   let lowered_value = lower context value in
-  lowered_key.prelude
-  @ lowered_value.prelude
+  let lowered_key = lower context key in
+  lowered_value.prelude
+  @ lowered_key.prelude
   @ [ D.DAssignLvalue
         ( None
         , [ D.Local map ]

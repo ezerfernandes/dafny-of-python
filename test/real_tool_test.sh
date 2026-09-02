@@ -90,6 +90,9 @@ def tail(xs: list[int]) -> list[int]:
 def tail_caller(xs: list[int]) -> list[int]:
   return tail(xs)
 
+def mutate(xs: list[int]) -> None:
+  xs.append(2)
+
 def increment(x: int) -> int:
   return x + 1
 
@@ -135,6 +138,7 @@ other_values: set[int] = {2, 3}
 empty_values: set[int] = set()
 from_list: set[int] = set([1, 2])
 assert len(empty_values) == 0
+assert empty_values == set()
 union: set[int] = values | other_values
 intersection: set[int] = union & other_values
 difference: set[int] = union - other_values
@@ -145,9 +149,14 @@ assert 1 in difference
 mapping: dict[int, int] = {1: 10, 1: 11}
 empty_mapping: dict[int, int] = dict()
 assert len(empty_mapping) == 0
+assert empty_mapping == dict()
 assert mapping[1] == 11
 mapping[1] = 12
 assert mapping[1] == 12
+
+key = 1
+if key in mapping:
+  assert mapping[key] == 12
 
 # pre key in mapping
 def lookup(mapping: dict[int, int], key: int) -> int:
@@ -158,10 +167,14 @@ assert lookup(mapping, 1) == 12
 for item in values:
   assert item in values
 
+for key in mapping:
+  assert mapping[key] == mapping[key]
+
 loop_items: list[int] = [1]
 for loop_item in loop_items:
   continue
 
+mutate(loop_items)
 PYTHON
 
 set +e
@@ -182,12 +195,14 @@ grep -q 'function first' "$workdir/valid_output"
 grep -q 'method tail' "$workdir/valid_output"
 grep -q 'method tail_caller' "$workdir/valid_output"
 grep -q 'rangeLower' "$workdir/valid_output"
+grep -q 'method mutate' "$workdir/valid_output"
 grep -q 'function increment' "$workdir/valid_output"
 grep -q 'method method_form' "$workdir/valid_output"
 grep -q 'function ordered' "$workdir/valid_output"
 grep -q 'if ' "$workdir/valid_output"
 grep -q 'set<int>' "$workdir/valid_output"
 grep -q 'map<int, int>' "$workdir/valid_output"
+grep -q '\.Keys' "$workdir/valid_output"
 grep -q 'setFromSeq' "$workdir/valid_output"
 grep -q ':|' "$workdir/valid_output"
 grep -q '.contains' "$workdir/valid_output"
@@ -239,6 +254,14 @@ def invalid_list_iteration(xs: list[int]) -> None:
 PY
 run_rejected_program list_iteration_mutation.py 'mutating list while iterating it is unsupported'
 
+cat > "$workdir/list_alias_mutation.py" <<'PY'
+def invalid_list_alias(xs: list[int]) -> None:
+  ys = xs
+  for item in xs:
+    ys.append(item)
+PY
+run_rejected_program list_alias_mutation.py 'mutating list while iterating it is unsupported'
+
 # List objects are functional in the runtime and do not have an index setter.
 cat > "$workdir/list_assignment.py" <<'PYTHON'
 def invalid_assignment(xs: list[int]) -> None:
@@ -255,12 +278,3 @@ def invalid_loop() -> None:
     pass
 PYTHON
 run_rejected_program loop_spec.py 'loop specifications support only invariant and decreases'
-
-# Dafny maps are unordered, so map iteration cannot preserve Python's
-# insertion-order semantics.
-cat > "$workdir/map_iteration.py" <<'PYTHON'
-mapping: dict[int, int] = {1: 1}
-for key in mapping:
-  assert key in mapping
-PYTHON
-run_rejected_program map_iteration.py 'map iteration is unsupported because Dafny maps do not preserve Python insertion order'

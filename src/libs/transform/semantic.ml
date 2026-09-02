@@ -45,6 +45,7 @@ type environment =
   ; memberships : (string * string) list
   ; known_map_keys : (string * string list) list
   ; map_aliases : string list
+  ; list_aliases : (string * string) list
   ; iterated_lists : string list
   }
 
@@ -55,6 +56,7 @@ let empty =
   ; memberships = []
   ; known_map_keys = []
   ; map_aliases = []
+  ; list_aliases = []
   ; iterated_lists = []
   }
 
@@ -261,6 +263,20 @@ let identifier_name = function
   | Identifier segment -> Option.value (snd segment) ~default:""
   | _ -> ""
 
+let list_alias_root env name =
+  Option.value (List.Assoc.find env.list_aliases name ~equal:String.equal) ~default:name
+
+let list_aliases_for env name =
+  let root = list_alias_root env name in
+  let names =
+    List.fold env.list_aliases ~init:[ root ] ~f:(fun names (alias, alias_root) ->
+      if String.equal alias_root root
+         && not (List.exists names ~f:(String.equal alias))
+      then alias :: names
+      else names)
+  in
+  List.rev names
+
 let literal_key = function
   | Literal (IntLit value) -> Some ("int:" ^ value)
   | Literal (FloatLit value) -> Some ("float:" ^ value)
@@ -327,6 +343,9 @@ let bind env name typ =
       scopes = { scope with bindings } :: rest
     ; known_map_keys = List.Assoc.remove env.known_map_keys name ~equal:String.equal
     ; map_aliases = List.filter env.map_aliases ~f:(fun old -> not (String.equal old name))
+    ; list_aliases =
+        List.filter env.list_aliases ~f:(fun (alias, source) ->
+          not (String.equal alias name || String.equal source name))
     ; iterated_lists = List.filter env.iterated_lists ~f:(fun old -> not (String.equal old name))
     }
 
@@ -342,7 +361,12 @@ let bind_value env name typ value =
   in
   let env = set_map_keys env name keys in
   match value, collection_kind typ with
-  | Identifier _, MapCollection -> { env with map_aliases = name :: env.map_aliases }
+  | Identifier _, MapCollection ->
+    { env with map_aliases = name :: env.map_aliases }
+  | Identifier source, ListCollection
+    when not (String.equal name (identifier_name (Identifier source))) ->
+    let source = list_alias_root env (identifier_name value) in
+    { env with list_aliases = (name, source) :: env.list_aliases }
   | _ -> env
 
 let add_map_key env name key =
@@ -801,13 +825,20 @@ let validate_map_lookup env value key =
 let validate_equality left_type right_type =
   match collection_kind left_type, collection_kind right_type with
   | SetCollection, SetCollection ->
-    require_set_elements left_type right_type "set equality operands have incompatible element types"
+    begin
+      match collection_element_type left_type, collection_element_type right_type with
+      | Some left, Some right ->
+        require_compatible left right "set equality operands have incompatible element types"
+      | Some _, None | None, Some _ -> ()
+      | None, None -> fail "set equality requires concrete element types"
+    end
   | MapCollection, MapCollection ->
     begin
       match map_types left_type, map_types right_type with
       | Some (left_key, left_value), Some (right_key, right_value) ->
         require_compatible left_key right_key "map equality keys have incompatible types";
         require_compatible left_value right_value "map equality values have incompatible types"
+      | Some _, None | None, Some _ -> ()
       | _ -> fail "map equality requires concrete key and value types"
     end
   | (SetCollection | MapCollection), _ | _, (SetCollection | MapCollection) ->
@@ -1066,8 +1097,12 @@ and validate_statements env statements =
       env
     | IfElse (condition, first, alternatives, last) ->
       validate_exp env condition;
-      let env = validate_statements env first in
-      let env = List.fold alternatives ~init:env ~f:(fun env (condition, body) -> validate_exp env condition; validate_statements env body) in
+      let env = validate_statements (assume_membership env condition) first in
+      let env =
+        List.fold alternatives ~init:env ~f:(fun env (condition, body) ->
+          validate_exp env condition;
+          validate_statements (assume_membership env condition) body)
+      in
       validate_statements env last
     | While (specifications, condition, body) ->
       let env = validate_loop_specs env specifications in
@@ -1086,8 +1121,7 @@ and validate_statements env statements =
         | MapCollection ->
           require (Option.is_some (map_types (infer env iterable)))
             "map iteration requires concrete key and value types";
-          raise (SemanticError
-                   "map iteration is unsupported because Dafny maps do not preserve Python insertion order")
+          require (List.length identifiers = 1) "set/map iteration requires one loop target"
         | ListCollection | SequenceCollection ->
           require (List.length identifiers = 1)
             "list/sequence iteration requires one loop target"
@@ -1105,7 +1139,12 @@ and validate_statements env statements =
       let loop_env =
         match collection_kind (infer env iterable), iterable with
         | ListCollection, Identifier source ->
-          { loop_env with iterated_lists = identifier_name (Identifier source) :: loop_env.iterated_lists }
+          { loop_env with
+            iterated_lists = list_aliases_for env (identifier_name (Identifier source))
+                             @ loop_env.iterated_lists }
+        | MapCollection, Identifier source ->
+          add_membership loop_env (identifier_name (Identifier identifier))
+            (identifier_name (Identifier source))
         | _ -> loop_env
       in
       let loop_env = bind loop_env (identifier_name (Identifier identifier)) element in

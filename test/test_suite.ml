@@ -26,10 +26,10 @@ let test_dafny4_function_syntax () =
   let method_program =
     Ast.Program
       (parse_program
-         "def method_form(x: int) -> int:\n  y = x + 1\n  return y\n\n# pre len(xs) > 1\ndef tail(xs: list[int]) -> list[int]:\n  return xs[1:]\n\ndef tail_caller(xs: list[int]) -> list[int]:\n  return tail(xs)\n\ndef caller() -> int:\n  return method_form(1)\n")
+         "def method_form(x: int) -> int:\n  y = x + 1\n  return y\n\n# pre len(xs) > 1\ndef tail(xs: list[int]) -> list[int]:\n  return xs[1:]\n\ndef tail_caller(xs: list[int]) -> list[int]:\n  return tail(xs)\n\ndef mutate(xs: list[int]) -> None:\n  xs.append(2)\n\ndef caller() -> int:\n  return method_form(1)\n")
   in
-  let method_source, _ =
-    Transform.Emitdfy.print_prog_with_sourcemap (Transform.Todafnyast.prog_dfy method_program)
+  let method_ast = Transform.Todafnyast.prog_dfy method_program in
+  let method_source, _ = Transform.Emitdfy.print_prog_with_sourcemap method_ast
   in
   check bool "lowered multi-statement functions are methods" true
     (has_substring method_source "method method_form");
@@ -39,6 +39,27 @@ let test_dafny4_function_syntax () =
     (has_substring method_source "method tail_caller");
   check bool "list slices call the runtime method" true
     (has_substring method_source "rangeLower");
+  check bool "methods forwarding list arguments carry a frame" true
+    (match method_ast with
+     | D.DProg (_, declarations) ->
+       List.exists
+         (function
+          | D.DMeth (specifications, (_, Some "tail_caller"), _, _, _, _) ->
+            List.exists
+              (function
+               | D.DModifies (D.DIdentifier (_, Some "xs")) -> true
+               | _ -> false)
+              specifications
+          | _ -> false)
+         declarations);
+  check bool "None expression-only functions emit statements" true
+    (match method_ast with
+     | D.DProg (_, declarations) ->
+       List.exists
+         (function
+          | D.DMeth (_, (_, Some "mutate"), _, _, [ D.DVoid ], Some [ D.DCallStmt _ ]) -> true
+          | _ -> false)
+         declarations);
   check bool "callers use the synchronized method signature" true
     (has_substring method_source "method caller");
   check bool "method calls are hoisted out of caller expressions" true
@@ -832,7 +853,7 @@ let test_semantic_lowering_paths () =
   List.iter
     (fun name -> ignore (Transform.Semantic.normalize_type (TIdent (segment name))))
     [ "list"; "seq"; "sequence"; "set"; "dict"; "map"; "tuple"; "array" ];
-  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; iterated_lists = [] } "ignored" int_type);
+  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; iterated_lists = [] } "ignored" int_type);
   ignore (Transform.Semantic.annotation (Typ int_type));
   ignore (Transform.Semantic.annotation (Identifier (segment "Alias")));
   ignore (Transform.Semantic.annotation (Literal TrueLit));
@@ -1046,7 +1067,7 @@ let test_semantic_lowering_paths () =
   ignore (Transform.Semantic.lookup_function environment "missing");
   ignore (Transform.Semantic.lookup_class environment "Missing");
   ignore (Transform.Semantic.leave_scope (Transform.Semantic.enter_scope environment Transform.Semantic.ComprehensionScope));
-  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; iterated_lists = [] });
+  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; iterated_lists = [] });
   let replacement : Transform.Semantic.callable_signature =
     { name = "pure"; parameters = []; return_type = int_type; kind = Transform.Semantic.Constructor }
   in
@@ -1806,6 +1827,24 @@ let test_phase3_collections () =
    | [ D.DAssignLvalue (_, [ D.Local (_, Some "mapping") ],
                        [ D.DMapUpdate (D.DIdentifier (_, Some "mapping"), D.DIntLit "1", D.DStringLit "updated") ]) ] -> ()
    | _ -> fail "map assignment should lower to a functional update");
+  let effectful_map_update =
+    Transform.Lowering.statements ~environment:env
+      [ Assign
+          ( None
+          , [ Subscript (mapping, Index (Call (Dot (list, segment "pop"), []))) ]
+          , [ Call (Dot (list, segment "pop"), []) ] ) ]
+  in
+  check bool "map updates evaluate values before keys" true
+    (match effectful_map_update with
+     | [ D.DAssignLvalue (_, [ D.Local (_, Some "lowered_1") ], [_])
+       ; D.DAssignLvalue (_, [ D.Local (_, Some "lowered_2") ], [_])
+       ; D.DAssignLvalue
+           (_, [ D.Local (_, Some "mapping") ],
+            [ D.DMapUpdate
+                ( D.DIdentifier (_, Some "mapping")
+                , D.DIdentifier (_, Some "lowered_2")
+                , D.DIdentifier (_, Some "lowered_1") ) ]) ] -> true
+     | _ -> false);
   let ordinary_binary = lower (BinaryExp (list, Plus def_seg, list)) in
   check bool "non-set binary operations keep their original operator" true
     (match ordinary_binary.result with D.DBinary (_, D.DPlus _, _) -> true | _ -> false);
@@ -1867,11 +1906,9 @@ let test_phase3_collections () =
       [ For ([], [ segment "item" ], values, [ Assert (BinaryExp (identifier "item", In def_seg, values)) ]) ]
   in
   let map_loop =
-    expect_exception "map iteration lowering is rejected"
-      (function Transform.Lowering.LoweringError message -> has_substring message "insertion order" | _ -> false)
-      (fun () -> Transform.Lowering.statements ~environment:env
-                   [ For ([], [ segment "key" ], mapping
-                        , [ Assert (BinaryExp (identifier "key", In def_seg, mapping)) ]) ])
+    Transform.Lowering.statements ~environment:env
+      [ For ([], [ segment "key" ], mapping
+           , [ Assert (BinaryExp (identifier "key", In def_seg, mapping)) ]) ]
   in
   let indexed_loop_specs =
     [ Invariant (Literal TrueLit); Decreases (Literal (IntLit "1")) ]
@@ -1890,7 +1927,11 @@ let test_phase3_collections () =
       | _ -> false) statements
   in
   check bool "set loops choose from a remaining set" true (has_choose set_loop);
-  ignore map_loop;
+  check bool "map loops choose from a snapshot of keys" true (has_choose map_loop);
+  check bool "map loops snapshot their key set" true
+    (List.exists
+       (fun statement -> has_substring (Transform.Emitdfy.print_stmt 0 statement) ".Keys")
+       map_loop);
   check bool "list loops use indexed lowering" true
     (has_substring (Transform.Emitdfy.print_stmt 0 (List.hd list_loop)) "lowered_");
   check bool "sequence loops use indexed lowering" true
@@ -1912,6 +1953,17 @@ let test_phase3_collections () =
     (fun () -> ignore (Transform.Lowering.statements ~environment:env
                          [ For ([], [ segment "item" ], list
                               , [ Exp (Call (Dot (list, segment "append"),
+                                             [ Literal (IntLit "3") ])) ]) ]));
+  let list_alias = identifier "list_alias" in
+  let list_alias_env =
+    Transform.Semantic.validate_statements env
+      [ Assign (None, [ list_alias ], [ list ]) ]
+  in
+  expect_exception "list aliases are protected during iteration"
+    (function Transform.Lowering.LoweringError message -> has_substring message "while iterating" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.statements ~environment:list_alias_env
+                         [ For ([], [ segment "item" ], list
+                              , [ Exp (Call (Dot (list_alias, segment "append"),
                                              [ Literal (IntLit "3") ])) ]) ]));
   List.iter
     (fun specification ->
@@ -1951,10 +2003,10 @@ let test_phase3_collections () =
        [ For ([], [ segment "item" ], list, [ Pass ])
        ; For ([], [ segment "item" ], sequence, [ Pass ])
        ]);
-  expect_exception "map iteration is rejected semantically"
-    (function Transform.Semantic.SemanticError message -> has_substring message "insertion order" | _ -> false)
-    (fun () -> ignore (Transform.Semantic.validate_statements env
-                         [ For ([], [ segment "key" ], mapping, [ Pass ]) ]));
+  ignore
+    (Transform.Semantic.validate_statements env
+       [ For ([], [ segment "key" ], mapping
+            , [ Assert (Subscript (mapping, Index (identifier "key"))) ]) ]);
   expect_exception "multi-target list iteration is rejected semantically"
     (function Transform.Semantic.SemanticError message -> has_substring message "one loop target" | _ -> false)
     (fun () -> ignore (Transform.Semantic.validate_statements env
@@ -1967,6 +2019,12 @@ let test_phase3_collections () =
     (fun () -> ignore (Transform.Semantic.validate_statements env
                          [ For ([], [ segment "item" ], list
                               , [ Exp (Call (Dot (list, segment "append"),
+                                             [ Literal (IntLit "3") ])) ]) ]));
+  expect_exception "list aliases are rejected semantically during iteration"
+    (function Transform.Semantic.SemanticError message -> has_substring message "while iterating" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements list_alias_env
+                         [ For ([], [ segment "item" ], list
+                              , [ Exp (Call (Dot (list_alias, segment "append"),
                                              [ Literal (IntLit "3") ])) ]) ]));
   let untyped_list_env =
     Transform.Semantic.bind Transform.Semantic.empty "untyped_list"
@@ -2083,6 +2141,16 @@ let test_phase3_collections () =
   ignore
     (Transform.Semantic.assume_membership env
        (CompareChain (identifier "key", [ (In def_seg, mapping) ])));
+  let unrelated_list_aliases =
+    { env with list_aliases = [ ("other", "different") ] }
+  in
+  check (Alcotest.list Alcotest.string) "unrelated list aliases are excluded" [ "list" ]
+    (Transform.Semantic.list_aliases_for unrelated_list_aliases "list");
+  let aliases_to_rebind =
+    { env with list_aliases = [ ("alias", "source"); ("other", "target") ] }
+  in
+  ignore (Transform.Semantic.bind aliases_to_rebind "alias" list_type);
+  ignore (Transform.Semantic.bind aliases_to_rebind "source" list_type);
   ignore (Transform.Semantic.known_literal_key env known_map (identifier "dynamic"));
   ignore (Transform.Semantic.add_membership env "" "");
   ignore (Transform.Semantic.add_map_key env "mapping" values);
@@ -2160,7 +2228,15 @@ let test_phase3_collections () =
   expect_exception "incomplete map equality"
     (function Transform.Semantic.SemanticError _ -> true | _ -> false)
     (fun () -> ignore (Transform.Semantic.validate_equality
-                         (TGeneric (segment "map", [])) map_type));
+                         (TGeneric (segment "map", [])) (TGeneric (segment "map", []))));
+  expect_exception "incomplete set equality"
+    (function Transform.Semantic.SemanticError _ -> true | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_equality
+                         (TGeneric (segment "set", [])) (TGeneric (segment "set", []))));
+  ignore (Transform.Semantic.validate_equality
+            (TGeneric (segment "map", [])) map_type);
+  ignore (Transform.Semantic.validate_equality
+            (TGeneric (segment "set", [])) set_type);
   let incomplete_map_env =
     Transform.Semantic.bind Transform.Semantic.empty "incomplete_map"
       (TGeneric (segment "map", []))
@@ -2192,6 +2268,10 @@ let test_phase3_collections () =
          (fun () -> ignore (Transform.Semantic.validate_equality left right)))
     [ set_type, int_type; int_type, set_type; map_type, int_type; int_type, map_type ];
   semantic_error "map lookup needs a proof" (Subscript (mapping, Index (Literal (IntLit "1"))));
+  ignore (Transform.Semantic.validate_exp env
+            (BinaryExp (values, EqEq def_seg, Call (identifier "set", []))));
+  ignore (Transform.Semantic.validate_exp env
+            (BinaryExp (mapping, EqEq def_seg, Call (identifier "dict", []))));
   semantic_error "map lookup key type" (Subscript (mapping, Index (Literal TrueLit)));
   semantic_error "set constructor arity" (Call (identifier "set", [ list; sequence ]));
   semantic_error "set constructor source" (Call (identifier "set", [ Literal (IntLit "1") ]));
@@ -2295,6 +2375,98 @@ let test_generics_paths () =
 
 let test_todafnyast_paths () =
   let open Ast in
+  let mutation =
+    Call (Dot (Identifier (segment "xs"), segment "append"), [ Literal (IntLit "1") ])
+  in
+  let other_call = Call (Dot (Identifier (segment "other"), segment "copy"), []) in
+  let pure = Identifier (segment "value") in
+  let check_modifies name expression =
+    check bool name true (Transform.Todafnyast.expression_modifies [ "xs" ] expression)
+  in
+  let check_not_modifies name expression =
+    check bool name false (Transform.Todafnyast.expression_modifies [ "xs" ] expression)
+  in
+  check_modifies "direct list mutation" mutation;
+  check_not_modifies "non-mutating method call" other_call;
+  check_not_modifies "non-mutating list method call"
+    (Call (Dot (Identifier (segment "xs"), segment "copy"), []));
+  check_modifies "nested call argument" (Call (pure, [ mutation ]));
+  check_modifies "nested call callee" (Call (other_call, [ mutation ]));
+  check_modifies "modifying generic callee"
+    (Call (Call (pure, [ mutation ]), []));
+  check bool "method call with a non-identifier argument is not inferred to modify" false
+    (Transform.Todafnyast.expression_modifies ~method_names:[ "method" ] [ "xs" ]
+       (Call (Identifier (segment "method"), [ Literal (IntLit "1") ])));
+  check_modifies "nested dot expression" (Dot (mutation, segment "field"));
+  check_modifies "binary expression left" (BinaryExp (mutation, Plus def_seg, pure));
+  check_modifies "binary expression right" (BinaryExp (pure, Plus def_seg, mutation));
+  check_modifies "comparison chain first" (CompareChain (mutation, []));
+  check_modifies "comparison chain operand"
+    (CompareChain (pure, [ (EqEq def_seg, pure); (EqEq def_seg, mutation) ]));
+  check_modifies "unary expression" (UnaryExp (Not def_seg, mutation));
+  check_modifies "list expression" (Lst [ mutation ]);
+  check_modifies "array expression" (Array [ mutation ]);
+  check_modifies "set expression" (Set [ mutation ]);
+  check_modifies "tuple expression" (Tuple [ mutation ]);
+  check_modifies "dictionary expression" (Dict [ (pure, mutation) ]);
+  check_modifies "dictionary key" (Dict [ (mutation, pure) ]);
+  check_modifies "singleton tuple expression" (SingletonTuple (segment ",", mutation));
+  check_modifies "index expression" (Index mutation);
+  check_modifies "subscript value" (Subscript (mutation, Index pure));
+  check_modifies "subscript selector" (Subscript (pure, Index mutation));
+  check_modifies "slice lower bound" (Slice (Some mutation, Some pure));
+  check_modifies "slice upper bound" (Slice (Some pure, Some mutation));
+  check_modifies "forall expression" (Forall ([ segment "item" ], mutation));
+  check_modifies "exists expression" (Exists ([ segment "item" ], mutation));
+  check_modifies "lambda expression" (Lambda ([ segment "item" ], mutation));
+  check_modifies "length expression" (Len (def_seg, mutation));
+  check_modifies "max expression" (Max (def_seg, mutation));
+  check_modifies "old expression" (Old (def_seg, mutation));
+  check_modifies "fresh expression" (Fresh (def_seg, mutation));
+  check_modifies "conditional true expression"
+    (IfElseExp (mutation, pure, pure));
+  check_modifies "conditional condition expression"
+    (IfElseExp (pure, mutation, pure));
+  check_modifies "conditional false expression"
+    (IfElseExp (pure, pure, mutation));
+  check_not_modifies "type expression" (Typ (TInt def_seg));
+  check_not_modifies "literal expression" (Literal TrueLit);
+  check_not_modifies "identifier expression" pure;
+  let check_statement name statement =
+    check bool name true (Transform.Todafnyast.statement_modifies [ "xs" ] statement)
+  in
+  check_statement "assignment mutation"
+    (Assign (None, [ pure ], [ mutation ]));
+  check_statement "assignment target mutation"
+    (Assign (None, [ mutation ], [ pure ]));
+  check_statement "if condition mutation"
+    (IfElse (mutation, [ Pass ], [], [ Pass ]));
+  check_statement "if first branch mutation"
+    (IfElse (pure, [ Exp mutation ], [], [ Pass ]));
+  check_statement "if alternative condition mutation"
+    (IfElse (pure, [ Pass ], [ (mutation, [ Pass ]) ], [ Pass ]));
+  check_statement "if alternative mutation"
+    (IfElse (pure, [ Pass ], [ (pure, [ Exp mutation ]) ], [ Pass ]));
+  check_statement "if final mutation"
+    (IfElse (pure, [ Pass ], [ (pure, [ Pass ]) ], [ Exp mutation ]));
+  check_statement "while mutation"
+    (While ([], pure, [ Exp mutation ]));
+  check_statement "while condition mutation"
+    (While ([], mutation, [ Pass ]));
+  check_statement "for mutation"
+    (For ([], [ segment "item" ], pure, [ Exp mutation ]));
+  check_statement "for iterable mutation"
+    (For ([], [ segment "item" ], mutation, [ Pass ]));
+  check_statement "nested function mutation"
+    (Function ([], segment "nested", [], Typ (TNone def_seg), [ Exp mutation ]));
+  check_statement "return mutation" (Return mutation);
+  check_statement "assert mutation" (Assert mutation);
+  check_statement "expression mutation" (Exp mutation);
+  List.iter
+    (fun statement ->
+       check bool "non-mutating control statement" false
+         (Transform.Todafnyast.statement_modifies [ "xs" ] statement))
+    [ Break; Continue; Pass ];
   let int_typ = TInt def_seg in
   let id_typ = TIdent (segment "Alias") in
   let all_types =

@@ -251,15 +251,117 @@ let semantic_params parameters =
   List.map parameters ~f:(fun (identifier, value) ->
     ident_dfy identifier, Lowering.type_dfy (Semantic.annotation value))
 
+let rec expression_modifies ?(method_names = []) names = function
+  | Call (Dot (Identifier receiver, method_name), arguments) ->
+    let receiver_name = Option.value (snd receiver) ~default:"" in
+    if List.exists names ~f:(String.equal receiver_name)
+       && Semantic.is_list_mutating_method (Option.value (snd method_name) ~default:"")
+    then true
+    else List.exists arguments ~f:(expression_modifies ~method_names names)
+  | Call (callee, arguments) ->
+    let callee_modifies = expression_modifies ~method_names names callee in
+    let passes_list_to_method =
+      match callee with
+      | Identifier identifier ->
+        List.mem method_names (Option.value (snd identifier) ~default:"")
+          ~equal:String.equal
+        && List.exists arguments ~f:(function
+             | Identifier argument ->
+               List.exists names ~f:(String.equal (Option.value (snd argument) ~default:""))
+             | _ -> false)
+      | _ -> false
+    in
+    begin
+      match callee_modifies || passes_list_to_method with
+      | true -> true
+      | false -> List.exists arguments ~f:(expression_modifies ~method_names names)
+    end
+  | Dot (value, _) -> expression_modifies ~method_names names value
+  | BinaryExp (left, _, right) ->
+    expression_modifies ~method_names names left || expression_modifies ~method_names names right
+  | CompareChain (first, comparisons) ->
+    expression_modifies ~method_names names first
+    || List.exists comparisons ~f:(fun (_, operand) -> expression_modifies ~method_names names operand)
+  | UnaryExp (_, value) -> expression_modifies ~method_names names value
+  | Lst elements | Array elements | Set elements | Tuple elements ->
+    List.exists elements ~f:(expression_modifies ~method_names names)
+  | Dict entries ->
+    List.exists entries ~f:(fun (key, value) ->
+      expression_modifies ~method_names names key
+      || expression_modifies ~method_names names value)
+  | SingletonTuple (_, value) | Index value -> expression_modifies ~method_names names value
+  | Subscript (value, selector) ->
+    expression_modifies ~method_names names value
+    || expression_modifies ~method_names names selector
+  | Slice (lower, upper) ->
+    Option.exists lower ~f:(expression_modifies ~method_names names)
+    || Option.exists upper ~f:(expression_modifies ~method_names names)
+  | Forall (_, body) | Exists (_, body) | Lambda (_, body) ->
+    expression_modifies ~method_names names body
+  | Len (_, value) | Max (_, value) | Old (_, value) | Fresh (_, value) ->
+    expression_modifies ~method_names names value
+  | IfElseExp (when_true, condition, when_false) ->
+    expression_modifies ~method_names names when_true
+    || expression_modifies ~method_names names condition
+    || expression_modifies ~method_names names when_false
+  | Typ _ | Literal _ | Identifier _ -> false
+
+let rec statement_modifies ?(method_names = []) names = function
+  | Assign (_, targets, values) ->
+    List.exists targets ~f:(expression_modifies ~method_names names)
+    || List.exists values ~f:(expression_modifies ~method_names names)
+  | IfElse (condition, first, alternatives, last) ->
+    expression_modifies ~method_names names condition
+    || List.exists first ~f:(statement_modifies ~method_names names)
+    || List.exists alternatives ~f:(fun (condition, body) ->
+         expression_modifies ~method_names names condition
+         || List.exists body ~f:(statement_modifies ~method_names names))
+    || List.exists last ~f:(statement_modifies ~method_names names)
+  | While (_, condition, body) ->
+    expression_modifies ~method_names names condition
+    || List.exists body ~f:(statement_modifies ~method_names names)
+  | For (_, _, iterable, body) ->
+    expression_modifies ~method_names names iterable
+    || List.exists body ~f:(statement_modifies ~method_names names)
+  | Function (_, _, _, _, body) -> List.exists body ~f:(statement_modifies ~method_names names)
+  | Return value | Assert value | Exp value -> expression_modifies ~method_names names value
+  | Break | Continue | Pass -> false
+
 let semantic_function generics environment (speclst, name, parameters, return_type, body) =
   let function_environment = semantic_function_env environment name parameters return_type in
   let function_environment = Semantic.validate_specs function_environment speclst in
   let body_environment = Semantic.validate_statements function_environment body in
+  let list_parameters =
+    List.filter_map parameters ~f:(fun (identifier, annotation) ->
+      match Semantic.collection_kind (Semantic.annotation annotation) with
+      | Semantic.ListCollection -> Some (Option.value (snd identifier) ~default:"")
+      | _ -> None)
+  in
+  let method_names =
+    List.filter_map environment.functions ~f:(fun signature ->
+      match signature.kind with
+      | Semantic.Method -> Some signature.name
+      | _ -> None)
+  in
+  let list_modifies =
+    List.filter_map list_parameters ~f:(fun name ->
+      if List.exists body ~f:(statement_modifies ~method_names [ name ]) then
+        Some (DModifies (DIdentifier (def_pos, Some name)))
+      else None)
+  in
   let parameters = semantic_params parameters in
   let specifications = semantic_specs function_environment speclst in
   let return_typ = Semantic.annotation return_type in
   let return_type = Lowering.type_dfy return_typ in
   match body with
+  | [ Exp _ ] when (match Semantic.normalize_type return_typ with TNone _ -> true | _ -> false) ->
+    DMeth
+      (specifications @ list_modifies, name, generics, parameters, [ return_type ],
+       Some
+         (Lowering.statements
+            ~environment:body_environment
+            ~return_type:return_typ
+            body))
   | [ Return expression ] | [ Exp expression ] ->
     let lowered =
       Lowering.expression
@@ -278,12 +380,12 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
       DFuncMeth (specifications @ list_reads, name, generics, parameters, return_type, Some lowered.result)
     else
       DMeth
-        (specifications, name, generics, parameters, [ return_type ],
+        (specifications @ list_modifies, name, generics, parameters, [ return_type ],
          Some (lowered.prelude @ [ DReturn [ lowered.result ] ]))
   | [ Pass ] -> DFuncMeth (specifications, name, generics, parameters, return_type, None)
   | _ ->
       DMeth
-         (specifications, name, generics, parameters, [ return_type ],
+         (specifications @ list_modifies, name, generics, parameters, [ return_type ],
          Some
            (Lowering.statements
               ~environment:body_environment
