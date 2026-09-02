@@ -26,13 +26,19 @@ let test_dafny4_function_syntax () =
   let method_program =
     Ast.Program
       (parse_program
-         "def method_form(x: int) -> int:\n  y = x + 1\n  return y\n\ndef caller() -> int:\n  return method_form(1)\n")
+         "def method_form(x: int) -> int:\n  y = x + 1\n  return y\n\n# pre len(xs) > 1\ndef tail(xs: list[int]) -> list[int]:\n  return xs[1:]\n\ndef tail_caller(xs: list[int]) -> list[int]:\n  return tail(xs)\n\ndef caller() -> int:\n  return method_form(1)\n")
   in
   let method_source, _ =
     Transform.Emitdfy.print_prog_with_sourcemap (Transform.Todafnyast.prog_dfy method_program)
   in
   check bool "lowered multi-statement functions are methods" true
     (has_substring method_source "method method_form");
+  check bool "list-slice functions are methods" true
+    (has_substring method_source "method tail");
+  check bool "callers of list-slice methods are synchronized" true
+    (has_substring method_source "method tail_caller");
+  check bool "list slices call the runtime method" true
+    (has_substring method_source "rangeLower");
   check bool "callers use the synchronized method signature" true
     (has_substring method_source "method caller");
   check bool "method calls are hoisted out of caller expressions" true
@@ -826,7 +832,7 @@ let test_semantic_lowering_paths () =
   List.iter
     (fun name -> ignore (Transform.Semantic.normalize_type (TIdent (segment name))))
     [ "list"; "seq"; "sequence"; "set"; "dict"; "map"; "tuple"; "array" ];
-  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = [] } "ignored" int_type);
+  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; iterated_lists = [] } "ignored" int_type);
   ignore (Transform.Semantic.annotation (Typ int_type));
   ignore (Transform.Semantic.annotation (Identifier (segment "Alias")));
   ignore (Transform.Semantic.annotation (Literal TrueLit));
@@ -882,13 +888,39 @@ let test_semantic_lowering_paths () =
   let method_call = Call (Dot (xs, segment "method"), []) in
   let lowered_method = lower method_call in
   check int "ordinary method calls have one local prelude" 1 (List.length lowered_method.prelude);
-  let quantifier = lower (Forall ([ segment "k" ], method_call)) in
-  check int "quantifier calls do not escape their scope" 0 (List.length quantifier.prelude);
-  (match quantifier.result with
-   | D.DForall (_, D.DCallExpr _) -> ()
-   | _ -> fail "quantifier body should retain its method call");
-  let conditional = lower (IfElseExp (method_call, Literal TrueLit, method_call)) in
-  check int "conditional branches are not evaluated eagerly" 0 (List.length conditional.prelude);
+  expect_exception "method calls are rejected in quantifiers"
+    (function Transform.Lowering.LoweringError message -> has_substring message "scoped expressions" | _ -> false)
+    (fun () -> ignore (lower (Forall ([ segment "k" ], method_call))));
+  ignore (lower (Forall ([ segment "k" ], Call (identifier "unknown", []))));
+  expect_exception "method calls are rejected in conditional branches"
+    (function Transform.Lowering.LoweringError message -> has_substring message "scoped expressions" | _ -> false)
+    (fun () -> ignore (lower (IfElseExp (method_call, Literal TrueLit, method_call))));
+  let list_slice = lower (Subscript (xs, Slice (Some (Literal (IntLit "1")), None))) in
+  check bool "list slices are hoisted into eager temporaries" true
+    (match list_slice.prelude, list_slice.result with
+     | [ D.DAssignLvalue (_, [ D.Local _ ], [ D.DCallExpr (D.DDot (_, (_, Some "rangeLower")), _) ]) ], D.DIdentifier _ -> true
+     | _ -> false);
+  let control_flow_list_slice =
+    lower
+      (Subscript
+         (IfElseExp (xs, Literal TrueLit, xs),
+          Slice (Some (Literal (IntLit "1")), None)))
+  in
+  check bool "list slice control flow is propagated" true control_flow_list_slice.control_flow;
+  let control_flow_selector_list_slice =
+    lower
+      (Subscript
+         (xs,
+          Slice
+            (Some (IfElseExp (Literal (IntLit "1"), Literal (IntLit "1"), Literal (IntLit "2"))), None)))
+  in
+  check bool "list slice selector control flow is propagated" true
+    control_flow_selector_list_slice.control_flow;
+  expect_exception "list slices are rejected in scoped expressions"
+    (function Transform.Lowering.LoweringError message -> has_substring message "scoped expressions" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.lower
+                         (Transform.Lowering.scoped (Transform.Lowering.context environment))
+                         (Subscript (xs, Slice (Some (Literal (IntLit "1")), None)))));
   let nested_dictionary = lower (Dict [ Literal (StringLit "key"), method_call ]) in
   check int "nested method calls are not silently dropped" 1 (List.length nested_dictionary.prelude);
   let lowered_if_with_prelude =
@@ -1014,7 +1046,7 @@ let test_semantic_lowering_paths () =
   ignore (Transform.Semantic.lookup_function environment "missing");
   ignore (Transform.Semantic.lookup_class environment "Missing");
   ignore (Transform.Semantic.leave_scope (Transform.Semantic.enter_scope environment Transform.Semantic.ComprehensionScope));
-  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = [] });
+  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; iterated_lists = [] });
   let replacement : Transform.Semantic.callable_signature =
     { name = "pure"; parameters = []; return_type = int_type; kind = Transform.Semantic.Constructor }
   in
@@ -1347,6 +1379,12 @@ let test_phase2_semantics_and_chains () =
     (fun () -> ignore (Transform.Lowering.expression ~environment (CompareChain (identifier "first", []))));
   let method_call = Call (Dot (identifier "values", segment "method"), []) in
   let method_chain = CompareChain (method_call, [ Lt def_seg, Literal (IntLit "1") ]) in
+  expect_exception "effectful calls are rejected in scoped expressions"
+    (function Transform.Lowering.LoweringError message -> has_substring message "scoped expressions" | _ -> false)
+    (fun () ->
+       ignore
+         (Transform.Lowering.lower
+            (Transform.Lowering.scoped (Transform.Lowering.context environment)) method_call));
   expect_exception "effectful calls are rejected in comparison chains"
     (function Transform.Lowering.LoweringError message -> has_substring message "effectful" | _ -> false)
     (fun () -> ignore (Transform.Lowering.expression ~environment method_chain));
@@ -1394,15 +1432,28 @@ let test_phase2_semantics_and_chains () =
   expect_exception "effectful final chain operands are rejected"
     (function Transform.Lowering.LoweringError message -> has_substring message "effectful" | _ -> false)
     (fun () -> ignore (Transform.Lowering.expression ~environment method_in_final_operand));
-  ignore
-    (Transform.Lowering.expression ~environment
-       (IfElseExp (method_call, Literal TrueLit, Literal FalseLit)));
-  ignore
-    (Transform.Lowering.expression ~environment
-       (IfElseExp (Literal TrueLit, method_call, Literal FalseLit)));
-  ignore
-    (Transform.Lowering.expression ~environment
-       (IfElseExp (Literal TrueLit, Literal TrueLit, method_call)));
+  List.iter
+    (fun (name, expression) ->
+       expect_exception ("effectful conditional " ^ name ^ " is rejected")
+         (function Transform.Lowering.LoweringError message -> has_substring message "scoped expressions" | _ -> false)
+         (fun () -> ignore (Transform.Lowering.expression ~environment expression)))
+    [ "true branch", IfElseExp (method_call, Literal TrueLit, Literal FalseLit)
+    ; "false branch", IfElseExp (Literal TrueLit, Literal TrueLit, method_call) ];
+  let effectful_condition =
+    Transform.Lowering.expression ~environment
+      (IfElseExp (Literal TrueLit, method_call, Literal FalseLit))
+  in
+  check bool "effectful conditional conditions are hoisted" true
+    (match effectful_condition.prelude, effectful_condition.result with
+     | _ :: _, D.DIfElseExpr (D.DIdentifier _, _, _) -> true
+     | _ -> false);
+  List.iter
+    (fun operator ->
+       expect_exception "effectful short-circuit operands are rejected"
+         (function Transform.Lowering.LoweringError message -> has_substring message "scoped expressions" | _ -> false)
+         (fun () -> ignore (Transform.Lowering.expression ~environment
+                              (BinaryExp (Literal TrueLit, operator, method_call)))))
+    [ And def_seg; Or def_seg ];
   expect_exception "chain list setup is rejected in a scoped operand"
     (function Transform.Lowering.LoweringError message -> has_substring message "comparison-chain" | _ -> false)
     (fun () ->
@@ -1437,6 +1488,7 @@ let test_phase3_collections () =
   let values = identifier "values" in
   let mapping = identifier "mapping" in
   let list = identifier "list_value" in
+  let nested_lists = identifier "nested_lists" in
   let sequence = identifier "sequence" in
   let known_map = Dict [ Literal (IntLit "1"), Literal (StringLit "value") ] in
   let env =
@@ -1444,6 +1496,8 @@ let test_phase3_collections () =
     |> fun env -> Transform.Semantic.bind env "values" set_type
     |> fun env -> Transform.Semantic.bind env "mapping" map_type
     |> fun env -> Transform.Semantic.bind env "list_value" list_type
+    |> fun env -> Transform.Semantic.bind env "nested_lists"
+         (TGeneric (segment "list", [ list_type ]))
     |> fun env -> Transform.Semantic.bind env "sequence" sequence_type
     |> fun env -> Transform.Semantic.bind env "text" string_type
     |> fun env -> Transform.Semantic.bind env "array_value" (TGeneric (segment "array", [ int_type ]))
@@ -1577,6 +1631,8 @@ let test_phase3_collections () =
         (Subscript (identifier "holder", BinaryExp (Literal (IntLit "0"), Plus def_seg, Literal (IntLit "1"))))
     ; classification_function "returns_subscript_value_method"
         (Subscript (Lst [], Literal (IntLit "0")))
+    ; classification_function "returns_subscript_selector_method"
+        (Subscript (identifier "holder", Index (Lst [])))
     ; classification_function "returns_index" (Index (Literal (IntLit "0")))
     ; classification_function "returns_slice"
         (Slice (Some (Literal (IntLit "0")), Some (Literal (IntLit "1"))))
@@ -1611,6 +1667,7 @@ let test_phase3_collections () =
     (match Transform.Semantic.callable_kind classification_environment (identifier "calls_classified_method") with
      | Transform.Semantic.Method -> true
      | _ -> false);
+  ignore (Transform.Semantic.classify_functions Transform.Semantic.empty classification_program);
   expect_exception "incomplete set operation type"
     (function Transform.Semantic.SemanticError _ -> true | _ -> false)
     (fun () -> Transform.Semantic.require_set_elements
@@ -1850,6 +1907,12 @@ let test_phase3_collections () =
     (match List.rev list_continue_loop with
      | D.DWhile (_, _, [ D.DAssignLvalue _; D.DAssignLvalue _; D.DContinue ]) :: _ -> true
      | _ -> false);
+  expect_exception "list mutation during iteration is rejected by lowering"
+    (function Transform.Lowering.LoweringError message -> has_substring message "while iterating" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.statements ~environment:env
+                         [ For ([], [ segment "item" ], list
+                              , [ Exp (Call (Dot (list, segment "append"),
+                                             [ Literal (IntLit "3") ])) ]) ]));
   List.iter
     (fun specification ->
        expect_exception "invalid loop specifications are rejected"
@@ -1896,10 +1959,25 @@ let test_phase3_collections () =
     (function Transform.Semantic.SemanticError message -> has_substring message "one loop target" | _ -> false)
     (fun () -> ignore (Transform.Semantic.validate_statements env
                          [ For ([], [ segment "first"; segment "second" ], list, [ Pass ]) ]));
+  expect_exception "set constructor rejects unhashable source elements"
+    (function Transform.Semantic.SemanticError message -> has_substring message "hashable" | _ -> false)
+    (fun () -> Transform.Semantic.validate_exp env (Call (identifier "set", [ nested_lists ])));
+  expect_exception "list mutation during iteration is rejected semantically"
+    (function Transform.Semantic.SemanticError message -> has_substring message "while iterating" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ For ([], [ segment "item" ], list
+                              , [ Exp (Call (Dot (list, segment "append"),
+                                             [ Literal (IntLit "3") ])) ]) ]));
+  let untyped_list_env =
+    Transform.Semantic.bind Transform.Semantic.empty "untyped_list"
+      (TGeneric (segment "list", []))
+  in
+  expect_exception "set constructor requires a concrete source element type"
+    (function Transform.Semantic.SemanticError message -> has_substring message "concrete source" | _ -> false)
+    (fun () -> Transform.Semantic.validate_exp untyped_list_env
+                 (Call (identifier "set", [ identifier "untyped_list" ])));
   ignore
-    (Transform.Semantic.validate_statements
-       (Transform.Semantic.bind Transform.Semantic.empty "untyped_list"
-          (TGeneric (segment "list", [])))
+    (Transform.Semantic.validate_statements untyped_list_env
        [ For ([], [ segment "item" ], identifier "untyped_list", [ Pass ]) ]);
   let lookup_function =
     Function
@@ -2324,8 +2402,8 @@ let test_todafnyast_paths () =
     ]
   in
   List.iter (fun statement -> ignore (Transform.Todafnyast.stmt_dfy statement)) statements;
-  expect_exception "continue statement" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
-    (fun () -> Transform.Todafnyast.stmt_dfy Continue);
+  check bool "continue statement conversion" true
+    (match Transform.Todafnyast.stmt_dfy Continue with D.DContinue -> true | _ -> false);
   expect_exception "for statement" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)
     (fun () -> Transform.Todafnyast.stmt_dfy (For ([], [], x, [])));
   expect_exception "non-call expression statement" (function Transform.Todafnyast.ToDfyError _ -> true | _ -> false)

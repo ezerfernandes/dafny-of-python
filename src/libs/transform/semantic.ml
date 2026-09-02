@@ -45,6 +45,7 @@ type environment =
   ; memberships : (string * string) list
   ; known_map_keys : (string * string list) list
   ; map_aliases : string list
+  ; iterated_lists : string list
   }
 
 let empty =
@@ -54,6 +55,7 @@ let empty =
   ; memberships = []
   ; known_map_keys = []
   ; map_aliases = []
+  ; iterated_lists = []
   }
 
 let generic name args = TGeneric ((def_pos, Some name), args)
@@ -325,6 +327,7 @@ let bind env name typ =
       scopes = { scope with bindings } :: rest
     ; known_map_keys = List.Assoc.remove env.known_map_keys name ~equal:String.equal
     ; map_aliases = List.filter env.map_aliases ~f:(fun old -> not (String.equal old name))
+    ; iterated_lists = List.filter env.iterated_lists ~f:(fun old -> not (String.equal old name))
     }
 
 let bind_many env bindings =
@@ -623,7 +626,13 @@ let rec expression_needs_method env = function
       expression_needs_method env key || expression_needs_method env value)
   | SingletonTuple (_, value) -> expression_needs_method env value
   | Subscript (value, selector) ->
-    expression_needs_method env value || expression_needs_method env selector
+    expression_needs_method env value
+    || expression_needs_method env selector
+    || begin
+      match selector, collection_kind (infer env value) with
+      | Slice _, ListCollection -> true
+      | _ -> false
+    end
   | Index value -> expression_needs_method env value
   | Slice (lower, upper) ->
     Option.exists lower ~f:(expression_needs_method env)
@@ -650,7 +659,10 @@ let classify_functions env statements =
     let env =
       List.fold bodies ~init:env ~f:(fun env (name, body) ->
         match lookup_function env name with
-        | Some signature when function_needs_method env body ->
+        | Some signature ->
+          let function_environment = enter_scope env (FunctionScope signature.name) in
+          let function_environment = bind_many function_environment signature.parameters in
+          if function_needs_method function_environment body then
           begin
             match signature.kind with
             | PureFunction ->
@@ -658,7 +670,8 @@ let classify_functions env statements =
               add_function env { signature with kind = Method }
             | _ -> env
           end
-        | _ -> env)
+          else env
+        | None -> env)
     in
     if !changed then fixpoint env else env
   in
@@ -692,6 +705,12 @@ let rec is_hashable_type typ =
     | _ -> false
 
 let require_hashable typ message = require (is_hashable_type typ) message
+
+let list_mutating_methods =
+  [ "append"; "insert"; "remove"; "pop"; "clear"; "reverse"; "sort"; "extend" ]
+
+let is_list_mutating_method name =
+  List.mem list_mutating_methods (String.lowercase name) ~equal:String.equal
 
 let require_set_elements left right message =
   match collection_element_type left, collection_element_type right with
@@ -829,7 +848,12 @@ let rec validate_call env callee arguments =
         begin
           validate_exp env iterable;
           require_set_source (collection_kind (infer env iterable))
-            "set() expects a supported typed iterable"
+            "set() expects a supported typed iterable";
+          begin
+            match set_source_element_type (infer env iterable) with
+            | Some element -> require_hashable element "set() source elements must be hashable"
+            | None -> fail "set() expects a concrete source element type"
+          end
         end
       | "set", _ -> fail "set() accepts zero or one argument"
       | "dict", [] | "map", [] -> ()
@@ -841,6 +865,10 @@ let rec validate_call env callee arguments =
     let method_name = String.lowercase (Option.value (snd method_name) ~default:"") in
     begin
       match collection, method_name with
+      | ListCollection, method_name
+        when is_list_mutating_method method_name
+             && List.exists env.iterated_lists ~f:(String.equal (identifier_name value)) ->
+        fail ("mutating list while iterating it is unsupported: " ^ method_name)
       | SetCollection, ("add" | "remove" | "discard" | "pop" | "clear" | "update"
                         | "intersection_update" | "difference_update" | "symmetric_difference_update")
       | MapCollection, ("pop" | "popitem" | "setdefault" | "update" | "clear") ->
@@ -1074,6 +1102,12 @@ and validate_statements env statements =
       in
       let loop_env = enter_scope env ComprehensionScope in
       let identifier = List.hd_exn identifiers in
+      let loop_env =
+        match collection_kind (infer env iterable), iterable with
+        | ListCollection, Identifier source ->
+          { loop_env with iterated_lists = identifier_name (Identifier source) :: loop_env.iterated_lists }
+        | _ -> loop_env
+      in
       let loop_env = bind loop_env (identifier_name (Identifier identifier)) element in
       ignore (validate_statements loop_env body);
       env

@@ -13,6 +13,7 @@ type context =
   ; expected_type : Py.typ option
   ; return_type : Py.typ option
   ; loop_depth : int
+  ; iterated_lists : string list
   }
 
 type lowered =
@@ -50,7 +51,13 @@ let fresh_temp () =
   (S.def_pos, Some ("lowered_" ^ Int.to_string !temp_number))
 
 let context environment =
-  { environment; evaluation = Eager; expected_type = None; return_type = None; loop_depth = 0 }
+  { environment
+  ; evaluation = Eager
+  ; expected_type = None
+  ; return_type = None
+  ; loop_depth = 0
+  ; iterated_lists = []
+  }
 
 let scoped context = { context with evaluation = Scoped }
 
@@ -286,7 +293,23 @@ and lower_call context callee arguments =
     lower_dict_constructor context (Py.Identifier identifier) arguments
   | _ -> lower_regular_call context callee arguments
 
+and reject_iterated_list_mutation context callee =
+  match callee with
+  | Py.Dot (Py.Identifier identifier, method_name) ->
+    let name = Option.value (snd identifier) ~default:"" in
+    let method_name = Option.value (snd method_name) ~default:"" in
+    begin
+      match Sem.collection_kind (Sem.infer context.environment (Py.Identifier identifier)) with
+      | Sem.ListCollection
+        when Sem.is_list_mutating_method method_name
+             && List.exists context.iterated_lists ~f:(String.equal name) ->
+        fail ("mutating list while iterating it is unsupported: " ^ String.lowercase method_name)
+      | _ -> ()
+    end
+  | _ -> ()
+
 and lower_regular_call context callee arguments =
+  reject_iterated_list_mutation context callee;
   let lowered_callee = lower context callee in
   let parameter_types =
     match Sem.normalize_type (Sem.infer context.environment callee) with
@@ -319,6 +342,11 @@ and lower_regular_call context callee arguments =
        | Sem.Method | Sem.Constructor | Sem.Generator -> true
        | Sem.PureFunction -> false
   in
+  begin
+    match context.evaluation, effectful with
+    | Scoped, true -> raise (LoweringError "effectful calls are unsupported in scoped expressions")
+    | _ -> ()
+  end;
   match Sem.callable_kind context.environment callee, context.evaluation with
   | (Sem.Method | Sem.Generator), Eager ->
     let identifier = fresh_temp () in
@@ -396,12 +424,29 @@ and lower_subscript context value selector =
         | _ -> D.DSubscript (lowered_value.result, lowered_selector.result)
       end
   in
-  { prelude = lowered_value.prelude @ lowered_selector.prelude
-  ; result
-  ; resolved_type = result_type
-  ; control_flow = lowered_value.control_flow || lowered_selector.control_flow
-  ; effectful = lowered_value.effectful || lowered_selector.effectful
-  }
+  let prelude = lowered_value.prelude @ lowered_selector.prelude in
+  let is_list_slice =
+    match source_selector, name with
+    | SliceSelector _, "list" -> true
+    | _ -> false
+  in
+  match is_list_slice, context.evaluation with
+  | true, Scoped -> fail "list slices are unsupported in scoped expressions"
+  | true, Eager ->
+    let identifier = fresh_temp () in
+    { prelude = prelude @ [ D.DAssignLvalue (None, [ D.Local identifier ], [ result ]) ]
+    ; result = D.DIdentifier identifier
+    ; resolved_type = result_type
+    ; control_flow = lowered_value.control_flow || lowered_selector.control_flow
+    ; effectful = true
+    }
+  | false, _ ->
+    { prelude
+    ; result
+    ; resolved_type = result_type
+    ; control_flow = lowered_value.control_flow || lowered_selector.control_flow
+    ; effectful = lowered_value.effectful || lowered_selector.effectful
+    }
 
 and lower_compare_chain context first comparisons =
   match comparisons with
@@ -500,7 +545,18 @@ and lower_for context specifications identifiers iterable body =
     |> fun environment -> Sem.bind environment target_name element_type
   in
   let loop_context =
-    { context with environment = loop_environment; loop_depth = context.loop_depth + 1 }
+    let iterated_lists =
+      match kind, iterable with
+      | Sem.ListCollection, Py.Identifier source
+        when not (String.equal (Option.value (snd source) ~default:"") target_name) ->
+        Option.value (snd source) ~default:"" :: context.iterated_lists
+      | _ -> context.iterated_lists
+    in
+    { context with
+      environment = loop_environment
+    ; loop_depth = context.loop_depth + 1
+    ; iterated_lists
+    }
   in
   let lower_specs () =
     let lowered = List.map specifications ~f:(lower_loop_spec (scoped context))
@@ -678,7 +734,10 @@ and lower context expression =
     ; result = D.DIfElseExpr (lowered_condition.result, lowered_true.result, lowered_false.result)
     ; resolved_type = Sem.infer environment expression
     ; control_flow = true
-    ; effectful = lowered_condition.effectful || lowered_true.effectful || lowered_false.effectful
+    (* Branches are lowered in [Scoped] mode, which rejects effectful calls
+       before a result can be constructed.  Only the eager condition can
+       therefore contribute an effect to this expression. *)
+    ; effectful = lowered_condition.effectful
     }
 
 and lower_spec context = function
@@ -723,6 +782,7 @@ and lower_expression_statement context expression =
     let lowered = lower_call context (Py.Identifier identifier) arguments in
     lowered.prelude, []
   | Py.Call (callee, arguments) ->
+    reject_iterated_list_mutation context callee;
     let lowered_callee = lower context callee in
     let lowered_arguments = lower_many context arguments in
     lowered_callee.prelude @ join_preludes lowered_arguments,

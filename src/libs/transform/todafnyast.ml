@@ -171,7 +171,7 @@ let rec stmt_dfy = function
   | Return el -> DReturn [exp_dfy el]
   | Assert e -> DAssert (exp_dfy e)
   | Break -> DBreak
-  | Continue -> failwith "continue statements are not supported"
+  | Continue -> DContinue
   | Pass -> DEmptyStmt
   | While (speclst, e, sl) -> DWhile (List.map ~f:spec_dfy speclst, exp_dfy e, List.map ~f:stmt_dfy sl)
   | For _ -> failwith "for loops are not supported"
@@ -256,14 +256,7 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
   let function_environment = Semantic.validate_specs function_environment speclst in
   let body_environment = Semantic.validate_statements function_environment body in
   let parameters = semantic_params parameters in
-  let list_reads =
-    List.filter_map parameters ~f:(fun (identifier, typ) ->
-      match typ with
-      | DIdentTyp ((_, Some name), _) when String.equal (String.lowercase name) "list" ->
-        Some (DReads (DIdentifier identifier))
-      | _ -> None)
-  in
-  let specifications = semantic_specs function_environment speclst @ list_reads in
+  let specifications = semantic_specs function_environment speclst in
   let return_typ = Semantic.annotation return_type in
   let return_type = Lowering.type_dfy return_typ in
   match body with
@@ -275,7 +268,14 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
         expression
     in
     if List.is_empty lowered.prelude && not lowered.effectful then
-      DFuncMeth (specifications, name, generics, parameters, return_type, Some lowered.result)
+      let list_reads =
+        List.filter_map parameters ~f:(fun (identifier, typ) ->
+          match typ with
+          | DIdentTyp ((_, Some name), _) when String.equal (String.lowercase name) "list" ->
+            Some (DReads (DIdentifier identifier))
+          | _ -> None)
+      in
+      DFuncMeth (specifications @ list_reads, name, generics, parameters, return_type, Some lowered.result)
     else
       DMeth
         (specifications, name, generics, parameters, [ return_type ],

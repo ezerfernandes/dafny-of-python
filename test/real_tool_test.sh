@@ -82,6 +82,14 @@ cat > "$workdir/valid_program.py" <<'PYTHON'
 def first(xs: list[int]) -> int:
   return xs[0]
 
+# pre len(xs) > 1
+def tail(xs: list[int]) -> list[int]:
+  return xs[1:]
+
+# pre len(xs) > 1
+def tail_caller(xs: list[int]) -> list[int]:
+  return tail(xs)
+
 def increment(x: int) -> int:
   return x + 1
 
@@ -109,6 +117,8 @@ def repeat_guard(x: int) -> None:
     break
 
 assert first([1]) == 1
+tail_result = tail([1, 2])
+tail_caller_result = tail_caller([1, 2])
 assert increment(1) == 2
 method_result = method_form(1)
 assert ordered(1, 2, 3)
@@ -169,6 +179,9 @@ set -e
 
 test "$status" -eq 0
 grep -q 'function first' "$workdir/valid_output"
+grep -q 'method tail' "$workdir/valid_output"
+grep -q 'method tail_caller' "$workdir/valid_output"
+grep -q 'rangeLower' "$workdir/valid_output"
 grep -q 'function increment' "$workdir/valid_output"
 grep -q 'method method_form' "$workdir/valid_output"
 grep -q 'function ordered' "$workdir/valid_output"
@@ -208,6 +221,23 @@ def invalid_chain(xs: list[int]) -> bool:
   return xs.copy()[0] < 2
 PYTHON
 run_rejected_program effectful_chain.py 'effectful calls are unsupported in comparison chains'
+
+# Effectful calls cannot appear in the lazy right-hand side of a short-circuit
+# expression, where Dafny only accepts expression-level calls.
+cat > "$workdir/scoped_effect.py" <<'PY'
+def invalid_scoped(xs: list[int]) -> list[int]:
+  return True and xs.copy()
+PY
+run_rejected_program scoped_effect.py 'effectful calls are unsupported in scoped expressions'
+
+# The indexed lowering captures the initial list length, so mutating the
+# iterated list would silently diverge from Python's iterator semantics.
+cat > "$workdir/list_iteration_mutation.py" <<'PY'
+def invalid_list_iteration(xs: list[int]) -> None:
+  for item in xs:
+    xs.append(item)
+PY
+run_rejected_program list_iteration_mutation.py 'mutating list while iterating it is unsupported'
 
 # List objects are functional in the runtime and do not have an index setter.
 cat > "$workdir/list_assignment.py" <<'PYTHON'
