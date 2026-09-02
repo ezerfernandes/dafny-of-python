@@ -114,6 +114,7 @@ type dStmt =
   | DWhile of dSpec list * dExpr * dStmt list
   | DReturn of dExpr list
   | DBreak
+  | DContinue
   | DCallStmt of dExpr * dExpr list
   [@@deriving sexp]
 

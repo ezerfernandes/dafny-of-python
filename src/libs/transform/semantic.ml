@@ -573,6 +573,97 @@ let rec collect_functions env statements =
     | While (_, _, body) | For (_, _, _, body) -> collect_functions env body
     | _ -> env)
 
+let rec collect_function_bodies statements =
+  List.concat_map statements ~f:(fun statement ->
+    match statement with
+    | Function (_, name, _, _, body) ->
+      (identifier_name (Identifier name), body) :: collect_function_bodies body
+    | IfElse (_, first, alternatives, last) ->
+      collect_function_bodies first
+      @ List.concat_map alternatives ~f:(fun (_, body) -> collect_function_bodies body)
+      @ collect_function_bodies last
+    | While (_, _, body) | For (_, _, _, body) -> collect_function_bodies body
+    | _ -> [])
+
+(* A function body with a statement sequence, a list construction, or a call
+   to a method cannot be emitted as a Dafny function.  Keep this information
+   in the callable environment before lowering any callers. *)
+let rec expression_needs_method env = function
+  | Typ _ | Literal _ | Identifier _ -> false
+  | Dot (value, _) -> expression_needs_method env value
+  | BinaryExp (left, _, right) ->
+    expression_needs_method env left || expression_needs_method env right
+  | CompareChain (first, comparisons) ->
+    expression_needs_method env first
+    || List.exists comparisons ~f:(fun (_, operand) -> expression_needs_method env operand)
+  | UnaryExp (_, value) -> expression_needs_method env value
+  | Call (callee, arguments) ->
+    expression_needs_method env callee
+    || List.exists arguments ~f:(expression_needs_method env)
+    || begin
+      match callee with
+      | Dot _ -> true
+      | Identifier identifier ->
+        begin
+          match lookup_function env (Option.value (snd identifier) ~default:"") with
+          | Some { kind = PureFunction; _ } | None -> false
+          | Some _ -> true
+        end
+      | _ -> false
+    end
+  | Lst elements ->
+    (* The runtime List representation requires a statement-level
+       construction, even when its elements are all pure. *)
+    ignore elements;
+    true
+  | Array elements | Set elements | Tuple elements ->
+    List.exists elements ~f:(expression_needs_method env)
+  | Dict entries ->
+    List.exists entries ~f:(fun (key, value) ->
+      expression_needs_method env key || expression_needs_method env value)
+  | SingletonTuple (_, value) -> expression_needs_method env value
+  | Subscript (value, selector) ->
+    expression_needs_method env value || expression_needs_method env selector
+  | Index value -> expression_needs_method env value
+  | Slice (lower, upper) ->
+    Option.exists lower ~f:(expression_needs_method env)
+    || Option.exists upper ~f:(expression_needs_method env)
+  | Forall (_, body) | Exists (_, body) -> expression_needs_method env body
+  | Len (_, value) | Max (_, value) | Old (_, value) | Fresh (_, value) ->
+    expression_needs_method env value
+  | Lambda (_, body) -> expression_needs_method env body
+  | IfElseExp (when_true, condition, when_false) ->
+    expression_needs_method env when_true
+    || expression_needs_method env condition
+    || expression_needs_method env when_false
+
+let function_needs_method env body =
+  match body with
+  | [ Return expression ] | [ Exp expression ] -> expression_needs_method env expression
+  | [ Pass ] -> false
+  | _ -> true
+
+let classify_functions env statements =
+  let bodies = collect_function_bodies statements in
+  let rec fixpoint env =
+    let changed = ref false in
+    let env =
+      List.fold bodies ~init:env ~f:(fun env (name, body) ->
+        match lookup_function env name with
+        | Some signature when function_needs_method env body ->
+          begin
+            match signature.kind with
+            | PureFunction ->
+              changed := true;
+              add_function env { signature with kind = Method }
+            | _ -> env
+          end
+        | _ -> env)
+    in
+    if !changed then fixpoint env else env
+  in
+  fixpoint env
+
 let is_unknown_type typ =
   match normalize_type typ with
   | TIdent _ -> true
@@ -584,6 +675,23 @@ let compatible_types left right =
 let require condition message = if not condition then fail message
 
 let require_compatible left right message = require (compatible_types left right) message
+
+let rec is_hashable_type typ =
+  match typ with
+  | TType (_, Some typ) -> is_hashable_type typ
+  | _ ->
+    match normalize_type typ with
+    | TInt _ | TFloat _ | TBool _ | TStr _ | TNone _ -> true
+    | TGeneric (segment, arguments) ->
+      begin
+        match segment_name segment, arguments with
+        | "tuple", arguments -> List.for_all arguments ~f:is_hashable_type
+        | "list", _ | "set", _ | "map", _ | "array", _ | "seq", _ -> false
+        | _, _ -> false
+      end
+    | _ -> false
+
+let require_hashable typ message = require (is_hashable_type typ) message
 
 let require_set_elements left right message =
   match collection_element_type left, collection_element_type right with
@@ -644,7 +752,14 @@ let known_literal_key env value key =
 let validate_membership env left right =
   let right_type = infer env right in
   match membership_type env right_type with
-  | Some element -> require_compatible (infer env left) element "membership operand has an incompatible type"
+  | Some element ->
+    require_compatible (infer env left) element "membership operand has an incompatible type";
+    begin
+      match collection_kind right_type with
+      | SetCollection | MapCollection ->
+        require_hashable (infer env left) "membership operand is not hashable"
+      | _ -> ()
+    end
   | None ->
     require (is_unknown_type right_type) "right operand of membership must be a collection"
 
@@ -655,6 +770,7 @@ let validate_map_lookup env value key =
       match map_types (infer env value) with
       | Some (key_type, _) ->
         require_compatible (infer env key) key_type "map lookup key has an incompatible type";
+        require_hashable (infer env key) "map lookup key must be hashable";
         require
           (known_literal_key env value key)
           "map lookup requires a key-membership precondition"
@@ -726,7 +842,7 @@ let rec validate_call env callee arguments =
     begin
       match collection, method_name with
       | SetCollection, ("add" | "remove" | "discard" | "pop" | "clear" | "update"
-                        | "intersection_update" | "difference_update")
+                        | "intersection_update" | "difference_update" | "symmetric_difference_update")
       | MapCollection, ("pop" | "popitem" | "setdefault" | "update" | "clear") ->
         fail ("mutating collection method is unsupported: " ^ method_name)
       | _ -> ()
@@ -755,7 +871,7 @@ and validate_exp env = function
     validate_exp env callee;
     List.iter arguments ~f:(validate_exp env);
     validate_call env callee arguments
-  | Lst elements | Array elements | Set elements ->
+  | Lst elements | Array elements ->
     List.iter elements ~f:(validate_exp env);
     begin
       match elements with
@@ -763,6 +879,18 @@ and validate_exp env = function
       | first :: rest ->
         let first_type = infer env first in
         List.iter rest ~f:(fun element -> require_compatible first_type (infer env element) "collection elements have incompatible types")
+    end
+  | Set elements ->
+    List.iter elements ~f:(validate_exp env);
+    begin
+      match elements with
+      | [] -> ()
+      | first :: rest ->
+        let first_type = infer env first in
+        require_hashable first_type "set elements must be hashable";
+        List.iter rest ~f:(fun element ->
+          require_compatible first_type (infer env element) "collection elements have incompatible types";
+          require_hashable (infer env element) "set elements must be hashable")
     end
   | Dict entries ->
     List.iter entries ~f:(fun (key, value) -> validate_exp env key; validate_exp env value);
@@ -772,8 +900,10 @@ and validate_exp env = function
       | (first_key, first_value) :: rest ->
         let key_type = infer env first_key in
         let value_type = infer env first_value in
+        require_hashable key_type "dictionary keys must be hashable";
         List.iter rest ~f:(fun (key, value) ->
           require_compatible key_type (infer env key) "dictionary keys have incompatible types";
+          require_hashable (infer env key) "dictionary keys must be hashable";
           require_compatible value_type (infer env value) "dictionary values have incompatible types")
     end
   | Tuple elements -> List.iter elements ~f:(validate_exp env)
@@ -854,7 +984,8 @@ and validate_target env = function
         begin
           match map_types (infer env value) with
           | Some (key_type, _) ->
-            require_compatible (infer env key) key_type "map update key has an incompatible type"
+            require_compatible (infer env key) key_type "map update key has an incompatible type";
+            require_hashable (infer env key) "map update key must be hashable"
           | None -> fail "map update requires concrete key and value types"
         end
       | ListCollection -> fail "indexed assignment into List is unsupported"
@@ -927,23 +1058,23 @@ and validate_statements env statements =
         | MapCollection ->
           require (Option.is_some (map_types (infer env iterable)))
             "map iteration requires concrete key and value types";
-          require (List.length identifiers = 1) "set/map iteration requires one loop target"
-        | ListCollection | SequenceCollection -> ()
+          raise (SemanticError
+                   "map iteration is unsupported because Dafny maps do not preserve Python insertion order")
+        | ListCollection | SequenceCollection ->
+          require (List.length identifiers = 1)
+            "list/sequence iteration requires one loop target"
         | UnknownCollection -> raise (SemanticError "for loop iterable requires a known type")
         | ArrayCollection | TupleCollection | StringCollection | NonCollection ->
           raise (SemanticError "for loop iterable is not supported")
       end;
       let element =
-        match collection_kind (infer env iterable), collection_arguments (infer env iterable) with
-        | MapCollection, key :: _ -> key
-        | _, element :: _ -> element
+        match collection_arguments (infer env iterable) with
+        | element :: _ -> element
         | _ -> TIdent def_seg
       in
       let loop_env = enter_scope env ComprehensionScope in
-      let loop_env = match identifiers with
-        | [ identifier ] -> bind loop_env (identifier_name (Identifier identifier)) element
-        | _ -> loop_env
-      in
+      let identifier = List.hd_exn identifiers in
+      let loop_env = bind loop_env (identifier_name (Identifier identifier)) element in
       ignore (validate_statements loop_env body);
       env
     | Return value | Assert value | Exp value -> validate_exp env value; env
@@ -952,5 +1083,5 @@ and validate_statements env statements =
 let analyze (Program statements) =
   match normalize_program (Program statements) with
   | Program statements ->
-    let env = collect_functions empty statements in
+    let env = collect_functions empty statements |> fun env -> classify_functions env statements in
     validate_statements env statements

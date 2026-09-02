@@ -22,7 +22,21 @@ let test_dafny4_function_syntax () =
   let ast = Transform.Todafnyast.prog_dfy (Ast.Program (parse_program "def f(x: int) -> int:\n  return x\n")) in
   let generated, _ = Transform.Emitdfy.print_prog_with_sourcemap ast in
   check bool "Dafny 4 function syntax is emitted" true (has_substring generated "function f(");
-  check bool "legacy function syntax is not emitted" false (has_substring generated "function method")
+  check bool "legacy function syntax is not emitted" false (has_substring generated "function method");
+  let method_program =
+    Ast.Program
+      (parse_program
+         "def method_form(x: int) -> int:\n  y = x + 1\n  return y\n\ndef caller() -> int:\n  return method_form(1)\n")
+  in
+  let method_source, _ =
+    Transform.Emitdfy.print_prog_with_sourcemap (Transform.Todafnyast.prog_dfy method_program)
+  in
+  check bool "lowered multi-statement functions are methods" true
+    (has_substring method_source "method method_form");
+  check bool "callers use the synchronized method signature" true
+    (has_substring method_source "method caller");
+  check bool "method calls are hoisted out of caller expressions" true
+    (has_substring method_source "return lowered_")
 
 let test_parser_assignment () =
   match parse_program "x: int = 1\n" with
@@ -146,6 +160,9 @@ let test_parser_entry_points_and_errors () =
      check int "all parameters" 2 (List.length params);
      check int "loop specification" 1 (List.length loop_specs)
    | _ -> fail "the parser did not preserve nested specifications and control flow");
+  (match Pyparse.Parser.parse_string "while True:\n  continue\n" with
+   | Ast.Program [ Ast.While (_, _, [ Ast.Continue ]) ] -> ()
+   | _ -> fail "continue should be parsed as a control-flow statement");
   (match Pyparse.Parser.parse_string "import typing\nfrom typing import TypeVar\nx = 1\n" with
    | Ast.Program [ Ast.Assign _ ] -> ()
    | _ -> fail "imports and comments should be ignored");
@@ -1160,6 +1177,12 @@ let test_semantic_lowering_paths () =
   expect_exception "invalid lvalue" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
     (fun () -> Transform.Lowering.lower_lvalue (Transform.Lowering.context environment) (Literal TrueLit));
   ignore (Transform.Lowering.lower_expression_statement (Transform.Lowering.context environment) (Call (identifier "pure", [])));
+  check bool "set expression statements discard pure constructor results" true
+    (Transform.Lowering.lower_expression_statement (Transform.Lowering.context environment)
+       (Call (identifier "set", [])) = ([], []));
+  check bool "dict expression statements discard pure constructor results" true
+    (Transform.Lowering.lower_expression_statement (Transform.Lowering.context environment)
+       (Call (identifier "dict", [])) = ([], []));
   ignore (Transform.Lowering.lower_expression_statement (Transform.Lowering.context environment) xs);
   ignore (Transform.Lowering.statements [ Pass ]);
   let alternative_with_prelude =
@@ -1495,6 +1518,99 @@ let test_phase3_collections () =
   ignore (Transform.Semantic.compatible_types int_type (TIdent (segment "unknown")));
   check bool "incompatible concrete types are rejected" false
     (Transform.Semantic.compatible_types int_type string_type);
+  check bool "primitive values are hashable" true
+    (List.for_all Transform.Semantic.is_hashable_type
+       [ int_type; TFloat def_seg; TBool def_seg; string_type; TNone def_seg ]);
+  check bool "tuples are hashable when all elements are hashable" true
+    (Transform.Semantic.is_hashable_type
+       (TTuple (def_seg, Some [ int_type; string_type ])));
+  check bool "tuples containing lists are not hashable" false
+    (Transform.Semantic.is_hashable_type
+       (TTuple (def_seg, Some [ int_type; list_type ])));
+  check bool "collection values are not hashable" false
+    (List.exists Transform.Semantic.is_hashable_type
+       [ list_type; set_type; map_type; sequence_type
+       ; TGeneric (segment "array", [ int_type ]) ]);
+  check bool "unknown and object values are not hashable" false
+    (List.exists Transform.Semantic.is_hashable_type
+       [ TIdent (segment "Unknown"); TObj def_seg
+       ; TCallable (def_seg, [ int_type ], int_type) ]);
+  check bool "type aliases retain hashability" true
+    (Transform.Semantic.is_hashable_type (TType (def_seg, Some int_type)));
+  check bool "unknown generic values are not hashable" false
+    (Transform.Semantic.is_hashable_type (TGeneric (segment "custom", [ int_type ])));
+  let classification_function name expression =
+    Function ([], segment name, [], Typ int_type, [ Return expression ])
+  in
+  let classification_program =
+    [ classification_function "plain" (Literal (IntLit "0"))
+    ; classification_function "calls_plain" (Call (identifier "plain", []))
+    ; classification_function "calls_unknown" (Call (identifier "missing", []))
+    ; classification_function "calls_non_identifier"
+        (Call (BinaryExp (Literal (IntLit "1"), Plus def_seg, Literal (IntLit "2")),
+               [ UnaryExp (UMinus def_seg, Literal (IntLit "1")) ]))
+    ; classification_function "calls_method"
+        (Call (Dot (identifier "holder", segment "run"), []))
+    ; classification_function "calls_classified_method" (Call (identifier "calls_method", []))
+    ; classification_function "returns_type" (Typ (TNone def_seg))
+    ; classification_function "returns_binary"
+        (BinaryExp (Literal (IntLit "1"), Plus def_seg, Literal (IntLit "2")))
+    ; classification_function "returns_binary_left_method"
+        (BinaryExp (Lst [], Plus def_seg, Literal (IntLit "2")))
+    ; classification_function "returns_chain"
+        (CompareChain (Literal (IntLit "1"), [ (Lt def_seg, Literal (IntLit "2")) ]))
+    ; classification_function "returns_chain_first_method"
+        (CompareChain (Lst [], [ (Lt def_seg, Literal (IntLit "2")) ]))
+    ; classification_function "returns_unary" (UnaryExp (Not def_seg, Literal TrueLit))
+    ; classification_function "returns_list" (Lst [])
+    ; classification_function "returns_collections"
+        (Array [ Literal (IntLit "1") ])
+    ; classification_function "returns_set" (Set [ Literal (IntLit "1") ])
+    ; classification_function "returns_tuple" (Tuple [ Literal (IntLit "1"); Literal (IntLit "2") ])
+    ; classification_function "returns_dict"
+        (Dict [ Literal (IntLit "1"), Literal (IntLit "2") ])
+    ; classification_function "returns_dict_key_method"
+        (Dict [ Lst [], Literal (IntLit "2") ])
+    ; classification_function "returns_singleton"
+        (SingletonTuple (segment ",", Literal (IntLit "1")))
+    ; classification_function "returns_subscript"
+        (Subscript (identifier "holder", BinaryExp (Literal (IntLit "0"), Plus def_seg, Literal (IntLit "1"))))
+    ; classification_function "returns_subscript_value_method"
+        (Subscript (Lst [], Literal (IntLit "0")))
+    ; classification_function "returns_index" (Index (Literal (IntLit "0")))
+    ; classification_function "returns_slice"
+        (Slice (Some (Literal (IntLit "0")), Some (Literal (IntLit "1"))))
+    ; classification_function "returns_slice_lower_method"
+        (Slice (Some (Lst []), Some (Literal (IntLit "1"))))
+    ; classification_function "returns_quantifier"
+        (Forall ([ segment "k" ], Literal TrueLit))
+    ; classification_function "returns_scope"
+        (Exists ([ segment "k" ], Literal TrueLit))
+    ; classification_function "returns_length" (Len (def_seg, identifier "holder"))
+    ; classification_function "returns_max" (Max (def_seg, identifier "holder"))
+    ; classification_function "returns_old" (Old (def_seg, identifier "holder"))
+    ; classification_function "returns_fresh" (Fresh (def_seg, identifier "holder"))
+    ; classification_function "returns_lambda" (Lambda ([ segment "k" ], identifier "k"))
+    ; classification_function "returns_conditional"
+        (IfElseExp (Literal TrueLit, Literal TrueLit, Literal FalseLit))
+    ; classification_function "returns_conditional_true_method"
+        (IfElseExp (Lst [], Literal TrueLit, Literal FalseLit))
+    ; classification_function "returns_conditional_condition_method"
+        (IfElseExp (Literal TrueLit, Lst [], Literal FalseLit))
+    ; classification_function "returns_call_callee_method"
+        (Call (Lst [], []))
+    ; classification_function "returns_call_argument_method"
+        (Call (identifier "plain", [ Lst [] ]))
+    ]
+  in
+  let classification_environment =
+    Transform.Semantic.collect_functions Transform.Semantic.empty classification_program
+    |> fun environment -> Transform.Semantic.classify_functions environment classification_program
+  in
+  check bool "callable classification follows emitted declaration kind" true
+    (match Transform.Semantic.callable_kind classification_environment (identifier "calls_classified_method") with
+     | Transform.Semantic.Method -> true
+     | _ -> false);
   expect_exception "incomplete set operation type"
     (function Transform.Semantic.SemanticError _ -> true | _ -> false)
     (fun () -> Transform.Semantic.require_set_elements
@@ -1694,8 +1810,11 @@ let test_phase3_collections () =
       [ For ([], [ segment "item" ], values, [ Assert (BinaryExp (identifier "item", In def_seg, values)) ]) ]
   in
   let map_loop =
-    Transform.Lowering.statements ~environment:env
-      [ For ([], [ segment "key" ], mapping, [ Assert (BinaryExp (identifier "key", In def_seg, mapping)) ]) ]
+    expect_exception "map iteration lowering is rejected"
+      (function Transform.Lowering.LoweringError message -> has_substring message "insertion order" | _ -> false)
+      (fun () -> Transform.Lowering.statements ~environment:env
+                   [ For ([], [ segment "key" ], mapping
+                        , [ Assert (BinaryExp (identifier "key", In def_seg, mapping)) ]) ])
   in
   let indexed_loop_specs =
     [ Invariant (Literal TrueLit); Decreases (Literal (IntLit "1")) ]
@@ -1714,7 +1833,7 @@ let test_phase3_collections () =
       | _ -> false) statements
   in
   check bool "set loops choose from a remaining set" true (has_choose set_loop);
-  check bool "map loops choose from remaining keys" true (has_choose map_loop);
+  ignore map_loop;
   check bool "list loops use indexed lowering" true
     (has_substring (Transform.Emitdfy.print_stmt 0 (List.hd list_loop)) "lowered_");
   check bool "sequence loops use indexed lowering" true
@@ -1723,6 +1842,14 @@ let test_phase3_collections () =
             [ segment "item" ] list [ Pass ]);
   ignore (Transform.Lowering.lower_for (Transform.Lowering.context env) []
             [ segment "item" ] sequence [ Pass ]);
+  let list_continue_loop =
+    Transform.Lowering.statements ~environment:env
+      [ For ([], [ segment "item" ], list, [ Continue ]) ]
+  in
+  check bool "list loop bookkeeping precedes continue" true
+    (match List.rev list_continue_loop with
+     | D.DWhile (_, _, [ D.DAssignLvalue _; D.DAssignLvalue _; D.DContinue ]) :: _ -> true
+     | _ -> false);
   List.iter
     (fun specification ->
        expect_exception "invalid loop specifications are rejected"
@@ -1758,10 +1885,17 @@ let test_phase3_collections () =
   ignore (Transform.Semantic.validate_statements Transform.Semantic.empty valid_map_program);
   ignore
     (Transform.Semantic.validate_statements env
-       [ For ([], [ segment "key" ], mapping, [ Pass ])
-       ; For ([], [ segment "item" ], list, [ Pass ])
+       [ For ([], [ segment "item" ], list, [ Pass ])
        ; For ([], [ segment "item" ], sequence, [ Pass ])
-       ; For ([], [ segment "first"; segment "second" ], list, [ Pass ]) ]);
+       ]);
+  expect_exception "map iteration is rejected semantically"
+    (function Transform.Semantic.SemanticError message -> has_substring message "insertion order" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ For ([], [ segment "key" ], mapping, [ Pass ]) ]));
+  expect_exception "multi-target list iteration is rejected semantically"
+    (function Transform.Semantic.SemanticError message -> has_substring message "one loop target" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ For ([], [ segment "first"; segment "second" ], list, [ Pass ]) ]));
   ignore
     (Transform.Semantic.validate_statements
        (Transform.Semantic.bind Transform.Semantic.empty "untyped_list"
@@ -1894,6 +2028,15 @@ let test_phase3_collections () =
       (function Transform.Semantic.SemanticError _ -> true | _ -> false)
       (fun () -> ignore (Transform.Semantic.validate_statements env [ Assert expression ]))
   in
+  let unhashable_set_env =
+    Transform.Semantic.bind env "bad_set"
+      (TGeneric (segment "set", [ list_type ]))
+  in
+  semantic_error "incompatible set member" (BinaryExp (Lst [ Literal (IntLit "1") ], In def_seg, values));
+  expect_exception "unhashable set membership operand"
+    (function Transform.Semantic.SemanticError message -> has_substring message "hashable" | _ -> false)
+    (fun () -> Transform.Semantic.validate_exp unhashable_set_env
+                 (BinaryExp (Lst [ Literal (IntLit "1") ], In def_seg, identifier "bad_set")));
   semantic_error "incompatible membership" (BinaryExp (Literal (StringLit "bad"), In def_seg, values));
   semantic_error "non-collection membership" (BinaryExp (Literal (IntLit "1"), In def_seg, Literal TrueLit));
   semantic_error "set algebra needs sets" (BinaryExp (list, BitOr def_seg, values));
@@ -1922,6 +2065,14 @@ let test_phase3_collections () =
     (fun () -> Transform.Semantic.validate_exp env
                  (Dict [ (Literal (IntLit "1"), Literal (StringLit "ok"));
                          (Literal (IntLit "2"), Literal (IntLit "bad")) ]));
+  expect_exception "unhashable set literal elements"
+    (function Transform.Semantic.SemanticError message -> has_substring message "hashable" | _ -> false)
+    (fun () -> Transform.Semantic.validate_exp env
+                 (Set [ Lst [ Literal (IntLit "1") ] ]));
+  expect_exception "unhashable dictionary keys"
+    (function Transform.Semantic.SemanticError message -> has_substring message "hashable" | _ -> false)
+    (fun () -> Transform.Semantic.validate_exp env
+                 (Dict [ Lst [ Literal (IntLit "1") ], Literal (StringLit "value") ]));
   semantic_error "set and map equality" (BinaryExp (values, EqEq def_seg, mapping));
   expect_exception "incompatible map equality keys"
     (function Transform.Semantic.SemanticError _ -> true | _ -> false)
@@ -1978,7 +2129,7 @@ let test_phase3_collections () =
     (fun method_name ->
        semantic_error ("set mutation " ^ method_name)
          (Call (Dot (values, segment method_name), [ Literal (IntLit "1") ])))
-    [ "remove"; "discard"; "pop"; "clear"; "update"; "intersection_update"; "difference_update" ];
+    [ "remove"; "discard"; "pop"; "clear"; "update"; "intersection_update"; "difference_update"; "symmetric_difference_update" ];
   List.iter
     (fun method_name ->
        semantic_error ("map mutation " ^ method_name)
@@ -2452,6 +2603,8 @@ let test_emitter_paths_and_sourcemaps () =
     (Transform.Emitdfy.print_stmt 0 (D.DAssert D.DTrue));
   check string "break rendering" "break;"
     (Transform.Emitdfy.print_stmt 0 D.DBreak);
+  check string "continue rendering" "continue;"
+    (Transform.Emitdfy.print_stmt 0 D.DContinue);
   check string "call statement rendering" "f(1);"
     (Transform.Emitdfy.print_stmt 0 (D.DCallStmt (id "f", [ D.DIntLit "1" ])));
   check string "return statement rendering" "return 1;"
@@ -2513,7 +2666,7 @@ let test_emitter_paths_and_sourcemaps () =
     [ D.DRequires D.DTrue; D.DEnsures D.DTrue; D.DInvariant D.DTrue
     ; D.DDecreases (D.DIntLit "1"); D.DReads D.DThis; D.DModifies D.DThis ];
   let statements =
-    [ D.DEmptyStmt; D.DAssume D.DTrue; D.DAssert D.DTrue; D.DBreak
+    [ D.DEmptyStmt; D.DAssume D.DTrue; D.DAssert D.DTrue; D.DBreak; D.DContinue
     ; D.DAssign (None, [], []); D.DAssign (None, [ ds "x" ], [])
     ; D.DAssign (Some (D.DInt def_seg), [ ds "y" ], [ D.DIntLit "1" ])
     ; D.DCallStmt (id "f", [ D.DIntLit "1" ])

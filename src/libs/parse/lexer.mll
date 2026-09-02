@@ -130,6 +130,7 @@ rule next_token = parse
 | "for" { FOR (emit_lexeme lexbuf) }
 | "while" { WHILE (emit_lexeme lexbuf) }
 | "break" { BREAK (emit_lexeme lexbuf) }
+| "continue" { CONTINUE (emit_lexeme lexbuf) }
 | "pass" { PASS (emit_lexeme lexbuf) }
 | "return" { RETURN (emit_lexeme lexbuf) }
 | "assert" { ASSERT (emit_lexeme lexbuf) }

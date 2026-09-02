@@ -85,9 +85,14 @@ def first(xs: list[int]) -> int:
 def increment(x: int) -> int:
   return x + 1
 
+def method_form(x: int) -> int:
+  y = x + 1
+  return y
+
 def ordered(a: int, b: int, c: int) -> bool:
   return a < b < c
 
+# pre value in xs
 def contains(xs: list[int], value: int) -> bool:
   return value in xs
 
@@ -105,6 +110,7 @@ def repeat_guard(x: int) -> None:
 
 assert first([1]) == 1
 assert increment(1) == 2
+method_result = method_form(1)
 assert ordered(1, 2, 3)
 assert contains([1], 1)
 chosen = choose(0)
@@ -142,8 +148,10 @@ assert lookup(mapping, 1) == 12
 for item in values:
   assert item in values
 
-for key in mapping:
-  assert key in mapping
+loop_items: list[int] = [1]
+for loop_item in loop_items:
+  continue
+
 PYTHON
 
 set +e
@@ -162,16 +170,17 @@ set -e
 test "$status" -eq 0
 grep -q 'function first' "$workdir/valid_output"
 grep -q 'function increment' "$workdir/valid_output"
+grep -q 'method method_form' "$workdir/valid_output"
 grep -q 'function ordered' "$workdir/valid_output"
 grep -q 'if ' "$workdir/valid_output"
 grep -q 'set<int>' "$workdir/valid_output"
 grep -q 'map<int, int>' "$workdir/valid_output"
 grep -q 'setFromSeq' "$workdir/valid_output"
 grep -q ':|' "$workdir/valid_output"
-grep -q 'mapping.Keys' "$workdir/valid_output"
 grep -q '.contains' "$workdir/valid_output"
 grep -q 'new List<int>(\[\])' "$workdir/valid_output"
 grep -q 'while true' "$workdir/valid_output"
+grep -q 'continue;' "$workdir/valid_output"
 grep -q 'verifier finished with [0-9][0-9]* verified, 0 error' "$workdir/valid_output"
 # Dafny 4.11 reports harmless warnings (for example, an `old` expression that
 # does not dereference the heap) on stderr. A zero exit code and a zero-error
@@ -216,3 +225,12 @@ def invalid_loop() -> None:
     pass
 PYTHON
 run_rejected_program loop_spec.py 'loop specifications support only invariant and decreases'
+
+# Dafny maps are unordered, so map iteration cannot preserve Python's
+# insertion-order semantics.
+cat > "$workdir/map_iteration.py" <<'PYTHON'
+mapping: dict[int, int] = {1: 1}
+for key in mapping:
+  assert key in mapping
+PYTHON
+run_rejected_program map_iteration.py 'map iteration is unsupported because Dafny maps do not preserve Python insertion order'

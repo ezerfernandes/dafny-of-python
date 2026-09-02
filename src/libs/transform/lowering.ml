@@ -12,6 +12,7 @@ type context =
   ; evaluation : evaluation
   ; expected_type : Py.typ option
   ; return_type : Py.typ option
+  ; loop_depth : int
   }
 
 type lowered =
@@ -49,7 +50,7 @@ let fresh_temp () =
   (S.def_pos, Some ("lowered_" ^ Int.to_string !temp_number))
 
 let context environment =
-  { environment; evaluation = Eager; expected_type = None; return_type = None }
+  { environment; evaluation = Eager; expected_type = None; return_type = None; loop_depth = 0 }
 
 let scoped context = { context with evaluation = Scoped }
 
@@ -280,7 +281,7 @@ and lower_call context callee arguments =
          ~equal:String.equal ->
     lower_set_constructor context (Py.Identifier identifier) arguments
   | Py.Identifier identifier
-    when List.mem [ "dict"; "dictf" ] (Option.value (snd identifier) ~default:"" |> String.lowercase)
+    when List.mem [ "dict"; "dictf"; "map" ] (Option.value (snd identifier) ~default:"" |> String.lowercase)
          ~equal:String.equal ->
     lower_dict_constructor context (Py.Identifier identifier) arguments
   | _ -> lower_regular_call context callee arguments
@@ -477,6 +478,11 @@ and lower_for context specifications identifiers iterable body =
   let lowered_iterable = lower context iterable in
   let iterable_type = Sem.infer context.environment iterable in
   let kind = Sem.collection_kind iterable_type in
+  let snapshot = fresh_temp () in
+  let snapshot_expression = D.DIdentifier snapshot in
+  let snapshot_binding =
+    D.DAssignLvalue (None, [ D.Local snapshot ], [ lowered_iterable.result ])
+  in
   let target =
     match identifiers with
     | [ identifier ] -> identifier
@@ -493,7 +499,9 @@ and lower_for context specifications identifiers iterable body =
     Sem.enter_scope context.environment Sem.ComprehensionScope
     |> fun environment -> Sem.bind environment target_name element_type
   in
-  let loop_context = { context with environment = loop_environment } in
+  let loop_context =
+    { context with environment = loop_environment; loop_depth = context.loop_depth + 1 }
+  in
   let lower_specs () =
     let lowered = List.map specifications ~f:(lower_loop_spec (scoped context))
     in
@@ -513,16 +521,15 @@ and lower_for context specifications identifiers iterable body =
            , D.DBinary (counter_expression, D.DLEq S.def_seg, limit_expression) ))
     in
     let loop_body =
-      lower_statements loop_context body
-      |> fun statements ->
-      [ D.DAssignLvalue (None, [ target_lvalue ], [ element counter_expression ]) ]
-      @ statements
-      @ [ D.DAssignLvalue
-            (None, [ D.Local counter ]
-            , [ D.DBinary (counter_expression, D.DPlus S.def_seg, D.DIntLit "1") ]) ]
+      [ D.DAssignLvalue (None, [ target_lvalue ], [ element counter_expression ])
+      ; D.DAssignLvalue
+          (None, [ D.Local counter ]
+          , [ D.DBinary (counter_expression, D.DPlus S.def_seg, D.DIntLit "1") ]) ]
+      @ lower_statements loop_context body
     in
     let user_prelude, user_specs = lower_specs () in
     lowered_iterable.prelude
+    @ [ snapshot_binding ]
     @ user_prelude
     @ [ D.DAssignLvalue (None, [ D.Local counter ], [ D.DIntLit "0" ])
       ; D.DAssignLvalue (None, [ D.Local limit ], [ length ])
@@ -548,22 +555,26 @@ and lower_for context specifications identifiers iterable body =
         , [ D.DBinary (remaining_expression, D.DSetDifference S.def_seg, D.DSetExpr [ target_expression ]) ] )
     in
     let user_prelude, user_specs = lower_specs () in
-    lowered_iterable.prelude
-    @ user_prelude
+    user_prelude
     @ [ D.DAssignLvalue (None, [ D.Local remaining ], [ initial ])
-      ; D.DWhile (subset :: decreasing :: user_specs, nonempty, choose :: lower_statements loop_context body @ [ remove ]) ]
+      ; D.DWhile
+          ( subset :: decreasing :: user_specs
+          , nonempty
+          , choose :: remove :: lower_statements loop_context body ) ]
   in
   match kind with
   | Sem.ListCollection ->
     lower_indexed_loop
-      (D.DCallExpr (D.DDot (lowered_iterable.result, (S.def_pos, Some "len")), []))
-      (fun index -> D.DCallExpr (D.DDot (lowered_iterable.result, (S.def_pos, Some "atIndex")), [ index ]))
+      (D.DCallExpr (D.DDot (snapshot_expression, (S.def_pos, Some "len")), []))
+      (fun index -> D.DCallExpr (D.DDot (snapshot_expression, (S.def_pos, Some "atIndex")), [ index ]))
   | Sem.SequenceCollection ->
     lower_indexed_loop
-      (D.DLen (S.def_seg, lowered_iterable.result))
-      (fun index -> D.DNativeIndex (lowered_iterable.result, index))
-  | Sem.SetCollection -> lower_value_loop lowered_iterable.result
-  | Sem.MapCollection -> lower_value_loop (D.DMapKeys lowered_iterable.result)
+      (D.DLen (S.def_seg, snapshot_expression))
+      (fun index -> D.DNativeIndex (snapshot_expression, index))
+  | Sem.SetCollection ->
+    lowered_iterable.prelude @ [ snapshot_binding ] @ lower_value_loop snapshot_expression
+  | Sem.MapCollection ->
+    fail "map iteration is unsupported because Dafny maps do not preserve Python insertion order"
   | _ -> fail "for loop iterable is not a supported collection"
 
 and lower context expression =
@@ -705,6 +716,12 @@ and lower_lvalue context target =
 
 and lower_expression_statement context expression =
   match expression with
+  | Py.Call (Py.Identifier identifier, arguments)
+    when List.mem [ "set"; "setf"; "dict"; "dictf"; "map" ]
+           (Option.value (snd identifier) ~default:"" |> String.lowercase)
+           ~equal:String.equal ->
+    let lowered = lower_call context (Py.Identifier identifier) arguments in
+    lowered.prelude, []
   | Py.Call (callee, arguments) ->
     let lowered_callee = lower context callee in
     let lowered_arguments = lower_many context arguments in
@@ -775,7 +792,9 @@ and lower_statement context statement =
   match statement with
   | Py.Pass -> [ D.DEmptyStmt ]
   | Py.Break -> [ D.DBreak ]
-  | Py.Continue -> fail "continue statements are not supported"
+  | Py.Continue ->
+    if context.loop_depth > 0 then [ D.DContinue ]
+    else fail "continue statements are only supported inside loops"
   | Py.Exp expression ->
     let prelude, statements = lower_expression_statement context expression in
     prelude @ statements
@@ -816,7 +835,7 @@ and lower_statement context statement =
     let specifications = List.map specifications ~f:(lower_loop_spec (scoped context)) in
     let spec_prelude = List.concat_map specifications ~f:fst in
     let specifications = List.map specifications ~f:snd in
-    let body = lower_statements context body in
+    let body = lower_statements { context with loop_depth = context.loop_depth + 1 } body in
     if List.is_empty lowered_condition.prelude then
       spec_prelude @ [ D.DWhile (specifications, lowered_condition.result, body) ]
     else

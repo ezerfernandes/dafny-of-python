@@ -382,6 +382,10 @@ and print_stmt id = function
     let b = newcolumn "break" in 
     let ps = (newcolumn ";") in
     String.concat [n; b; ps]
+  | DContinue -> let n = newcolumn (indent id) in
+    let c = newcolumn "continue" in
+    let ps = newcolumn ";" in
+    String.concat [n; c; ps]
   | DAssign (_, [], _) -> ""
   | DAssign (None, first::rest, el) -> let n = newcolumn (indent id) in
     let exists = (lookup (!curr_func) (seg_val first) !vars) in

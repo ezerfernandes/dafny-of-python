@@ -14,7 +14,7 @@ menhir --list-errors
 %token <Sourcemap.segment> COMMA
 %token <Sourcemap.segment> NONE
 %token <int> SPACE
-%token <Sourcemap.segment> DEF IF ELIF ELSE WHILE FOR BREAK RETURN NOT_IN IN ASSERT LAMBDA PASS
+%token <Sourcemap.segment> DEF IF ELIF ELSE WHILE FOR BREAK CONTINUE RETURN NOT_IN IN ASSERT LAMBDA PASS
 %token <Sourcemap.segment> AND OR NOT 
 %token <Sourcemap.segment> TYPF IDENTIFIER INT_TYP FLOAT_TYP BOOL_TYP STRING_TYP LIST_TYP DICT_TYP SET_TYP TUPLE_TYP CALLABLE_TYP UNION_TYP TYPE_TYP OBJ_TYP
 %token <string> STRING INT FLOAT
@@ -72,6 +72,7 @@ small_stmt:
   | PASS { Pass }
   | ASSERT; e=exp { Assert e }
   | BREAK { Break }
+  | CONTINUE { Continue }
   ;
 
 compound_stmt:
