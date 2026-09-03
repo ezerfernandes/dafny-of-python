@@ -14,6 +14,7 @@ type context =
   ; return_type : Py.typ option
   ; loop_depth : int
   ; iterated_lists : string list
+  ; iterated_maps : string list
   }
 
 type lowered =
@@ -57,6 +58,7 @@ let context environment =
   ; return_type = None
   ; loop_depth = 0
   ; iterated_lists = []
+  ; iterated_maps = []
   }
 
 let scoped context = { context with evaluation = Scoped }
@@ -545,18 +547,32 @@ and lower_for context specifications identifiers iterable body =
     |> fun environment -> Sem.bind environment target_name element_type
   in
   let loop_context =
+    let inherited_iterated_lists =
+      List.filter context.iterated_lists ~f:(fun name -> not (String.equal name target_name))
+    in
+    let inherited_iterated_maps =
+      List.filter context.iterated_maps ~f:(fun name -> not (String.equal name target_name))
+    in
     let iterated_lists =
       match kind, iterable with
       | Sem.ListCollection, Py.Identifier source
         when not (String.equal (Option.value (snd source) ~default:"") target_name) ->
         Sem.list_aliases_for context.environment (Option.value (snd source) ~default:"")
-        @ context.iterated_lists
-      | _ -> context.iterated_lists
+        @ inherited_iterated_lists
+      | _ -> inherited_iterated_lists
+    in
+    let iterated_maps =
+      match kind, iterable with
+      | Sem.MapCollection, Py.Identifier source ->
+        Sem.map_aliases_for context.environment (Option.value (snd source) ~default:"")
+        @ inherited_iterated_maps
+      | _ -> inherited_iterated_maps
     in
     { context with
       environment = loop_environment
     ; loop_depth = context.loop_depth + 1
     ; iterated_lists
+    ; iterated_maps
     }
   in
   let lower_specs () =
@@ -801,6 +817,8 @@ and lower_map_assignment context map key value =
     | Sem.MapCollection -> ()
     | _ -> raise (LoweringError "indexed assignment target is not a map")
   end;
+  if List.exists context.iterated_maps ~f:(String.equal (Option.value (snd map) ~default:"")) then
+    raise (LoweringError "map updates while iterating are unsupported");
   let lowered_value = lower context value in
   let lowered_key = lower context key in
   lowered_value.prelude

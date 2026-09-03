@@ -26,7 +26,7 @@ let test_dafny4_function_syntax () =
   let method_program =
     Ast.Program
       (parse_program
-         "def method_form(x: int) -> int:\n  y = x + 1\n  return y\n\n# pre len(xs) > 1\ndef tail(xs: list[int]) -> list[int]:\n  return xs[1:]\n\ndef tail_caller(xs: list[int]) -> list[int]:\n  return tail(xs)\n\ndef mutate(xs: list[int]) -> None:\n  xs.append(2)\n\ndef caller() -> int:\n  return method_form(1)\n")
+         "def method_form(x: int) -> int:\n  y = x + 1\n  return y\n\n# pre len(xs) > 1\ndef tail(xs: list[int]) -> list[int]:\n  return xs[1:]\n\ndef tail_caller(xs: list[int]) -> list[int]:\n  return tail(xs)\n\ndef mutate(xs: list[int]) -> None:\n  xs.append(2)\n\ndef alias_mutate(xs: list[int]) -> None:\n  ys = xs\n  ys.append(2)\n\ndef caller() -> int:\n  return method_form(1)\n")
   in
   let method_ast = Transform.Todafnyast.prog_dfy method_program in
   let method_source, _ = Transform.Emitdfy.print_prog_with_sourcemap method_ast
@@ -58,6 +58,19 @@ let test_dafny4_function_syntax () =
        List.exists
          (function
           | D.DMeth (_, (_, Some "mutate"), _, _, [ D.DVoid ], Some [ D.DCallStmt _ ]) -> true
+          | _ -> false)
+         declarations);
+  check bool "alias-mutating methods carry a frame" true
+    (match method_ast with
+     | D.DProg (_, declarations) ->
+       List.exists
+         (function
+          | D.DMeth (specifications, (_, Some "alias_mutate"), _, _, [ D.DVoid ], _) ->
+            List.exists
+              (function
+               | D.DModifies (D.DIdentifier (_, Some "xs")) -> true
+               | _ -> false)
+              specifications
           | _ -> false)
          declarations);
   check bool "callers use the synchronized method signature" true
@@ -853,7 +866,7 @@ let test_semantic_lowering_paths () =
   List.iter
     (fun name -> ignore (Transform.Semantic.normalize_type (TIdent (segment name))))
     [ "list"; "seq"; "sequence"; "set"; "dict"; "map"; "tuple"; "array" ];
-  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; iterated_lists = [] } "ignored" int_type);
+  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; iterated_lists = []; iterated_maps = [] } "ignored" int_type);
   ignore (Transform.Semantic.annotation (Typ int_type));
   ignore (Transform.Semantic.annotation (Identifier (segment "Alias")));
   ignore (Transform.Semantic.annotation (Literal TrueLit));
@@ -1067,7 +1080,7 @@ let test_semantic_lowering_paths () =
   ignore (Transform.Semantic.lookup_function environment "missing");
   ignore (Transform.Semantic.lookup_class environment "Missing");
   ignore (Transform.Semantic.leave_scope (Transform.Semantic.enter_scope environment Transform.Semantic.ComprehensionScope));
-  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; iterated_lists = [] });
+  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; iterated_lists = []; iterated_maps = [] });
   let replacement : Transform.Semantic.callable_signature =
     { name = "pure"; parameters = []; return_type = int_type; kind = Transform.Semantic.Constructor }
   in
@@ -1877,6 +1890,12 @@ let test_phase3_collections () =
     (fun () -> ignore (Transform.Lowering.lower_map_assignment
                          (Transform.Lowering.context env) (segment "list_value")
                          (Literal (IntLit "0")) (Literal (IntLit "1"))));
+  expect_exception "direct map updates are rejected in an iterated context"
+    (function Transform.Lowering.LoweringError message -> has_substring message "while iterating" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.lower_map_assignment
+                         { (Transform.Lowering.context env) with iterated_maps = [ "other_map"; "mapping" ] }
+                         (segment "mapping") (Literal (IntLit "0"))
+                         (Literal (StringLit "value"))));
   ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context env)
             (Subscript (sequence, Index (Literal (IntLit "0")))));
   ignore (Transform.Lowering.lower_assignment (Transform.Lowering.context env) None
@@ -1964,7 +1983,24 @@ let test_phase3_collections () =
     (fun () -> ignore (Transform.Lowering.statements ~environment:list_alias_env
                          [ For ([], [ segment "item" ], list
                               , [ Exp (Call (Dot (list_alias, segment "append"),
-                                             [ Literal (IntLit "3") ])) ]) ]));
+                             [ Literal (IntLit "3") ])) ]) ]));
+  let map_alias = identifier "map_alias" in
+  let map_alias_env =
+    Transform.Semantic.validate_statements env
+      [ Assign (None, [ map_alias ], [ mapping ]) ]
+  in
+  expect_exception "map mutation during iteration is rejected by lowering"
+    (function Transform.Lowering.LoweringError message -> has_substring message "while iterating" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.statements ~environment:env
+                         [ For ([], [ segment "key" ], mapping
+                              , [ Assign (None, [ Subscript (mapping, Index (Literal (IntLit "3"))) ],
+                                          [ Literal (StringLit "value") ]) ]) ]));
+  expect_exception "map aliases are protected during iteration by lowering"
+    (function Transform.Lowering.LoweringError message -> has_substring message "while iterating" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.statements ~environment:map_alias_env
+                         [ For ([], [ segment "key" ], map_alias
+                              , [ Assign (None, [ Subscript (mapping, Index (Literal (IntLit "3"))) ],
+                                          [ Literal (StringLit "value") ]) ]) ]));
   List.iter
     (fun specification ->
        expect_exception "invalid loop specifications are rejected"
@@ -2007,6 +2043,26 @@ let test_phase3_collections () =
     (Transform.Semantic.validate_statements env
        [ For ([], [ segment "key" ], mapping
             , [ Assert (Subscript (mapping, Index (identifier "key"))) ]) ]);
+  let keyed_env = Transform.Semantic.bind env "key" int_type in
+  let membership_condition = BinaryExp (identifier "key", In def_seg, mapping) in
+  let map_lookup = Subscript (mapping, Index (identifier "key")) in
+  ignore
+    (Transform.Semantic.validate_statements keyed_env
+       [ IfElse (membership_condition, [ Assert map_lookup ], [], [ Pass ]) ]);
+  expect_exception "map membership proofs do not leak into else branches"
+    (function Transform.Semantic.SemanticError message -> has_substring message "membership precondition" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements keyed_env
+                         [ IfElse (membership_condition, [ Pass ], [], [ Assert map_lookup ]) ]));
+  expect_exception "map membership proofs do not leak into elif branches"
+    (function Transform.Semantic.SemanticError message -> has_substring message "membership precondition" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements keyed_env
+                         [ IfElse (membership_condition, [ Pass ],
+                                   [ (Literal TrueLit, [ Assert map_lookup ]) ], [ Pass ]) ]));
+  expect_exception "map membership proofs do not leak after conditionals"
+    (function Transform.Semantic.SemanticError message -> has_substring message "membership precondition" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements keyed_env
+                         [ IfElse (membership_condition, [ Pass ], [], [ Pass ])
+                         ; Assert map_lookup ]));
   expect_exception "multi-target list iteration is rejected semantically"
     (function Transform.Semantic.SemanticError message -> has_substring message "one loop target" | _ -> false)
     (fun () -> ignore (Transform.Semantic.validate_statements env
@@ -2026,6 +2082,54 @@ let test_phase3_collections () =
                          [ For ([], [ segment "item" ], list
                               , [ Exp (Call (Dot (list_alias, segment "append"),
                                              [ Literal (IntLit "3") ])) ]) ]));
+  expect_exception "map mutation during iteration is rejected semantically"
+    (function Transform.Semantic.SemanticError message -> has_substring message "while iterating" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ For ([], [ segment "key" ], mapping
+                              , [ Assign (None, [ Subscript (mapping, Index (Literal (IntLit "3"))) ],
+                                          [ Literal (StringLit "value") ]) ]) ]));
+  expect_exception "map aliases are protected during iteration semantically"
+    (function Transform.Semantic.SemanticError message -> has_substring message "while iterating" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements map_alias_env
+                         [ For ([], [ segment "key" ], map_alias
+                              , [ Assign (None, [ Subscript (mapping, Index (Literal (IntLit "3"))) ],
+                                          [ Literal (StringLit "value") ]) ]) ]));
+  let nested_list_type = TGeneric (segment "list", [ list_type ]) in
+  let nested_loop_environment =
+    Transform.Semantic.empty
+    |> fun env -> Transform.Semantic.bind env "xs" nested_list_type
+    |> fun env -> Transform.Semantic.bind env "ys" nested_list_type
+  in
+  let nested_shadowing_loop =
+    For
+      ( []
+      , [ segment "x" ]
+      , identifier "xs"
+      , [ For
+            ( []
+            , [ segment "xs" ]
+            , identifier "ys"
+            , [ Exp (Call (Dot (identifier "xs", segment "append"), [ Literal (IntLit "1") ])) ] ) ] )
+  in
+  ignore (Transform.Semantic.validate_statements nested_loop_environment [ nested_shadowing_loop ]);
+  ignore (Transform.Lowering.statements ~environment:nested_loop_environment [ nested_shadowing_loop ]);
+  let nested_map_type = TGeneric (segment "map", [ int_type; string_type ]) in
+  let nested_map_environment =
+    Transform.Semantic.empty
+    |> fun env -> Transform.Semantic.bind env "outer_mapping"
+         (TGeneric (segment "map", [ int_type; nested_map_type ]))
+    |> fun env -> Transform.Semantic.bind env "other_mapping"
+         (TGeneric (segment "map", [ int_type; nested_map_type ]))
+  in
+  let nested_map_loop =
+    For
+      ( []
+      , [ segment "outer_key" ]
+      , identifier "outer_mapping"
+      , [ For ([], [ segment "outer_mapping" ], identifier "other_mapping", [ Pass ]) ] )
+  in
+  ignore (Transform.Semantic.validate_statements nested_map_environment [ nested_map_loop ]);
+  ignore (Transform.Lowering.statements ~environment:nested_map_environment [ nested_map_loop ]);
   let untyped_list_env =
     Transform.Semantic.bind Transform.Semantic.empty "untyped_list"
       (TGeneric (segment "list", []))
@@ -2151,6 +2255,16 @@ let test_phase3_collections () =
   in
   ignore (Transform.Semantic.bind aliases_to_rebind "alias" list_type);
   ignore (Transform.Semantic.bind aliases_to_rebind "source" list_type);
+  let unrelated_map_aliases =
+    { env with map_aliases = [ ("other_map", "different_map") ] }
+  in
+  check (Alcotest.list Alcotest.string) "unrelated map aliases are excluded" [ "mapping" ]
+    (Transform.Semantic.map_aliases_for unrelated_map_aliases "mapping");
+  let map_aliases_to_rebind =
+    { env with map_aliases = [ ("alias_map", "source_map"); ("other_map", "target_map") ] }
+  in
+  ignore (Transform.Semantic.bind map_aliases_to_rebind "alias_map" map_type);
+  ignore (Transform.Semantic.bind map_aliases_to_rebind "source_map" map_type);
   ignore (Transform.Semantic.known_literal_key env known_map (identifier "dynamic"));
   ignore (Transform.Semantic.add_membership env "" "");
   ignore (Transform.Semantic.add_map_key env "mapping" values);

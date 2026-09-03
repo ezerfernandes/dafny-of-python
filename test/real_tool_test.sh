@@ -93,6 +93,10 @@ def tail_caller(xs: list[int]) -> list[int]:
 def mutate(xs: list[int]) -> None:
   xs.append(2)
 
+def alias_mutate(xs: list[int]) -> None:
+  ys = xs
+  ys.append(2)
+
 def increment(x: int) -> int:
   return x + 1
 
@@ -196,6 +200,7 @@ grep -q 'method tail' "$workdir/valid_output"
 grep -q 'method tail_caller' "$workdir/valid_output"
 grep -q 'rangeLower' "$workdir/valid_output"
 grep -q 'method mutate' "$workdir/valid_output"
+grep -q 'method alias_mutate' "$workdir/valid_output"
 grep -q 'function increment' "$workdir/valid_output"
 grep -q 'method method_form' "$workdir/valid_output"
 grep -q 'function ordered' "$workdir/valid_output"
@@ -221,7 +226,12 @@ run_rejected_program() {
   set +e
   (
     cd "$workdir"
-    "$main_exe" +      --mypy "$mypy_bin" +      --dafny "$dafny_bin" +      --prelude "$prelude" +      --list "$list_library" +      --temp-root "$workdir" < "$filename" > rejected_output 2> rejected_errors
+    "$main_exe" \
+      --mypy "$mypy_bin" \
+      --dafny "$dafny_bin" \
+      --prelude "$prelude" \
+      --list "$list_library" \
+      --temp-root "$workdir" < "$filename" > rejected_output 2> rejected_errors
   )
   local status=$?
   set -e
@@ -261,6 +271,13 @@ def invalid_list_alias(xs: list[int]) -> None:
     ys.append(item)
 PY
 run_rejected_program list_alias_mutation.py 'mutating list while iterating it is unsupported'
+
+cat > "$workdir/map_iteration_mutation.py" <<'PY'
+def invalid_map_iteration(mapping: dict[int, int]) -> None:
+  for key in mapping:
+    mapping[2] = key
+PY
+run_rejected_program map_iteration_mutation.py 'map updates while iterating are unsupported'
 
 # List objects are functional in the runtime and do not have an index setter.
 cat > "$workdir/list_assignment.py" <<'PYTHON'

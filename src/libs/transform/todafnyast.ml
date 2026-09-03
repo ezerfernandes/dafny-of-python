@@ -345,7 +345,8 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
   in
   let list_modifies =
     List.filter_map list_parameters ~f:(fun name ->
-      if List.exists body ~f:(statement_modifies ~method_names [ name ]) then
+      let list_names = Semantic.list_aliases_for body_environment name in
+      if List.exists body ~f:(statement_modifies ~method_names list_names) then
         Some (DModifies (DIdentifier (def_pos, Some name)))
       else None)
   in

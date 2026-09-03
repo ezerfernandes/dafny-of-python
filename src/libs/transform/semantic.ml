@@ -44,9 +44,10 @@ type environment =
   ; classes : class_definition list
   ; memberships : (string * string) list
   ; known_map_keys : (string * string list) list
-  ; map_aliases : string list
+  ; map_aliases : (string * string) list
   ; list_aliases : (string * string) list
   ; iterated_lists : string list
+  ; iterated_maps : string list
   }
 
 let empty =
@@ -58,6 +59,7 @@ let empty =
   ; map_aliases = []
   ; list_aliases = []
   ; iterated_lists = []
+  ; iterated_maps = []
   }
 
 let generic name args = TGeneric ((def_pos, Some name), args)
@@ -277,6 +279,20 @@ let list_aliases_for env name =
   in
   List.rev names
 
+let map_alias_root env name =
+  Option.value (List.Assoc.find env.map_aliases name ~equal:String.equal) ~default:name
+
+let map_aliases_for env name =
+  let root = map_alias_root env name in
+  let names =
+    List.fold env.map_aliases ~init:[ root ] ~f:(fun names (alias, alias_root) ->
+      if String.equal alias_root root
+         && not (List.exists names ~f:(String.equal alias))
+      then alias :: names
+      else names)
+  in
+  List.rev names
+
 let literal_key = function
   | Literal (IntLit value) -> Some ("int:" ^ value)
   | Literal (FloatLit value) -> Some ("float:" ^ value)
@@ -342,11 +358,14 @@ let bind env name typ =
     { env with
       scopes = { scope with bindings } :: rest
     ; known_map_keys = List.Assoc.remove env.known_map_keys name ~equal:String.equal
-    ; map_aliases = List.filter env.map_aliases ~f:(fun old -> not (String.equal old name))
+    ; map_aliases =
+        List.filter env.map_aliases ~f:(fun (alias, source) ->
+          not (String.equal alias name || String.equal source name))
     ; list_aliases =
         List.filter env.list_aliases ~f:(fun (alias, source) ->
           not (String.equal alias name || String.equal source name))
     ; iterated_lists = List.filter env.iterated_lists ~f:(fun old -> not (String.equal old name))
+    ; iterated_maps = List.filter env.iterated_maps ~f:(fun old -> not (String.equal old name))
     }
 
 let bind_many env bindings =
@@ -361,8 +380,10 @@ let bind_value env name typ value =
   in
   let env = set_map_keys env name keys in
   match value, collection_kind typ with
-  | Identifier _, MapCollection ->
-    { env with map_aliases = name :: env.map_aliases }
+  | Identifier source, MapCollection
+    when not (String.equal name (identifier_name (Identifier source))) ->
+    let source = map_alias_root env (identifier_name value) in
+    { env with map_aliases = (name, source) :: env.map_aliases }
   | Identifier source, ListCollection
     when not (String.equal name (identifier_name (Identifier source))) ->
     let source = list_alias_root env (identifier_name value) in
@@ -1038,8 +1059,12 @@ and validate_target env = function
         require (match value with Identifier _ -> true | _ -> false)
           "map updates require a local map variable";
         require
-          (not (List.exists env.map_aliases ~f:(String.equal (identifier_name value))))
+          (not (List.exists env.map_aliases ~f:(fun (alias, _) ->
+             String.equal alias (identifier_name value))))
           "map updates through aliases are unsupported";
+        require
+          (not (List.exists env.iterated_maps ~f:(String.equal (identifier_name value))))
+          "map updates while iterating are unsupported";
         begin
           match map_types (infer env value) with
           | Some (key_type, _) ->
@@ -1097,13 +1122,31 @@ and validate_statements env statements =
       env
     | IfElse (condition, first, alternatives, last) ->
       validate_exp env condition;
-      let env = validate_statements (assume_membership env condition) first in
-      let env =
-        List.fold alternatives ~init:env ~f:(fun env (condition, body) ->
-          validate_exp env condition;
-          validate_statements (assume_membership env condition) body)
+      let branch_environment = env in
+      let branch_memberships = branch_environment.memberships in
+      let validate_branch condition body =
+        let branch_environment = { branch_environment with memberships = branch_memberships } in
+        let branch_environment =
+          validate_statements (assume_membership branch_environment condition) body
+        in
+        branch_environment
       in
-      validate_statements env last
+      let first_environment = validate_branch condition first in
+      let alternative_environments =
+        List.map alternatives ~f:(fun (condition, body) ->
+          validate_exp branch_environment condition;
+          validate_branch condition body)
+      in
+      let last_environment = validate_statements branch_environment last in
+      let branch_environments = first_environment :: alternative_environments @ [ last_environment ] in
+      let memberships =
+        List.filter (Option.value (List.hd branch_environments) ~default:branch_environment).memberships
+          ~f:(fun membership ->
+            List.for_all branch_environments ~f:(fun environment ->
+              List.mem environment.memberships membership ~equal:(fun (left_key, left_map) (right_key, right_map) ->
+                String.equal left_key right_key && String.equal left_map right_map)))
+      in
+      { branch_environment with memberships }
     | While (specifications, condition, body) ->
       let env = validate_loop_specs env specifications in
       validate_exp env condition;
@@ -1143,8 +1186,13 @@ and validate_statements env statements =
             iterated_lists = list_aliases_for env (identifier_name (Identifier source))
                              @ loop_env.iterated_lists }
         | MapCollection, Identifier source ->
-          add_membership loop_env (identifier_name (Identifier identifier))
-            (identifier_name (Identifier source))
+          let loop_env =
+            add_membership loop_env (identifier_name (Identifier identifier))
+              (identifier_name (Identifier source))
+          in
+          { loop_env with
+            iterated_maps = map_aliases_for env (identifier_name (Identifier source))
+                            @ loop_env.iterated_maps }
         | _ -> loop_env
       in
       let loop_env = bind loop_env (identifier_name (Identifier identifier)) element in
