@@ -194,6 +194,9 @@ literal_alias_result = alias_literal_lookup()
 for item in values:
   assert item in values
 
+for key in mapping:
+  assert key in mapping
+
 loop_items: list[int] = [1]
 for loop_item in loop_items:
   continue
@@ -233,6 +236,7 @@ grep -q 'set<int>' "$workdir/valid_output"
 grep -q 'map<int, int>' "$workdir/valid_output"
 grep -q 'setFromSeq' "$workdir/valid_output"
 grep -q ':|' "$workdir/valid_output"
+grep -q '.Keys' "$workdir/valid_output"
 grep -q '.contains' "$workdir/valid_output"
 grep -q 'new List<int>(\[\])' "$workdir/valid_output"
 grep -q 'while true' "$workdir/valid_output"
@@ -300,7 +304,14 @@ def invalid_map_iteration(mapping: dict[int, int]) -> None:
   for key in mapping:
     mapping[2] = key
 PY
-run_rejected_program map_iteration_mutation.py 'map iteration is unsupported because Dafny maps do not preserve Python insertion order'
+run_rejected_program map_iteration_mutation.py 'map updates while iterating are unsupported'
+
+cat > "$workdir/map_iteration_order.py" <<'PY'
+def invalid_map_order(mapping: dict[int, int]) -> None:
+  for key in mapping:
+    break
+PY
+run_rejected_program map_iteration_order.py 'order-dependent behavior in map iteration is unsupported'
 
 # List objects are functional in the runtime and do not have an index setter.
 cat > "$workdir/list_assignment.py" <<'PYTHON'

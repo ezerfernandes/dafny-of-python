@@ -14,6 +14,7 @@ type context =
   ; return_type : Py.typ option
   ; loop_depth : int
   ; iterated_lists : string list
+  ; iterated_maps : string list
   }
 
 type lowered =
@@ -57,6 +58,7 @@ let context environment =
   ; return_type = None
   ; loop_depth = 0
   ; iterated_lists = []
+  ; iterated_maps = []
   }
 
 let scoped context = { context with evaluation = Scoped }
@@ -302,7 +304,8 @@ and reject_iterated_list_mutation context callee =
       match Sem.collection_kind (Sem.infer context.environment (Py.Identifier identifier)) with
       | Sem.ListCollection
         when Sem.is_list_mutating_method method_name
-             && List.exists context.iterated_lists ~f:(String.equal name) ->
+             && List.exists context.iterated_lists ~f:(fun iterated ->
+                  Sem.may_alias_list context.environment name iterated) ->
         fail ("mutating list while iterating it is unsupported: " ^ String.lowercase method_name)
       | _ -> ()
     end
@@ -548,18 +551,30 @@ and lower_for context specifications identifiers iterable body =
     let inherited_iterated_lists =
       List.filter context.iterated_lists ~f:(fun name -> not (String.equal name target_name))
     in
+    let inherited_iterated_maps =
+      List.filter context.iterated_maps ~f:(fun name -> not (String.equal name target_name))
+    in
     let iterated_lists =
       match kind, iterable with
       | Sem.ListCollection, Py.Identifier source
         when not (String.equal (Option.value (snd source) ~default:"") target_name) ->
-        Sem.list_aliases_for context.environment (Option.value (snd source) ~default:"")
+        Sem.list_may_aliases_for context.environment (Option.value (snd source) ~default:"")
         @ inherited_iterated_lists
       | _ -> inherited_iterated_lists
+    in
+    let iterated_maps =
+      match kind, iterable with
+      | Sem.MapCollection, Py.Identifier source
+        when not (String.equal (Option.value (snd source) ~default:"") target_name) ->
+        Sem.map_aliases_for context.environment (Option.value (snd source) ~default:"")
+        @ inherited_iterated_maps
+      | _ -> inherited_iterated_maps
     in
     { context with
       environment = loop_environment
     ; loop_depth = context.loop_depth + 1
     ; iterated_lists
+    ; iterated_maps
     }
   in
   let lower_specs () =
@@ -634,7 +649,14 @@ and lower_for context specifications identifiers iterable body =
   | Sem.SetCollection ->
     lowered_iterable.prelude @ [ snapshot_binding ] @ lower_value_loop snapshot_expression
   | Sem.MapCollection ->
-    fail "map iteration is unsupported because Dafny maps do not preserve Python insertion order"
+    let lowered =
+      lowered_iterable.prelude
+      @ [ snapshot_binding ]
+      @ lower_value_loop (D.DMapKeys snapshot_expression)
+    in
+    if Sem.map_iteration_is_order_sensitive body then
+      fail "order-dependent behavior in map iteration is unsupported"
+    else lowered
   | _ -> fail "for loop iterable is not a supported collection"
 
 and lower context expression =
@@ -801,6 +823,11 @@ and lower_map_assignment context map key value =
     match Sem.collection_kind (Sem.infer context.environment map_expression) with
     | Sem.MapCollection -> ()
     | _ -> raise (LoweringError "indexed assignment target is not a map")
+  end;
+  begin
+    match List.exists context.iterated_maps ~f:(String.equal (Option.value (snd map) ~default:"")) with
+    | true -> raise (LoweringError "map updates while iterating are unsupported")
+    | false -> ()
   end;
   let lowered_value = lower context value in
   let lowered_key = lower context key in

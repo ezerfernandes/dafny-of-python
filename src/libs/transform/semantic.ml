@@ -46,7 +46,9 @@ type environment =
   ; known_map_keys : (string * string list) list
   ; map_aliases : (string * string) list
   ; list_aliases : (string * string) list
+  ; possible_list_aliases : (string * string) list
   ; iterated_lists : string list
+  ; iterated_maps : string list
   }
 
 let empty =
@@ -57,7 +59,9 @@ let empty =
   ; known_map_keys = []
   ; map_aliases = []
   ; list_aliases = []
+  ; possible_list_aliases = []
   ; iterated_lists = []
+  ; iterated_maps = []
   }
 
 let generic name args = TGeneric ((def_pos, Some name), args)
@@ -263,8 +267,35 @@ let identifier_name = function
   | Identifier segment -> Option.value (snd segment) ~default:""
   | _ -> ""
 
+let alias_root aliases name =
+  let rec resolve seen name =
+    if List.mem seen name ~equal:String.equal then name
+    else
+      match List.Assoc.find aliases name ~equal:String.equal with
+      | Some root -> resolve (name :: seen) root
+      | None -> name
+  in
+  resolve [] name
+
+let alias_roots aliases name =
+  let rec resolve seen name =
+    if List.mem seen name ~equal:String.equal then [ name ]
+    else
+      let roots =
+        List.filter_map aliases ~f:(fun (alias, root) ->
+          if String.equal alias name then Some root else None)
+      in
+      match roots with
+      | [] -> [ name ]
+      | roots ->
+        roots
+        |> List.concat_map ~f:(resolve (name :: seen))
+        |> List.dedup_and_sort ~compare:String.compare
+  in
+  resolve [] name
+
 let list_alias_root env name =
-  Option.value (List.Assoc.find env.list_aliases name ~equal:String.equal) ~default:name
+  alias_root env.list_aliases name
 
 let list_aliases_for env name =
   let root = list_alias_root env name in
@@ -277,8 +308,30 @@ let list_aliases_for env name =
   in
   List.rev names
 
+let list_may_aliases_for env name =
+  let aliases = env.list_aliases @ env.possible_list_aliases in
+  let roots = alias_roots aliases name in
+  let names =
+    List.fold aliases ~init:roots ~f:(fun names (alias, _) ->
+      if List.exists (alias_roots aliases alias) ~f:(fun root ->
+           List.mem roots root ~equal:String.equal)
+         && not (List.exists names ~f:(String.equal alias))
+      then alias :: names
+      else names)
+  in
+  List.rev names
+
+let may_alias_list env left right =
+  let left_roots = alias_roots (env.list_aliases @ env.possible_list_aliases) left in
+  let right_roots = alias_roots (env.list_aliases @ env.possible_list_aliases) right in
+  List.exists left_roots ~f:(fun root -> List.mem right_roots root ~equal:String.equal)
+
+let may_iterated_list env name =
+  List.exists env.iterated_lists ~f:(fun iterated ->
+    may_alias_list env name iterated)
+
 let map_alias_root env name =
-  Option.value (List.Assoc.find env.map_aliases name ~equal:String.equal) ~default:name
+  alias_root env.map_aliases name
 
 let map_aliases_for env name =
   let root = map_alias_root env name in
@@ -313,6 +366,18 @@ let common_map_keys environments =
           | _ -> None)
       in
       Option.map keys ~f:(fun keys -> name, keys))
+
+let union_pairs pairs =
+  List.fold pairs ~init:[] ~f:(fun result pair ->
+    if List.mem result pair ~equal:(fun (left_name, left_root) (right_name, right_root) ->
+         String.equal left_name right_name && String.equal left_root right_root)
+    then result
+    else pair :: result)
+
+let possible_list_aliases environments =
+  union_pairs
+    (List.concat_map environments ~f:(fun environment ->
+       environment.possible_list_aliases @ environment.list_aliases))
 
 let literal_key = function
   | Literal (IntLit value) -> Some ("int:" ^ value)
@@ -389,7 +454,11 @@ let bind env name typ =
     ; list_aliases =
         List.filter env.list_aliases ~f:(fun (alias, source) ->
           not (String.equal alias name || String.equal source name))
+    ; possible_list_aliases =
+        List.filter env.possible_list_aliases ~f:(fun (alias, source) ->
+          not (String.equal alias name || String.equal source name))
     ; iterated_lists = List.filter env.iterated_lists ~f:(fun old -> not (String.equal old name))
+    ; iterated_maps = List.filter env.iterated_maps ~f:(fun old -> not (String.equal old name))
     }
 
 let bind_many env bindings =
@@ -398,16 +467,16 @@ let bind_many env bindings =
 let bind_value env name typ value =
   let map_alias_source =
     match value, collection_kind typ with
-    | Identifier source, MapCollection
-      when not (String.equal name (identifier_name (Identifier source))) ->
-      Some (map_alias_root env (identifier_name (Identifier source)))
+    | Identifier source, MapCollection ->
+      let source = map_alias_root env (identifier_name (Identifier source)) in
+      if String.equal name source then None else Some source
     | _ -> None
   in
   let list_alias_source =
     match value, collection_kind typ with
-    | Identifier source, ListCollection
-      when not (String.equal name (identifier_name (Identifier source))) ->
-      Some (list_alias_root env (identifier_name (Identifier source)))
+    | Identifier source, ListCollection ->
+      let source = list_alias_root env (identifier_name (Identifier source)) in
+      if String.equal name source then None else Some source
     | _ -> None
   in
   let env = bind env name typ in
@@ -424,7 +493,14 @@ let bind_value env name typ value =
   match value with
   | Dict entries ->
     set_map_keys env name (List.filter_map entries ~f:(fun (key, _) -> literal_key key))
-  | _ -> env
+  | Identifier _ -> env
+  | _ ->
+    begin
+      match collection_kind typ with
+      | MapCollection ->
+        { env with known_map_keys = List.Assoc.remove env.known_map_keys name ~equal:String.equal }
+      | _ -> env
+    end
 
 let add_map_key env name key =
   match literal_key key with
@@ -813,6 +889,62 @@ let require_set_source kind message =
      | _ -> false)
     message
 
+let any_order_sensitive values =
+  List.exists values ~f:(fun value -> value)
+
+let rec expression_order_sensitive = function
+  | Typ _ | Literal _ | Identifier _ -> false
+  | Dot (value, _) | UnaryExp (_, value) | Index value | Len (_, value)
+  | Max (_, value) | Old (_, value) | Fresh (_, value) -> expression_order_sensitive value
+  | BinaryExp (left, _, right) ->
+    any_order_sensitive
+      [ expression_order_sensitive left; expression_order_sensitive right ]
+  | CompareChain (first, comparisons) ->
+    any_order_sensitive
+      (expression_order_sensitive first
+       :: List.map comparisons ~f:(fun (_, operand) -> expression_order_sensitive operand))
+  | Call _ -> true
+  | Lst elements | Array elements | Set elements | Tuple elements ->
+    List.exists elements ~f:expression_order_sensitive
+  | Dict entries ->
+    List.exists entries ~f:(fun (key, value) ->
+      any_order_sensitive
+        [ expression_order_sensitive key; expression_order_sensitive value ])
+  | SingletonTuple (_, value) -> expression_order_sensitive value
+  | Subscript (value, selector) ->
+    any_order_sensitive
+      [ expression_order_sensitive value; expression_order_sensitive selector ]
+  | Slice (lower, upper) ->
+    any_order_sensitive
+      [ Option.exists lower ~f:expression_order_sensitive
+      ; Option.exists upper ~f:expression_order_sensitive ]
+  | Forall (_, body) | Exists (_, body) | Lambda (_, body) ->
+    expression_order_sensitive body
+  | IfElseExp (when_true, condition, when_false) ->
+    any_order_sensitive
+      [ expression_order_sensitive when_true
+      ; expression_order_sensitive condition
+      ; expression_order_sensitive when_false ]
+
+let rec statement_order_sensitive = function
+  | Pass -> false
+  | Assert expression | Exp expression -> expression_order_sensitive expression
+  | IfElse (condition, first, alternatives, last) ->
+    any_order_sensitive
+      [ expression_order_sensitive condition
+      ; List.exists first ~f:statement_order_sensitive
+      ; List.exists alternatives ~f:(fun (condition, body) ->
+          any_order_sensitive
+            [ expression_order_sensitive condition
+            ; List.exists body ~f:statement_order_sensitive ])
+      ; List.exists last ~f:statement_order_sensitive ]
+  | Assign _ | While _ | Return _ | Break | Continue -> true
+  | For (_, _, _, body) -> List.exists body ~f:statement_order_sensitive
+  | Function (_, _, _, _, body) -> List.exists body ~f:statement_order_sensitive
+
+let map_iteration_is_order_sensitive body =
+  List.exists body ~f:statement_order_sensitive
+
 let membership_type _env value_type =
   match collection_kind value_type, collection_arguments value_type with
   | SetCollection, element :: _ -> Some element
@@ -955,7 +1087,7 @@ let rec validate_call env callee arguments =
       match collection, method_name with
       | ListCollection, method_name
         when is_list_mutating_method method_name
-             && List.exists env.iterated_lists ~f:(String.equal (identifier_name value)) ->
+             && may_iterated_list env (identifier_name value) ->
         fail ("mutating list while iterating it is unsupported: " ^ method_name)
       | SetCollection, ("add" | "remove" | "discard" | "pop" | "clear" | "update"
                         | "intersection_update" | "difference_update" | "symmetric_difference_update")
@@ -1098,6 +1230,9 @@ and validate_target env = function
           (not (List.exists env.map_aliases ~f:(fun (alias, _) ->
              String.equal alias (identifier_name value))))
           "map updates through aliases are unsupported";
+        require
+          (not (List.exists env.iterated_maps ~f:(String.equal (identifier_name value))))
+          "map updates while iterating are unsupported";
         begin
           match map_types (infer env value) with
           | Some (key_type, _) ->
@@ -1181,8 +1316,15 @@ and validate_statements env statements =
       in
       let list_aliases = common_pairs branch_environments (fun environment -> environment.list_aliases) in
       let map_aliases = common_pairs branch_environments (fun environment -> environment.map_aliases) in
+      let possible_list_aliases = possible_list_aliases branch_environments in
       let known_map_keys = common_map_keys branch_environments in
-      { branch_environment with memberships; list_aliases; map_aliases; known_map_keys }
+      { branch_environment with
+        memberships
+      ; list_aliases
+      ; possible_list_aliases
+      ; map_aliases
+      ; known_map_keys
+      }
     | While (specifications, condition, body) ->
       let env = validate_loop_specs env specifications in
       validate_exp env condition;
@@ -1200,9 +1342,7 @@ and validate_statements env statements =
         | MapCollection ->
           require (Option.is_some (map_types (infer env iterable)))
             "map iteration requires concrete key and value types";
-          require (List.length identifiers = 1) "set/map iteration requires one loop target";
-          raise (SemanticError
-                   "map iteration is unsupported because Dafny maps do not preserve Python insertion order")
+          require (List.length identifiers = 1) "set/map iteration requires one loop target"
         | ListCollection | SequenceCollection ->
           require (List.length identifiers = 1)
             "list/sequence iteration requires one loop target"
@@ -1219,14 +1359,33 @@ and validate_statements env statements =
       let identifier = List.hd_exn identifiers in
       let loop_env =
         match collection_kind (infer env iterable), iterable with
+        | MapCollection, Identifier source ->
+          add_membership loop_env (identifier_name (Identifier identifier))
+            (identifier_name (Identifier source))
+        | _ -> loop_env
+      in
+      let loop_env =
+        match collection_kind (infer env iterable), iterable with
         | ListCollection, Identifier source ->
           { loop_env with
             iterated_lists = list_aliases_for env (identifier_name (Identifier source))
                              @ loop_env.iterated_lists }
+        | MapCollection, Identifier source ->
+          { loop_env with
+            iterated_maps = map_aliases_for env (identifier_name (Identifier source))
+                            @ loop_env.iterated_maps }
         | _ -> loop_env
       in
       let loop_env = bind loop_env (identifier_name (Identifier identifier)) element in
-      ignore (validate_statements loop_env body);
+      let body_environment = validate_statements loop_env body in
+      begin
+        match collection_kind (infer env iterable) with
+        | MapCollection ->
+          require (not (map_iteration_is_order_sensitive body))
+            "order-dependent behavior in map iteration is unsupported"
+        | _ -> ()
+      end;
+      ignore body_environment;
       env
     | Return value | Assert value | Exp value -> validate_exp env value; env
     | Break | Continue | Pass -> env)
