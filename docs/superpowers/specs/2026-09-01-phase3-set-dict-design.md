@@ -66,13 +66,13 @@ The semantic environment classifies the iterable before loop lowering:
 - Lists and sequences retain indexed loop lowering.
 - Sets iterate over a remaining set, choosing one member per iteration and
   removing it from the remaining value.
-- Maps iterate over a remaining key set, choosing one key per iteration and
-  removing it after the body.
+- Maps are rejected during iteration because Dafny map keys are exposed as an
+  unordered set, while Python dictionaries preserve insertion order.
 
-Set/map iteration requires a single supported loop target. Unsupported
+Set iteration requires a single supported loop target. Unsupported
 destructuring and assumptions about iteration order produce translator
-errors. The remaining collection is paired with a decreasing cardinality so
-the generated loop has a Dafny termination argument.
+errors. The remaining set is paired with a decreasing cardinality so the
+generated loop has a Dafny termination argument.
 
 ## Evaluation order and effects
 
@@ -87,6 +87,8 @@ Semantic analysis rejects before Dafny invocation:
 
 - missing concrete collection element, key, or value types;
 - invalid membership, equality, algebra, or indexing operands;
+- map iteration, because the target representation cannot preserve Python
+  dictionary insertion order;
 - map lookup where the enclosing specification has no available membership
   guarantee;
 - functional updates through fields, nested indexes, or aliases;

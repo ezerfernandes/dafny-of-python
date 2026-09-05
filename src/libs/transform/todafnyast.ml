@@ -327,6 +327,35 @@ let rec statement_modifies ?(method_names = []) names = function
   | Return value | Assert value | Exp value -> expression_modifies ~method_names names value
   | Break | Continue | Pass -> false
 
+let add_frame_alias names name =
+  if String.is_empty name || List.mem names name ~equal:String.equal then names else name :: names
+
+let rec collect_frame_aliases names statements =
+  List.fold statements ~init:names ~f:(fun names statement ->
+    let names =
+      match statement with
+      | Assign (_, [ Identifier alias ], [ Identifier source ]) ->
+        let alias = Option.value (snd alias) ~default:"" in
+        let source = Option.value (snd source) ~default:"" in
+        if List.mem names source ~equal:String.equal then add_frame_alias names alias else names
+      | _ -> names
+    in
+    match statement with
+    | IfElse (_, first, alternatives, last) ->
+      let names = collect_frame_aliases names first in
+      let names = List.fold alternatives ~init:names ~f:(fun names (_, body) -> collect_frame_aliases names body) in
+      collect_frame_aliases names last
+    | While (_, _, body) | For (_, _, _, body) -> collect_frame_aliases names body
+    | Function (_, _, _, _, body) -> collect_frame_aliases names body
+    | _ -> names)
+
+let frame_aliases name body =
+  let rec fixed_point names =
+    let updated = collect_frame_aliases names body in
+    if List.length updated = List.length names then updated else fixed_point updated
+  in
+  fixed_point [ name ]
+
 let semantic_function generics environment (speclst, name, parameters, return_type, body) =
   let function_environment = semantic_function_env environment name parameters return_type in
   let function_environment = Semantic.validate_specs function_environment speclst in
@@ -345,7 +374,11 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
   in
   let list_modifies =
     List.filter_map list_parameters ~f:(fun name ->
-      let list_names = Semantic.list_aliases_for body_environment name in
+      let list_names =
+        frame_aliases name body
+        @ Semantic.list_aliases_for body_environment name
+        |> List.dedup_and_sort ~compare:String.compare
+      in
       if List.exists body ~f:(statement_modifies ~method_names list_names) then
         Some (DModifies (DIdentifier (def_pos, Some name)))
       else None)
@@ -358,15 +391,15 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
   | [ Exp _ ] when (match Semantic.normalize_type return_typ with TNone _ -> true | _ -> false) ->
     DMeth
       (specifications @ list_modifies, name, generics, parameters, [ return_type ],
-       Some
+         Some
          (Lowering.statements
-            ~environment:body_environment
+            ~environment:function_environment
             ~return_type:return_typ
             body))
   | [ Return expression ] | [ Exp expression ] ->
     let lowered =
       Lowering.expression
-        ~environment:body_environment
+        ~environment:function_environment
         ~expected_type:return_typ
         expression
     in
@@ -387,9 +420,9 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
   | _ ->
       DMeth
          (specifications @ list_modifies, name, generics, parameters, [ return_type ],
-         Some
+           Some
            (Lowering.statements
-              ~environment:body_environment
+              ~environment:function_environment
               ~return_type:return_typ
               body))
 
@@ -406,11 +439,12 @@ let prog_dfy p =
   Convertcall.reset ();
   let p = Semantic.normalize_program p in
   let (n_p, gens) = Generics.prog p in
-  let environment = Semantic.analyze n_p in
+  let environment = Semantic.initial_environment n_p in
   (* Typed lowering owns loop translation so set/map iterables can use their
      value semantics instead of the list-specific indexed conversion. *)
   let p = n_p in
   let (Program sl) = p in
+  ignore (Semantic.validate_statements environment sl);
   let d_funcs = List.fold ~f:(fun so_far s ->
     match s with
     | Function (speclst, name, parameters, return_type, body) when is_func s ->

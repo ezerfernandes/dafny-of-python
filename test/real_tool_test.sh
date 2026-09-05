@@ -97,6 +97,27 @@ def alias_mutate(xs: list[int]) -> None:
   ys = xs
   ys.append(2)
 
+def branch_alias_mutate(xs: list[int], flag: bool) -> None:
+  if flag:
+    ys = xs
+    ys.append(2)
+
+def alias_lookup(mapping: dict[int, int], key: int) -> int:
+  alias = mapping
+  if key in alias:
+    return mapping[key]
+  else:
+    return 0
+
+def alias_literal_lookup() -> int:
+  mapping: dict[int, int] = {1: 2}
+  alias = mapping
+  return alias[1]
+
+def loop_entry_environment(other: list[int], mapping: list[int]) -> None:
+  for key in other:
+    assert key == key
+
 def increment(x: int) -> int:
   return x + 1
 
@@ -167,12 +188,11 @@ def lookup(mapping: dict[int, int], key: int) -> int:
   return mapping[key]
 
 assert lookup(mapping, 1) == 12
+alias_result = alias_lookup(mapping, 1)
+literal_alias_result = alias_literal_lookup()
 
 for item in values:
   assert item in values
-
-for key in mapping:
-  assert mapping[key] == mapping[key]
 
 loop_items: list[int] = [1]
 for loop_item in loop_items:
@@ -201,13 +221,16 @@ grep -q 'method tail_caller' "$workdir/valid_output"
 grep -q 'rangeLower' "$workdir/valid_output"
 grep -q 'method mutate' "$workdir/valid_output"
 grep -q 'method alias_mutate' "$workdir/valid_output"
+grep -q 'method branch_alias_mutate' "$workdir/valid_output"
+grep -q 'method alias_lookup' "$workdir/valid_output"
+grep -q 'method alias_literal_lookup' "$workdir/valid_output"
+grep -q 'method loop_entry_environment' "$workdir/valid_output"
 grep -q 'function increment' "$workdir/valid_output"
 grep -q 'method method_form' "$workdir/valid_output"
 grep -q 'function ordered' "$workdir/valid_output"
 grep -q 'if ' "$workdir/valid_output"
 grep -q 'set<int>' "$workdir/valid_output"
 grep -q 'map<int, int>' "$workdir/valid_output"
-grep -q '\.Keys' "$workdir/valid_output"
 grep -q 'setFromSeq' "$workdir/valid_output"
 grep -q ':|' "$workdir/valid_output"
 grep -q '.contains' "$workdir/valid_output"
@@ -277,7 +300,7 @@ def invalid_map_iteration(mapping: dict[int, int]) -> None:
   for key in mapping:
     mapping[2] = key
 PY
-run_rejected_program map_iteration_mutation.py 'map updates while iterating are unsupported'
+run_rejected_program map_iteration_mutation.py 'map iteration is unsupported because Dafny maps do not preserve Python insertion order'
 
 # List objects are functional in the runtime and do not have an index setter.
 cat > "$workdir/list_assignment.py" <<'PYTHON'

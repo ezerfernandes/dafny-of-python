@@ -19,6 +19,7 @@ let has_substring source pattern =
   pattern_length = 0 || search 0
 
 let test_dafny4_function_syntax () =
+  let segment name = Pyparse.Sourcemap.new_seg 1 1 (Some name) in
   let ast = Transform.Todafnyast.prog_dfy (Ast.Program (parse_program "def f(x: int) -> int:\n  return x\n")) in
   let generated, _ = Transform.Emitdfy.print_prog_with_sourcemap ast in
   check bool "Dafny 4 function syntax is emitted" true (has_substring generated "function f(");
@@ -26,7 +27,7 @@ let test_dafny4_function_syntax () =
   let method_program =
     Ast.Program
       (parse_program
-         "def method_form(x: int) -> int:\n  y = x + 1\n  return y\n\n# pre len(xs) > 1\ndef tail(xs: list[int]) -> list[int]:\n  return xs[1:]\n\ndef tail_caller(xs: list[int]) -> list[int]:\n  return tail(xs)\n\ndef mutate(xs: list[int]) -> None:\n  xs.append(2)\n\ndef alias_mutate(xs: list[int]) -> None:\n  ys = xs\n  ys.append(2)\n\ndef caller() -> int:\n  return method_form(1)\n")
+         "def method_form(x: int) -> int:\n  y = x + 1\n  return y\n\n# pre len(xs) > 1\ndef tail(xs: list[int]) -> list[int]:\n  return xs[1:]\n\ndef tail_caller(xs: list[int]) -> list[int]:\n  return tail(xs)\n\ndef mutate(xs: list[int]) -> None:\n  xs.append(2)\n\ndef alias_mutate(xs: list[int]) -> None:\n  ys = xs\n  ys.append(2)\n\ndef branch_alias_mutate(xs: list[int], flag: bool) -> None:\n  if flag:\n    ys = xs\n    ys.append(2)\n\ndef caller() -> int:\n  return method_form(1)\n")
   in
   let method_ast = Transform.Todafnyast.prog_dfy method_program in
   let method_source, _ = Transform.Emitdfy.print_prog_with_sourcemap method_ast
@@ -71,8 +72,111 @@ let test_dafny4_function_syntax () =
                | D.DModifies (D.DIdentifier (_, Some "xs")) -> true
                | _ -> false)
               specifications
+         | _ -> false)
+         declarations);
+  check bool "branch aliases contribute to list frames" true
+    (match method_ast with
+     | D.DProg (_, declarations) ->
+       List.exists
+         (function
+          | D.DMeth (specifications, (_, Some "branch_alias_mutate"), _, _, [ D.DVoid ], _) ->
+            List.exists
+              (function
+               | D.DModifies (D.DIdentifier (_, Some "xs")) -> true
+               | _ -> false)
+              specifications
           | _ -> false)
          declarations);
+  let map_type = Ast.Typ (Ast.TDict (def_seg, Some (Ast.TInt def_seg), Some (Ast.TInt def_seg))) in
+  let map_program =
+    Ast.Program
+      [ Ast.Function
+          ( []
+          , segment "alias_lookup"
+          , [ segment "mapping", map_type; segment "key", Ast.Typ (Ast.TInt def_seg) ]
+          , Ast.Typ (Ast.TInt def_seg)
+          , [ Ast.Assign (None, [ Ast.Identifier (segment "alias") ], [ Ast.Identifier (segment "mapping") ])
+            ; Ast.IfElse
+                ( Ast.CompareChain
+                    ( Ast.Identifier (segment "key")
+                    , [ (Ast.In def_seg, Ast.Identifier (segment "alias")) ] )
+                , [ Ast.Return
+                      (Ast.Subscript
+                         ( Ast.Identifier (segment "mapping")
+                         , Ast.Index (Ast.Identifier (segment "key")) )) ]
+                , []
+                , [ Ast.Return (Ast.Literal (Ast.IntLit "0")) ] ) ] )
+        ; Ast.Function
+            ( []
+            , segment "common_mapping"
+            , [ segment "mapping", map_type; segment "flag", Ast.Typ (Ast.TBool def_seg) ]
+            , Ast.Typ (Ast.TInt def_seg)
+            , [ Ast.IfElse
+                  ( Ast.Identifier (segment "flag")
+                  , [ Ast.Assign
+                        ( None
+                        , [ Ast.Identifier (segment "mapping") ]
+                        , [ Ast.Dict [ (Ast.Literal (Ast.IntLit "1"), Ast.Literal (Ast.IntLit "1")) ] ] ) ]
+                  , []
+                  , [ Ast.Assign
+                        ( None
+                        , [ Ast.Identifier (segment "mapping") ]
+                        , [ Ast.Dict [ (Ast.Literal (Ast.IntLit "1"), Ast.Literal (Ast.IntLit "2")) ] ] ) ] )
+              ; Ast.Return
+                  (Ast.Subscript
+                     ( Ast.Identifier (segment "mapping")
+                     , Ast.Index (Ast.Literal (Ast.IntLit "1")) )) ] )
+        ; Ast.Function
+            ( []
+            , segment "alias_literal_lookup"
+            , []
+            , Ast.Typ (Ast.TInt def_seg)
+            , [ Ast.Assign
+                  ( Some map_type
+                  , [ Ast.Identifier (segment "mapping") ]
+                  , [ Ast.Dict [ (Ast.Literal (Ast.IntLit "1"), Ast.Literal (Ast.IntLit "2")) ] ] )
+              ; Ast.Assign
+                  ( None
+                  , [ Ast.Identifier (segment "alias") ]
+                  , [ Ast.Identifier (segment "mapping") ] )
+              ; Ast.Return
+                  (Ast.Subscript
+                     ( Ast.Identifier (segment "alias")
+                     , Ast.Index (Ast.Literal (Ast.IntLit "1")) )) ] ) ]
+  in
+  let map_source, _ = Transform.Emitdfy.print_prog_with_sourcemap (Transform.Todafnyast.prog_dfy map_program) in
+  check bool "map aliases normalize membership proofs" true
+    (has_substring map_source "method alias_lookup");
+  check bool "map keys common to branches survive joins" true
+    (has_substring map_source "method common_mapping");
+  check bool "map aliases normalize literal-key facts" true
+    (has_substring map_source "method alias_literal_lookup");
+  let list_type = Ast.Typ (Ast.TLst (def_seg, Some (Ast.TInt def_seg))) in
+  let loop_entry_program =
+    Ast.Program
+      [ Ast.Function
+          ( []
+          , segment "loop_entry_environment"
+          , [ segment "other", list_type; segment "mapping", list_type ]
+          , Ast.Typ (Ast.TNone def_seg)
+          , [ Ast.For
+                ( []
+                , [ segment "key" ]
+                , Ast.Identifier (segment "other")
+                , [ Ast.Exp
+                      ( Ast.Call
+                          ( Ast.Dot (Ast.Identifier (segment "mapping"), segment "append")
+                          , [ Ast.Identifier (segment "key") ] ) ) ] )
+            ; Ast.Assign
+                ( None
+                , [ Ast.Identifier (segment "other") ]
+                , [ Ast.Identifier (segment "mapping") ] ) ] ) ]
+  in
+  let loop_entry_source, _ =
+    Transform.Emitdfy.print_prog_with_sourcemap (Transform.Todafnyast.prog_dfy loop_entry_program)
+  in
+  check bool "loop lowering uses the loop-entry environment" true
+    (has_substring loop_entry_source "method loop_entry_environment");
   check bool "callers use the synchronized method signature" true
     (has_substring method_source "method caller");
   check bool "method calls are hoisted out of caller expressions" true
@@ -866,7 +970,7 @@ let test_semantic_lowering_paths () =
   List.iter
     (fun name -> ignore (Transform.Semantic.normalize_type (TIdent (segment name))))
     [ "list"; "seq"; "sequence"; "set"; "dict"; "map"; "tuple"; "array" ];
-  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; iterated_lists = []; iterated_maps = [] } "ignored" int_type);
+  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; iterated_lists = [] } "ignored" int_type);
   ignore (Transform.Semantic.annotation (Typ int_type));
   ignore (Transform.Semantic.annotation (Identifier (segment "Alias")));
   ignore (Transform.Semantic.annotation (Literal TrueLit));
@@ -1080,7 +1184,7 @@ let test_semantic_lowering_paths () =
   ignore (Transform.Semantic.lookup_function environment "missing");
   ignore (Transform.Semantic.lookup_class environment "Missing");
   ignore (Transform.Semantic.leave_scope (Transform.Semantic.enter_scope environment Transform.Semantic.ComprehensionScope));
-  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; iterated_lists = []; iterated_maps = [] });
+  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; iterated_lists = [] });
   let replacement : Transform.Semantic.callable_signature =
     { name = "pure"; parameters = []; return_type = int_type; kind = Transform.Semantic.Constructor }
   in
@@ -1890,12 +1994,6 @@ let test_phase3_collections () =
     (fun () -> ignore (Transform.Lowering.lower_map_assignment
                          (Transform.Lowering.context env) (segment "list_value")
                          (Literal (IntLit "0")) (Literal (IntLit "1"))));
-  expect_exception "direct map updates are rejected in an iterated context"
-    (function Transform.Lowering.LoweringError message -> has_substring message "while iterating" | _ -> false)
-    (fun () -> ignore (Transform.Lowering.lower_map_assignment
-                         { (Transform.Lowering.context env) with iterated_maps = [ "other_map"; "mapping" ] }
-                         (segment "mapping") (Literal (IntLit "0"))
-                         (Literal (StringLit "value"))));
   ignore (Transform.Lowering.lower_lvalue (Transform.Lowering.context env)
             (Subscript (sequence, Index (Literal (IntLit "0")))));
   ignore (Transform.Lowering.lower_assignment (Transform.Lowering.context env) None
@@ -1924,11 +2022,6 @@ let test_phase3_collections () =
     Transform.Lowering.statements ~environment:env
       [ For ([], [ segment "item" ], values, [ Assert (BinaryExp (identifier "item", In def_seg, values)) ]) ]
   in
-  let map_loop =
-    Transform.Lowering.statements ~environment:env
-      [ For ([], [ segment "key" ], mapping
-           , [ Assert (BinaryExp (identifier "key", In def_seg, mapping)) ]) ]
-  in
   let indexed_loop_specs =
     [ Invariant (Literal TrueLit); Decreases (Literal (IntLit "1")) ]
   in
@@ -1946,11 +2039,11 @@ let test_phase3_collections () =
       | _ -> false) statements
   in
   check bool "set loops choose from a remaining set" true (has_choose set_loop);
-  check bool "map loops choose from a snapshot of keys" true (has_choose map_loop);
-  check bool "map loops snapshot their key set" true
-    (List.exists
-       (fun statement -> has_substring (Transform.Emitdfy.print_stmt 0 statement) ".Keys")
-       map_loop);
+  expect_exception "map iteration is rejected because map order is unavailable"
+    (function Transform.Lowering.LoweringError message -> has_substring message "insertion order" | _ -> false)
+    (fun () -> ignore (Transform.Lowering.statements ~environment:env
+                         [ For ([], [ segment "key" ], mapping
+                              , [ Assert (BinaryExp (identifier "key", In def_seg, mapping)) ]) ]));
   check bool "list loops use indexed lowering" true
     (has_substring (Transform.Emitdfy.print_stmt 0 (List.hd list_loop)) "lowered_");
   check bool "sequence loops use indexed lowering" true
@@ -1990,13 +2083,13 @@ let test_phase3_collections () =
       [ Assign (None, [ map_alias ], [ mapping ]) ]
   in
   expect_exception "map mutation during iteration is rejected by lowering"
-    (function Transform.Lowering.LoweringError message -> has_substring message "while iterating" | _ -> false)
+    (function Transform.Lowering.LoweringError message -> has_substring message "insertion order" | _ -> false)
     (fun () -> ignore (Transform.Lowering.statements ~environment:env
                          [ For ([], [ segment "key" ], mapping
                               , [ Assign (None, [ Subscript (mapping, Index (Literal (IntLit "3"))) ],
                                           [ Literal (StringLit "value") ]) ]) ]));
   expect_exception "map aliases are protected during iteration by lowering"
-    (function Transform.Lowering.LoweringError message -> has_substring message "while iterating" | _ -> false)
+    (function Transform.Lowering.LoweringError message -> has_substring message "insertion order" | _ -> false)
     (fun () -> ignore (Transform.Lowering.statements ~environment:map_alias_env
                          [ For ([], [ segment "key" ], map_alias
                               , [ Assign (None, [ Subscript (mapping, Index (Literal (IntLit "3"))) ],
@@ -2039,13 +2132,42 @@ let test_phase3_collections () =
        [ For ([], [ segment "item" ], list, [ Pass ])
        ; For ([], [ segment "item" ], sequence, [ Pass ])
        ]);
-  ignore
-    (Transform.Semantic.validate_statements env
-       [ For ([], [ segment "key" ], mapping
-            , [ Assert (Subscript (mapping, Index (identifier "key"))) ]) ]);
+  expect_exception "map iteration is rejected because map order is unavailable"
+    (function Transform.Semantic.SemanticError message -> has_substring message "insertion order" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env
+                         [ For ([], [ segment "key" ], mapping
+                              , [ Assert (Subscript (mapping, Index (identifier "key"))) ]) ]));
   let keyed_env = Transform.Semantic.bind env "key" int_type in
   let membership_condition = BinaryExp (identifier "key", In def_seg, mapping) in
   let map_lookup = Subscript (mapping, Index (identifier "key")) in
+  let map_alias_lookup_env =
+    Transform.Semantic.validate_statements Transform.Semantic.empty
+      [ Assign (Some (Typ map_type), [ mapping ], [ known_map ])
+      ; Assign (None, [ map_alias ], [ mapping ]) ]
+  in
+  ignore
+    (Transform.Semantic.validate_exp map_alias_lookup_env
+       (Subscript (map_alias, Index (Literal (IntLit "1")))));
+  let map_alias_keyed_env =
+    Transform.Semantic.validate_statements keyed_env
+      [ Assign (None, [ map_alias ], [ mapping ]) ]
+  in
+  ignore
+    (Transform.Semantic.validate_statements map_alias_keyed_env
+       [ IfElse
+           ( BinaryExp (identifier "key", In def_seg, map_alias)
+           , [ Assert map_lookup ]
+           , []
+           , [ Pass ] ) ]);
+  let flag_env = Transform.Semantic.bind keyed_env "flag" (TBool def_seg) in
+  ignore
+    (Transform.Semantic.validate_statements flag_env
+       [ IfElse
+           ( identifier "flag"
+           , [ Assign (None, [ mapping ], [ known_map ]) ]
+           , []
+           , [ Assign (None, [ mapping ], [ known_map ]) ] )
+       ; Assert (Subscript (mapping, Index (Literal (IntLit "1")))) ]);
   ignore
     (Transform.Semantic.validate_statements keyed_env
        [ IfElse (membership_condition, [ Assert map_lookup ], [], [ Pass ]) ]);
@@ -2083,13 +2205,13 @@ let test_phase3_collections () =
                               , [ Exp (Call (Dot (list_alias, segment "append"),
                                              [ Literal (IntLit "3") ])) ]) ]));
   expect_exception "map mutation during iteration is rejected semantically"
-    (function Transform.Semantic.SemanticError message -> has_substring message "while iterating" | _ -> false)
+    (function Transform.Semantic.SemanticError message -> has_substring message "insertion order" | _ -> false)
     (fun () -> ignore (Transform.Semantic.validate_statements env
                          [ For ([], [ segment "key" ], mapping
                               , [ Assign (None, [ Subscript (mapping, Index (Literal (IntLit "3"))) ],
                                           [ Literal (StringLit "value") ]) ]) ]));
   expect_exception "map aliases are protected during iteration semantically"
-    (function Transform.Semantic.SemanticError message -> has_substring message "while iterating" | _ -> false)
+    (function Transform.Semantic.SemanticError message -> has_substring message "insertion order" | _ -> false)
     (fun () -> ignore (Transform.Semantic.validate_statements map_alias_env
                          [ For ([], [ segment "key" ], map_alias
                               , [ Assign (None, [ Subscript (mapping, Index (Literal (IntLit "3"))) ],
@@ -2128,8 +2250,9 @@ let test_phase3_collections () =
       , identifier "outer_mapping"
       , [ For ([], [ segment "outer_mapping" ], identifier "other_mapping", [ Pass ]) ] )
   in
-  ignore (Transform.Semantic.validate_statements nested_map_environment [ nested_map_loop ]);
-  ignore (Transform.Lowering.statements ~environment:nested_map_environment [ nested_map_loop ]);
+  expect_exception "nested map iteration is rejected because map order is unavailable"
+    (function Transform.Semantic.SemanticError message -> has_substring message "insertion order" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements nested_map_environment [ nested_map_loop ]));
   let untyped_list_env =
     Transform.Semantic.bind Transform.Semantic.empty "untyped_list"
       (TGeneric (segment "list", []))
@@ -2248,8 +2371,25 @@ let test_phase3_collections () =
   let unrelated_list_aliases =
     { env with list_aliases = [ ("other", "different") ] }
   in
+  ignore
+    (Transform.Semantic.common_pairs []
+       (fun (environment : Transform.Semantic.environment) -> environment.list_aliases));
+  ignore
+    (Transform.Semantic.common_pairs
+       [ { env with list_aliases = [ ("alias", "source") ] }
+       ; { env with list_aliases = [ ("alias", "other_source") ] } ]
+       (fun environment -> environment.list_aliases));
+  ignore (Transform.Semantic.common_map_keys []);
+  ignore
+    (Transform.Semantic.common_map_keys
+       [ { env with known_map_keys = [ ("mapping", [ "int:1" ]) ] }; env ]);
   check (Alcotest.list Alcotest.string) "unrelated list aliases are excluded" [ "list" ]
     (Transform.Semantic.list_aliases_for unrelated_list_aliases "list");
+  let related_list_aliases =
+    { env with list_aliases = [ ("alias", "list") ] }
+  in
+  check (Alcotest.list Alcotest.string) "related list aliases are included" [ "list"; "alias" ]
+    (Transform.Semantic.list_aliases_for related_list_aliases "list");
   let aliases_to_rebind =
     { env with list_aliases = [ ("alias", "source"); ("other", "target") ] }
   in
@@ -2260,6 +2400,11 @@ let test_phase3_collections () =
   in
   check (Alcotest.list Alcotest.string) "unrelated map aliases are excluded" [ "mapping" ]
     (Transform.Semantic.map_aliases_for unrelated_map_aliases "mapping");
+  let related_map_aliases =
+    { env with map_aliases = [ ("alias_map", "mapping") ] }
+  in
+  check (Alcotest.list Alcotest.string) "related map aliases are included" [ "mapping"; "alias_map" ]
+    (Transform.Semantic.map_aliases_for related_map_aliases "mapping");
   let map_aliases_to_rebind =
     { env with map_aliases = [ ("alias_map", "source_map"); ("other_map", "target_map") ] }
   in
@@ -2271,6 +2416,16 @@ let test_phase3_collections () =
   ignore (Transform.Semantic.bind_value env "alias" map_type mapping);
   ignore (Transform.Semantic.bind (Transform.Semantic.bind_value env "alias" map_type mapping)
             "alias" map_type);
+  ignore
+    (Transform.Todafnyast.frame_aliases "list_value"
+       [ Assign (None, [ Identifier def_seg ], [ list ])
+       ; Assign (None, [ Identifier (segment "alias") ], [ list ])
+       ; Assign (None, [ Identifier (segment "alias") ], [ list ])
+       ; Assign (None, [ Identifier (segment "unrelated") ], [ Identifier (segment "other") ])
+       ; IfElse (Literal TrueLit, [], [ (Literal FalseLit, [ Pass ]) ], [])
+       ; While ([], Literal FalseLit, [ Pass ])
+       ; For ([], [ segment "item" ], list, [ Pass ])
+       ; Function ([], segment "nested", [], Typ int_type, [ Pass ]) ]);
   expect_exception "invalid assignment target" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
     (fun () -> ignore (Transform.Semantic.validate_statements env
                          [ Assign (None, [ Literal TrueLit ], [ Literal TrueLit ]) ]));

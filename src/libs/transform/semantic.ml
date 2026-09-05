@@ -47,7 +47,6 @@ type environment =
   ; map_aliases : (string * string) list
   ; list_aliases : (string * string) list
   ; iterated_lists : string list
-  ; iterated_maps : string list
   }
 
 let empty =
@@ -59,7 +58,6 @@ let empty =
   ; map_aliases = []
   ; list_aliases = []
   ; iterated_lists = []
-  ; iterated_maps = []
   }
 
 let generic name args = TGeneric ((def_pos, Some name), args)
@@ -293,6 +291,29 @@ let map_aliases_for env name =
   in
   List.rev names
 
+let common_pairs environments pairs_of =
+  match environments with
+  | [] -> []
+  | first :: rest ->
+    List.filter (pairs_of first) ~f:(fun pair ->
+      List.for_all rest ~f:(fun environment ->
+        List.mem (pairs_of environment) pair ~equal:(fun (left_name, left_root) (right_name, right_root) ->
+          String.equal left_name right_name && String.equal left_root right_root)))
+
+let common_map_keys environments =
+  match environments with
+  | [] -> []
+  | first :: rest ->
+    List.filter_map first.known_map_keys ~f:(fun (name, keys) ->
+      let keys =
+        List.fold rest ~init:(Some keys) ~f:(fun common environment ->
+          match common, List.Assoc.find environment.known_map_keys name ~equal:String.equal with
+          | Some common, Some other ->
+            Some (List.filter common ~f:(fun key -> List.mem other key ~equal:String.equal))
+          | _ -> None)
+      in
+      Option.map keys ~f:(fun keys -> name, keys))
+
 let literal_key = function
   | Literal (IntLit value) -> Some ("int:" ^ value)
   | Literal (FloatLit value) -> Some ("float:" ^ value)
@@ -303,19 +324,23 @@ let literal_key = function
   | _ -> None
 
 let map_keys env name =
+  let name = map_alias_root env name in
   Option.value (List.Assoc.find env.known_map_keys name ~equal:String.equal) ~default:[]
 
 let set_map_keys env name keys =
+  let name = map_alias_root env name in
   let known_map_keys =
     (name, keys) :: List.Assoc.remove env.known_map_keys name ~equal:String.equal
   in
   { env with known_map_keys }
 
 let add_membership env key map =
+  let map = map_alias_root env map in
   if String.is_empty key || String.is_empty map then env
   else { env with memberships = (key, map) :: List.filter env.memberships ~f:(fun (old_key, old_map) -> not (String.equal old_key key && String.equal old_map map)) }
 
 let has_membership env key map =
+  let map = map_alias_root env map in
   List.exists env.memberships ~f:(fun (old_key, old_map) -> String.equal old_key key && String.equal old_map map)
 
 let membership_assumption = function
@@ -365,29 +390,40 @@ let bind env name typ =
         List.filter env.list_aliases ~f:(fun (alias, source) ->
           not (String.equal alias name || String.equal source name))
     ; iterated_lists = List.filter env.iterated_lists ~f:(fun old -> not (String.equal old name))
-    ; iterated_maps = List.filter env.iterated_maps ~f:(fun old -> not (String.equal old name))
     }
 
 let bind_many env bindings =
   List.fold bindings ~init:env ~f:(fun env (name, typ) -> bind env name typ)
 
 let bind_value env name typ value =
-  let env = bind env name typ in
-  let keys =
-    match value with
-    | Dict entries -> List.filter_map entries ~f:(fun (key, _) -> literal_key key)
-    | _ -> []
+  let map_alias_source =
+    match value, collection_kind typ with
+    | Identifier source, MapCollection
+      when not (String.equal name (identifier_name (Identifier source))) ->
+      Some (map_alias_root env (identifier_name (Identifier source)))
+    | _ -> None
   in
-  let env = set_map_keys env name keys in
-  match value, collection_kind typ with
-  | Identifier source, MapCollection
-    when not (String.equal name (identifier_name (Identifier source))) ->
-    let source = map_alias_root env (identifier_name value) in
-    { env with map_aliases = (name, source) :: env.map_aliases }
-  | Identifier source, ListCollection
-    when not (String.equal name (identifier_name (Identifier source))) ->
-    let source = list_alias_root env (identifier_name value) in
-    { env with list_aliases = (name, source) :: env.list_aliases }
+  let list_alias_source =
+    match value, collection_kind typ with
+    | Identifier source, ListCollection
+      when not (String.equal name (identifier_name (Identifier source))) ->
+      Some (list_alias_root env (identifier_name (Identifier source)))
+    | _ -> None
+  in
+  let env = bind env name typ in
+  let env =
+    match map_alias_source with
+    | Some source -> { env with map_aliases = (name, source) :: env.map_aliases }
+    | None -> env
+  in
+  let env =
+    match list_alias_source with
+    | Some source -> { env with list_aliases = (name, source) :: env.list_aliases }
+    | None -> env
+  in
+  match value with
+  | Dict entries ->
+    set_map_keys env name (List.filter_map entries ~f:(fun (key, _) -> literal_key key))
   | _ -> env
 
 let add_map_key env name key =
@@ -1062,9 +1098,6 @@ and validate_target env = function
           (not (List.exists env.map_aliases ~f:(fun (alias, _) ->
              String.equal alias (identifier_name value))))
           "map updates through aliases are unsupported";
-        require
-          (not (List.exists env.iterated_maps ~f:(String.equal (identifier_name value))))
-          "map updates while iterating are unsupported";
         begin
           match map_types (infer env value) with
           | Some (key_type, _) ->
@@ -1146,7 +1179,10 @@ and validate_statements env statements =
               List.mem environment.memberships membership ~equal:(fun (left_key, left_map) (right_key, right_map) ->
                 String.equal left_key right_key && String.equal left_map right_map)))
       in
-      { branch_environment with memberships }
+      let list_aliases = common_pairs branch_environments (fun environment -> environment.list_aliases) in
+      let map_aliases = common_pairs branch_environments (fun environment -> environment.map_aliases) in
+      let known_map_keys = common_map_keys branch_environments in
+      { branch_environment with memberships; list_aliases; map_aliases; known_map_keys }
     | While (specifications, condition, body) ->
       let env = validate_loop_specs env specifications in
       validate_exp env condition;
@@ -1164,7 +1200,9 @@ and validate_statements env statements =
         | MapCollection ->
           require (Option.is_some (map_types (infer env iterable)))
             "map iteration requires concrete key and value types";
-          require (List.length identifiers = 1) "set/map iteration requires one loop target"
+          require (List.length identifiers = 1) "set/map iteration requires one loop target";
+          raise (SemanticError
+                   "map iteration is unsupported because Dafny maps do not preserve Python insertion order")
         | ListCollection | SequenceCollection ->
           require (List.length identifiers = 1)
             "list/sequence iteration requires one loop target"
@@ -1185,14 +1223,6 @@ and validate_statements env statements =
           { loop_env with
             iterated_lists = list_aliases_for env (identifier_name (Identifier source))
                              @ loop_env.iterated_lists }
-        | MapCollection, Identifier source ->
-          let loop_env =
-            add_membership loop_env (identifier_name (Identifier identifier))
-              (identifier_name (Identifier source))
-          in
-          { loop_env with
-            iterated_maps = map_aliases_for env (identifier_name (Identifier source))
-                            @ loop_env.iterated_maps }
         | _ -> loop_env
       in
       let loop_env = bind loop_env (identifier_name (Identifier identifier)) element in
@@ -1201,8 +1231,11 @@ and validate_statements env statements =
     | Return value | Assert value | Exp value -> validate_exp env value; env
     | Break | Continue | Pass -> env)
 
+let initial_environment (Program statements) =
+  collect_functions empty statements |> fun env -> classify_functions env statements
+
 let analyze (Program statements) =
   match normalize_program (Program statements) with
   | Program statements ->
-    let env = collect_functions empty statements |> fun env -> classify_functions env statements in
+    let env = initial_environment (Program statements) in
     validate_statements env statements
