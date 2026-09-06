@@ -45,6 +45,8 @@ type environment =
   ; memberships : (string * string) list
   ; known_map_keys : (string * string list) list
   ; map_aliases : (string * string) list
+  ; possible_map_aliases : (string * string) list
+  ; map_parameters : string list
   ; list_aliases : (string * string) list
   ; possible_list_aliases : (string * string) list
   ; iterated_lists : string list
@@ -58,6 +60,8 @@ let empty =
   ; memberships = []
   ; known_map_keys = []
   ; map_aliases = []
+  ; possible_map_aliases = []
+  ; map_parameters = []
   ; list_aliases = []
   ; possible_list_aliases = []
   ; iterated_lists = []
@@ -344,6 +348,19 @@ let map_aliases_for env name =
   in
   List.rev names
 
+let map_may_aliases_for env name =
+  let aliases = env.map_aliases @ env.possible_map_aliases in
+  let roots = alias_roots aliases name in
+  let names =
+    List.fold aliases ~init:roots ~f:(fun names (alias, _) ->
+      if List.exists (alias_roots aliases alias) ~f:(fun root ->
+           List.mem roots root ~equal:String.equal)
+         && not (List.exists names ~f:(String.equal alias))
+      then alias :: names
+      else names)
+  in
+  List.rev names
+
 let common_pairs environments pairs_of =
   match environments with
   | [] -> []
@@ -378,6 +395,11 @@ let possible_list_aliases environments =
   union_pairs
     (List.concat_map environments ~f:(fun environment ->
        environment.possible_list_aliases @ environment.list_aliases))
+
+let possible_map_aliases environments =
+  union_pairs
+    (List.concat_map environments ~f:(fun environment ->
+       environment.possible_map_aliases @ environment.map_aliases))
 
 let literal_key = function
   | Literal (IntLit value) -> Some ("int:" ^ value)
@@ -451,6 +473,10 @@ let bind env name typ =
     ; map_aliases =
         List.filter env.map_aliases ~f:(fun (alias, source) ->
           not (String.equal alias name || String.equal source name))
+    ; possible_map_aliases =
+        List.filter env.possible_map_aliases ~f:(fun (alias, source) ->
+          not (String.equal alias name || String.equal source name))
+    ; map_parameters = List.filter env.map_parameters ~f:(fun parameter -> not (String.equal parameter name))
     ; list_aliases =
         List.filter env.list_aliases ~f:(fun (alias, source) ->
           not (String.equal alias name || String.equal source name))
@@ -464,43 +490,93 @@ let bind env name typ =
 let bind_many env bindings =
   List.fold bindings ~init:env ~f:(fun env (name, typ) -> bind env name typ)
 
+let bind_parameters env bindings =
+  let env = bind_many env bindings in
+  let map_parameters =
+    List.fold bindings ~init:env.map_parameters ~f:(fun parameters (name, typ) ->
+      match collection_kind typ with
+      | MapCollection ->
+        if List.mem parameters name ~equal:String.equal then parameters else name :: parameters
+      | _ -> parameters)
+  in
+  { env with map_parameters }
+
 let bind_value env name typ value =
+  let self_assignment =
+    match value, collection_kind typ with
+    | Identifier source, ListCollection ->
+      String.equal name (list_alias_root env (identifier_name (Identifier source)))
+    | Identifier source, MapCollection ->
+      String.equal name (map_alias_root env (identifier_name (Identifier source)))
+    | _ -> false
+  in
+  if self_assignment then env
+  else
   let map_alias_source =
     match value, collection_kind typ with
     | Identifier source, MapCollection ->
       let source = map_alias_root env (identifier_name (Identifier source)) in
-      if String.equal name source then None else Some source
+      Some source
     | _ -> None
+  in
+  let possible_map_alias_sources =
+    match value, collection_kind typ with
+    | Call (_, arguments), MapCollection ->
+      List.filter_map arguments ~f:(function
+        | Identifier source ->
+          let source_name = identifier_name (Identifier source) in
+          begin
+            match lookup env source_name with
+            | Some source_type ->
+              begin
+                match collection_kind source_type with
+                | MapCollection -> Some (map_alias_root env source_name)
+                | _ -> None
+              end
+            | None -> None
+          end
+        | _ -> None)
+    | _ -> []
   in
   let list_alias_source =
     match value, collection_kind typ with
     | Identifier source, ListCollection ->
       let source = list_alias_root env (identifier_name (Identifier source)) in
-      if String.equal name source then None else Some source
+      Some source
     | _ -> None
   in
-  let env = bind env name typ in
-  let env =
-    match map_alias_source with
-    | Some source -> { env with map_aliases = (name, source) :: env.map_aliases }
-    | None -> env
-  in
-  let env =
-    match list_alias_source with
-    | Some source -> { env with list_aliases = (name, source) :: env.list_aliases }
-    | None -> env
-  in
-  match value with
-  | Dict entries ->
-    set_map_keys env name (List.filter_map entries ~f:(fun (key, _) -> literal_key key))
-  | Identifier _ -> env
-  | _ ->
-    begin
-      match collection_kind typ with
-      | MapCollection ->
-        { env with known_map_keys = List.Assoc.remove env.known_map_keys name ~equal:String.equal }
-      | _ -> env
-    end
+    let env = bind env name typ in
+    let env =
+      match map_alias_source with
+      | Some source -> { env with map_aliases = (name, source) :: env.map_aliases }
+      | None -> env
+    in
+    let env =
+      { env with
+        possible_map_aliases =
+          List.fold possible_map_alias_sources ~init:env.possible_map_aliases
+            ~f:(fun aliases source ->
+              if List.mem aliases (name, source) ~equal:(fun (left_name, left_source) (right_name, right_source) ->
+                   String.equal left_name right_name && String.equal left_source right_source)
+              then aliases
+              else (name, source) :: aliases) }
+    in
+    let env =
+      match list_alias_source with
+      | Some source -> { env with list_aliases = (name, source) :: env.list_aliases }
+      | None -> env
+    in
+    match value with
+    | Dict entries ->
+      set_map_keys env name (List.filter_map entries ~f:(fun (key, _) -> literal_key key))
+    | Identifier _ -> env
+    | _ ->
+      begin
+        match collection_kind typ with
+        | MapCollection ->
+          { env with known_map_keys = List.Assoc.remove env.known_map_keys name ~equal:String.equal }
+        | _ -> env
+      end
 
 let add_map_key env name key =
   match literal_key key with
@@ -818,7 +894,7 @@ let classify_functions env statements =
         match lookup_function env name with
         | Some signature ->
           let function_environment = enter_scope env (FunctionScope signature.name) in
-          let function_environment = bind_many function_environment signature.parameters in
+          let function_environment = bind_parameters function_environment signature.parameters in
           if function_needs_method function_environment body then
           begin
             match signature.kind with
@@ -1227,12 +1303,14 @@ and validate_target env = function
         require (match value with Identifier _ -> true | _ -> false)
           "map updates require a local map variable";
         require
-          (not (List.exists env.map_aliases ~f:(fun (alias, _) ->
-             String.equal alias (identifier_name value))))
-          "map updates through aliases are unsupported";
-        require
           (not (List.exists env.iterated_maps ~f:(String.equal (identifier_name value))))
           "map updates while iterating are unsupported";
+        require
+          (List.length (map_may_aliases_for env (identifier_name value)) = 1)
+          "map updates through aliases are unsupported";
+        require
+          (not (List.mem env.map_parameters (identifier_name value) ~equal:String.equal))
+          "map updates of function parameters are unsupported";
         begin
           match map_types (infer env value) with
           | Some (key_type, _) ->
@@ -1283,7 +1361,7 @@ and validate_statements env statements =
     | Function (specifications, name, _parameters, return_type, body) ->
       let signature = Option.value_exn (lookup_function env (identifier_name (Identifier name))) in
       let function_env = enter_scope env (FunctionScope signature.name) in
-      let function_env = bind_many function_env signature.parameters in
+      let function_env = bind_parameters function_env signature.parameters in
       let function_env = bind function_env "return" (annotation return_type) in
       let function_env = validate_specs function_env specifications in
       ignore (validate_statements function_env body);
@@ -1317,12 +1395,14 @@ and validate_statements env statements =
       let list_aliases = common_pairs branch_environments (fun environment -> environment.list_aliases) in
       let map_aliases = common_pairs branch_environments (fun environment -> environment.map_aliases) in
       let possible_list_aliases = possible_list_aliases branch_environments in
+      let possible_map_aliases = possible_map_aliases branch_environments in
       let known_map_keys = common_map_keys branch_environments in
       { branch_environment with
         memberships
       ; list_aliases
       ; possible_list_aliases
       ; map_aliases
+      ; possible_map_aliases
       ; known_map_keys
       }
     | While (specifications, condition, body) ->
@@ -1372,7 +1452,7 @@ and validate_statements env statements =
                              @ loop_env.iterated_lists }
         | MapCollection, Identifier source ->
           { loop_env with
-            iterated_maps = map_aliases_for env (identifier_name (Identifier source))
+            iterated_maps = map_may_aliases_for env (identifier_name (Identifier source))
                             @ loop_env.iterated_maps }
         | _ -> loop_env
       in

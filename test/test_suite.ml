@@ -85,6 +85,41 @@ let test_dafny4_function_syntax () =
                | D.DModifies (D.DIdentifier (_, Some "xs")) -> true
                | _ -> false)
               specifications
+         | _ -> false)
+         declarations);
+  let possible_alias_program =
+    Ast.Program
+      [ Ast.Function
+          ( []
+          , segment "possible_alias_mutate"
+          , [ segment "xs", Ast.Typ (Ast.TLst (def_seg, Some (Ast.TInt def_seg)))
+            ; segment "flag", Ast.Typ (Ast.TBool def_seg) ]
+          , Ast.Typ (Ast.TNone def_seg)
+          , [ Ast.IfElse
+                ( Ast.Identifier (segment "flag")
+                , [ Ast.Assign
+                      ( None
+                      , [ Ast.Identifier (segment "ys") ]
+                      , [ Ast.Identifier (segment "xs") ] ) ]
+                , []
+                , [] )
+            ; Ast.Exp
+                (Ast.Call
+                   ( Ast.Dot (Ast.Identifier (segment "ys"), segment "append")
+                   , [ Ast.Literal (Ast.IntLit "2") ] )) ] ) ]
+  in
+  let possible_alias_ast = Transform.Todafnyast.prog_dfy possible_alias_program in
+  check bool "possible branch aliases contribute to list frames" true
+    (match possible_alias_ast with
+     | D.DProg (_, declarations) ->
+       List.exists
+         (function
+          | D.DMeth (specifications, (_, Some "possible_alias_mutate"), _, _, [ D.DVoid ], _) ->
+            List.exists
+              (function
+               | D.DModifies (D.DIdentifier (_, Some "xs")) -> true
+               | _ -> false)
+              specifications
           | _ -> false)
          declarations);
   let map_type = Ast.Typ (Ast.TDict (def_seg, Some (Ast.TInt def_seg), Some (Ast.TInt def_seg))) in
@@ -970,7 +1005,7 @@ let test_semantic_lowering_paths () =
   List.iter
     (fun name -> ignore (Transform.Semantic.normalize_type (TIdent (segment name))))
     [ "list"; "seq"; "sequence"; "set"; "dict"; "map"; "tuple"; "array" ];
-  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; possible_list_aliases = []; iterated_lists = []; iterated_maps = [] } "ignored" int_type);
+  ignore (Transform.Semantic.bind { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; possible_map_aliases = []; map_parameters = []; list_aliases = []; possible_list_aliases = []; iterated_lists = []; iterated_maps = [] } "ignored" int_type);
   ignore (Transform.Semantic.annotation (Typ int_type));
   ignore (Transform.Semantic.annotation (Identifier (segment "Alias")));
   ignore (Transform.Semantic.annotation (Literal TrueLit));
@@ -982,6 +1017,66 @@ let test_semantic_lowering_paths () =
   (match list_index.result with
    | D.DCallExpr (D.DDot (_, (_, Some "atIndex")), [ D.DIntLit "0" ]) -> ()
    | _ -> fail "list indexes should use the runtime atIndex operation");
+  let ordered_tuple =
+    lower
+      (Tuple
+         [ Len (def_seg, xs)
+         ; Call (Dot (xs, segment "pop"), []) ])
+  in
+  check bool "collection elements preserve left-to-right evaluation" true
+    (match ordered_tuple.prelude with
+     | [ D.DAssignLvalue (_, [ D.Local _ ], [ D.DCallExpr (D.DDot (_, (_, Some "len")), []) ])
+       ; D.DAssignLvalue (_, [ D.Local _ ], [ D.DCallExpr (D.DDot (_, (_, Some "pop")), []) ]) ] -> true
+     | _ -> false);
+  let ordered_call =
+    lower
+      (Call
+         ( identifier "unknown"
+         , [ Len (def_seg, xs); Call (Dot (xs, segment "pop"), []) ] ))
+  in
+  check bool "call arguments preserve left-to-right evaluation" true
+    (match ordered_call.prelude with
+     | [ D.DAssignLvalue (_, [ D.Local _ ], [ D.DCallExpr (D.DDot (_, (_, Some "len")), []) ])
+       ; D.DAssignLvalue (_, [ D.Local _ ], [ D.DCallExpr (D.DDot (_, (_, Some "pop")), []) ]) ] -> true
+     | _ -> false);
+  ignore
+    (Transform.Lowering.lower_many
+       (Transform.Lowering.scoped (Transform.Lowering.context environment))
+       [ Literal (IntLit "1") ]);
+  ignore
+    (Transform.Lowering.materialize
+       (Transform.Lowering.scoped (Transform.Lowering.context environment))
+       (Transform.Lowering.lower (Transform.Lowering.context environment) (Literal TrueLit)));
+  ignore
+    (lower
+       (Tuple
+          [ Literal (FloatLit "1.0")
+          ; Literal TrueLit
+          ; Literal NoneLit
+          ; Literal FalseLit
+          ; Call (Dot (xs, segment "pop"), []) ]));
+  let list_equality =
+    lower
+      (BinaryExp
+         ( Lst [ Literal (IntLit "1") ]
+         , EqEq def_seg
+         , Lst [ Literal (IntLit "1") ] ))
+  in
+  check bool "list equality compares list contents" true
+    (match list_equality.result with
+     | D.DBinary (D.DDot (_, (_, Some "lst")), D.DEq _, D.DDot (_, (_, Some "lst"))) -> true
+     | _ -> false);
+  let list_non_equality =
+    lower
+      (BinaryExp
+         ( Lst [ Literal (IntLit "1") ]
+         , NEq def_seg
+         , Lst [ Literal (IntLit "1") ] ))
+  in
+  check bool "list inequality compares list contents" true
+    (match list_non_equality.result with
+     | D.DUnary (D.DNot _, D.DBinary (D.DDot (_, (_, Some "lst")), D.DEq _, D.DDot (_, (_, Some "lst")))) -> true
+     | _ -> false);
   expect_exception "scoped list construction" (function Transform.Lowering.LoweringError _ -> true | _ -> false)
     (fun () ->
        Transform.Lowering.lower
@@ -1184,7 +1279,7 @@ let test_semantic_lowering_paths () =
   ignore (Transform.Semantic.lookup_function environment "missing");
   ignore (Transform.Semantic.lookup_class environment "Missing");
   ignore (Transform.Semantic.leave_scope (Transform.Semantic.enter_scope environment Transform.Semantic.ComprehensionScope));
-  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; list_aliases = []; possible_list_aliases = []; iterated_lists = []; iterated_maps = [] });
+  ignore (Transform.Semantic.leave_scope { Transform.Semantic.scopes = []; functions = []; classes = []; memberships = []; known_map_keys = []; map_aliases = []; possible_map_aliases = []; map_parameters = []; list_aliases = []; possible_list_aliases = []; iterated_lists = []; iterated_maps = [] });
   let replacement : Transform.Semantic.callable_signature =
     { name = "pure"; parameters = []; return_type = int_type; kind = Transform.Semantic.Constructor }
   in
@@ -1641,6 +1736,9 @@ let test_phase3_collections () =
     |> fun env -> Transform.Semantic.bind env "array_value" (TGeneric (segment "array", [ int_type ]))
     |> fun env -> Transform.Semantic.bind env "tuple_value" (TTuple (def_seg, Some [ int_type; int_type ]))
   in
+  ignore
+    (Transform.Semantic.bind_parameters env
+       [ "mapping", map_type; "mapping", map_type ]);
   let kind name expected typ =
     check bool name true (Transform.Semantic.collection_kind typ = expected)
   in
@@ -2098,7 +2196,8 @@ let test_phase3_collections () =
   let self_list_alias_env =
     Transform.Semantic.validate_statements env
       [ Assign (None, [ list_alias ], [ list ])
-      ; Assign (None, [ list_alias ], [ list_alias ]) ]
+      ; Assign (None, [ list_alias ], [ list_alias ])
+      ; Assign (None, [ list ], [ list_alias ]) ]
   in
   let initial_self_list_alias_env =
     Transform.Semantic.validate_statements env
@@ -2122,7 +2221,8 @@ let test_phase3_collections () =
     Transform.Semantic.validate_statements Transform.Semantic.empty
       [ Assign (Some (Typ map_type), [ mapping ], [ known_map ])
       ; Assign (None, [ map_alias ], [ mapping ])
-      ; Assign (None, [ map_alias ], [ map_alias ]) ]
+      ; Assign (None, [ map_alias ], [ map_alias ])
+      ; Assign (None, [ mapping ], [ map_alias ]) ]
   in
   ignore (Transform.Semantic.validate_exp self_map_alias_env
             (Subscript (map_alias, Index (Literal (IntLit "1")))));
@@ -2159,6 +2259,48 @@ let test_phase3_collections () =
     (function Transform.Semantic.SemanticError message -> has_substring message "membership precondition" | _ -> false)
     (fun () -> Transform.Semantic.validate_exp stale_map_environment
                  (Subscript (mapping, Index (Literal (IntLit "1")))));
+  let identity_map_signature : Transform.Semantic.callable_signature =
+    { name = "identity_map"; parameters = [ "source", map_type ]; return_type = map_type
+    ; kind = Transform.Semantic.PureFunction }
+  in
+  let returned_alias_environment =
+    Transform.Semantic.empty
+    |> fun environment -> Transform.Semantic.add_function environment identity_map_signature
+    |> fun environment -> Transform.Semantic.bind environment "mapping" map_type
+    |> fun environment -> Transform.Semantic.validate_statements environment
+         [ Assign (None, [ identifier "alias" ],
+                   [ Call (identifier "identity_map", [ mapping ]) ]) ]
+  in
+  ignore
+    (Transform.Semantic.bind_value env "non_map_return" map_type
+       (Call (identifier "make_map", [ list ])));
+  ignore
+    (Transform.Semantic.bind_value env "unknown_map_return" map_type
+       (Call (identifier "make_map", [ identifier "unknown" ])));
+  ignore
+    (Transform.Semantic.bind_value env "literal_map_return" map_type
+       (Call (identifier "make_map", [ Literal (IntLit "1") ])));
+  ignore
+    (Transform.Semantic.bind_value env "duplicate_map_return" map_type
+       (Call (identifier "make_map", [ mapping; mapping ])));
+  ignore
+    (Transform.Semantic.bind
+       { returned_alias_environment with possible_map_aliases = [ ("alias", "mapping") ] }
+       "alias" map_type);
+  ignore
+    (Transform.Semantic.bind
+       { returned_alias_environment with possible_map_aliases = [ ("alias", "mapping") ] }
+       "mapping" map_type);
+  check bool "returned map aliases are tracked conservatively" true
+    (List.exists
+       (fun (left_name, left_source) ->
+          String.equal left_name "alias" && String.equal left_source "mapping")
+       returned_alias_environment.possible_map_aliases);
+  expect_exception "updates with returned map aliases are rejected"
+    (function Transform.Semantic.SemanticError message -> has_substring message "aliases" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements returned_alias_environment
+                         [ Assign (None, [ Subscript (mapping, Index (Literal (IntLit "1"))) ],
+                                   [ Literal (StringLit "value") ]) ]));
   expect_exception "map mutation during iteration is rejected by lowering"
     (function Transform.Lowering.LoweringError message -> has_substring message "while iterating" | _ -> false)
     (fun () -> ignore (Transform.Lowering.statements ~environment:env
@@ -2483,6 +2625,16 @@ let test_phase3_collections () =
   in
   check (Alcotest.list Alcotest.string) "related map aliases are included" [ "mapping"; "alias_map" ]
     (Transform.Semantic.map_aliases_for related_map_aliases "mapping");
+  check (Alcotest.list Alcotest.string) "possible map aliases are included"
+    [ "mapping"; "alias_map" ]
+    (Transform.Semantic.map_may_aliases_for
+       { env with possible_map_aliases = [ ("alias_map", "mapping") ] }
+       "mapping");
+  check (Alcotest.list Alcotest.string) "unrelated possible map aliases are excluded"
+    [ "mapping" ]
+    (Transform.Semantic.map_may_aliases_for
+       { env with possible_map_aliases = [ ("other_map", "different_map") ] }
+       "mapping");
   let map_aliases_to_rebind =
     { env with map_aliases = [ ("alias_map", "source_map"); ("other_map", "target_map") ] }
   in
@@ -2668,6 +2820,29 @@ let test_phase3_collections () =
   in
   expect_exception "map alias update" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
     (fun () -> ignore (Transform.Semantic.validate_statements env alias_program));
+  let reverse_alias_program =
+    [ Assign (None, [ identifier "alias" ], [ mapping ])
+    ; Assign (None, [ Subscript (mapping, Index (Literal (IntLit "1"))) ],
+              [ Literal (StringLit "value") ]) ]
+  in
+  expect_exception "map root update with an alias" (function Transform.Semantic.SemanticError message -> has_substring message "aliases" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements env reverse_alias_program));
+  let parameter_update =
+    Function
+      ( []
+      , segment "update_parameter"
+      , [ segment "mapping", Typ map_type ]
+      , Typ (TNone def_seg)
+      , [ Assign
+            ( None
+            , [ Subscript (identifier "mapping", Index (Literal (IntLit "1"))) ]
+            , [ Literal (IntLit "2") ] ) ] )
+  in
+  let parameter_environment =
+    Transform.Semantic.initial_environment (Program [ parameter_update ])
+  in
+  expect_exception "map parameter updates are rejected" (function Transform.Semantic.SemanticError message -> has_substring message "parameters" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements parameter_environment [ parameter_update ]));
   expect_exception "multi-target set loop" (function Transform.Semantic.SemanticError _ -> true | _ -> false)
     (fun () -> ignore (Transform.Semantic.validate_statements env
                          [ For ([], [ segment "first"; segment "second" ], values, [ Pass ]) ]));

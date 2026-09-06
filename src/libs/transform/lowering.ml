@@ -63,6 +63,11 @@ let context environment =
 
 let scoped context = { context with evaluation = Scoped }
 
+let is_eager context =
+  match context.evaluation with
+  | Eager -> true
+  | Scoped -> false
+
 let with_expected_type context expected_type = { context with expected_type = Some expected_type }
 
 let with_return_type context return_type = { context with return_type = Some return_type }
@@ -164,11 +169,24 @@ let collection_binary_operator environment left operator right =
   | _ -> binary_operator operator
 
 let binary_expression environment left operator right left_result right_result =
-  match operator, Sem.collection_kind (Sem.infer environment right) with
-  | Py.In _, Sem.ListCollection ->
+  let list_contents result = D.DDot (result, (S.def_pos, Some "lst")) in
+  let lists_are_equal =
+    match Sem.collection_kind (Sem.infer environment left),
+          Sem.collection_kind (Sem.infer environment right) with
+    | Sem.ListCollection, Sem.ListCollection -> true
+    | _ -> false
+  in
+  match operator, lists_are_equal, Sem.collection_kind (Sem.infer environment right) with
+  | Py.EqEq segment, true, _ ->
+    D.DBinary (list_contents left_result, D.DEq segment, list_contents right_result)
+  | Py.NEq segment, true, _ ->
+    D.DUnary
+      (D.DNot segment,
+       D.DBinary (list_contents left_result, D.DEq segment, list_contents right_result))
+  | Py.In _, _, Sem.ListCollection ->
     D.DCallExpr
       (D.DDot (right_result, (S.def_pos, Some "contains")), [ left_result ])
-  | Py.NotIn segment, Sem.ListCollection ->
+  | Py.NotIn segment, _, Sem.ListCollection ->
     D.DUnary
       (D.DNot segment,
        D.DCallExpr
@@ -191,12 +209,44 @@ let empty_list_type expected_type =
 
 let reject_list_assignment () = fail "indexed assignment into List is unsupported"
 
+let materialize context (lowered : lowered) =
+  match context.evaluation with
+  | Scoped -> lowered
+  | Eager ->
+    let identifier = fresh_temp () in
+    { lowered with
+      prelude = lowered.prelude @ [ D.DAssignLvalue (None, [ D.Local identifier ], [ lowered.result ]) ]
+    ; result = D.DIdentifier identifier
+    }
+
+let result_needs_capture = function
+  | D.DIdentifier _ | D.DIntLit _ | D.DRealLit _ | D.DTrue | D.DFalse
+  | D.DStringLit _ | D.DNull -> false
+  | _ -> true
+
 let join_preludes (lowered : lowered list) =
   List.concat_map lowered ~f:(fun value -> value.prelude)
 
 let results (lowered : lowered list) = List.map lowered ~f:(fun value -> value.result)
 
-let rec lower_many context expressions = List.map expressions ~f:(lower context)
+let rec preserve_before_prelude context (values : lowered list) : lowered list =
+  match values with
+  | [] -> []
+  | value :: rest ->
+    let rest = preserve_before_prelude context rest in
+    let value =
+      if is_eager context
+         && result_needs_capture value.result
+         && List.exists rest ~f:(fun value -> not (List.is_empty value.prelude))
+      then
+        materialize context value
+      else value
+    in
+    value :: rest
+
+let rec lower_many context expressions =
+  let lowered = List.map expressions ~f:(lower context) in
+  preserve_before_prelude context lowered
 
 and lower_collection context constructor expressions resolved_type =
   let lowered = lower_many context expressions in
@@ -208,7 +258,15 @@ and lower_collection context constructor expressions resolved_type =
   }
 
 and lower_map context entries =
-  let lowered = List.map entries ~f:(fun (key, value) -> lower context key, lower context value) in
+  let lowered_values =
+    lower_many context (List.concat_map entries ~f:(fun (key, value) -> [ key; value ]))
+  in
+  let pair_values values =
+    List.mapi entries ~f:(fun index _entry ->
+      ( List.nth_exn values (index * 2)
+      , List.nth_exn values (index * 2 + 1) ))
+  in
+  let lowered = pair_values lowered_values in
   let result =
     List.fold lowered ~init:(D.DMapExpr []) ~f:(fun result (key, value) ->
       D.DMapUpdate (result, key.result, value.result))
@@ -334,7 +392,9 @@ and lower_regular_call context callee arguments =
          | [] -> [])
         rest
   in
-  let lowered_arguments = lower_arguments parameter_types arguments in
+  let lowered_arguments =
+    preserve_before_prelude context (lower_arguments parameter_types arguments)
+  in
   let call = D.DCallExpr (lowered_callee.result, results lowered_arguments) in
   let prelude = lowered_callee.prelude @ join_preludes lowered_arguments in
   let resolved_type = Sem.infer context.environment (Py.Call (callee, arguments)) in
@@ -367,8 +427,17 @@ and lower_selector context = function
     let lowered = lower context index in
     lowered, IndexSelector index
   | Py.Slice (lower_bound, upper_bound) ->
-    let lower_value = Option.map lower_bound ~f:(lower context) in
-    let upper_value = Option.map upper_bound ~f:(lower context) in
+    let lowered_bounds = lower_many context (Option.to_list lower_bound @ Option.to_list upper_bound) in
+    let lower_value =
+      match lower_bound with
+      | Some _ -> Some (List.hd_exn lowered_bounds)
+      | None -> None
+    in
+    let upper_value =
+      match upper_bound with
+      | Some _ -> Some (List.last_exn lowered_bounds)
+      | None -> None
+    in
     let lower_result = Option.map lower_value ~f:(fun value -> value.result) in
     let upper_result = Option.map upper_value ~f:(fun value -> value.result) in
     let kind, arguments =
@@ -390,6 +459,11 @@ and lower_selector context = function
 and lower_subscript context value selector =
   let lowered_value = lower context value in
   let lowered_selector, source_selector = lower_selector context selector in
+  let lowered_value =
+    if is_eager context && not (List.is_empty lowered_selector.prelude) then
+      materialize context lowered_value
+    else lowered_value
+  in
   let value_type = Sem.infer context.environment value in
   let name = generic_name value_type in
   let result_type = Sem.infer context.environment (Py.Subscript (value, selector)) in
@@ -566,7 +640,7 @@ and lower_for context specifications identifiers iterable body =
       match kind, iterable with
       | Sem.MapCollection, Py.Identifier source
         when not (String.equal (Option.value (snd source) ~default:"") target_name) ->
-        Sem.map_aliases_for context.environment (Option.value (snd source) ~default:"")
+        Sem.map_may_aliases_for context.environment (Option.value (snd source) ~default:"")
         @ inherited_iterated_maps
       | _ -> inherited_iterated_maps
     in
@@ -689,6 +763,11 @@ and lower context expression =
     in
     let lowered_left = lower left_context left in
     let lowered_right = lower right_context right in
+    let lowered_left =
+      if is_eager context && not (List.is_empty lowered_right.prelude) then
+        materialize context lowered_left
+      else lowered_left
+    in
     { prelude = lowered_left.prelude @ lowered_right.prelude
     ; result = binary_expression environment left operator right lowered_left.result lowered_right.result
     ; resolved_type = Sem.infer environment expression

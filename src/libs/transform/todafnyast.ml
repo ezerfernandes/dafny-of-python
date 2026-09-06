@@ -239,7 +239,7 @@ let semantic_function_env environment name parameters return_type =
     List.map parameters ~f:(fun (identifier, value) ->
       seg_val identifier, Semantic.annotation value)
   in
-  Semantic.bind_many scoped
+  Semantic.bind_parameters scoped
     (parameters @ [ ("return", Semantic.annotation return_type) ])
 
 let semantic_specs environment specifications =
@@ -377,6 +377,7 @@ let semantic_function generics environment (speclst, name, parameters, return_ty
       let list_names =
         frame_aliases name body
         @ Semantic.list_aliases_for body_environment name
+        @ Semantic.list_may_aliases_for body_environment name
         |> List.dedup_and_sort ~compare:String.compare
       in
       if List.exists body ~f:(statement_modifies ~method_names list_names) then

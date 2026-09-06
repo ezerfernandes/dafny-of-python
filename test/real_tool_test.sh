@@ -149,6 +149,10 @@ tail_result = tail([1, 2])
 tail_caller_result = tail_caller([1, 2])
 assert increment(1) == 2
 method_result = method_form(1)
+evaluation_xs: list[int] = [10, 20]
+evaluation_pair = (len(evaluation_xs), evaluation_xs.pop())
+assert evaluation_pair[0] == 2
+assert [1] == [1]
 assert ordered(1, 2, 3)
 assert contains([1], 1)
 chosen = choose(0)
@@ -231,6 +235,7 @@ grep -q 'method loop_entry_environment' "$workdir/valid_output"
 grep -q 'function increment' "$workdir/valid_output"
 grep -q 'method method_form' "$workdir/valid_output"
 grep -q 'function ordered' "$workdir/valid_output"
+grep -q 'evaluation_xs' "$workdir/valid_output"
 grep -q 'if ' "$workdir/valid_output"
 grep -q 'set<int>' "$workdir/valid_output"
 grep -q 'map<int, int>' "$workdir/valid_output"
@@ -319,6 +324,29 @@ def invalid_assignment(xs: list[int]) -> None:
   xs[0] = 2
 PYTHON
 run_rejected_program list_assignment.py 'indexed assignment into List is unsupported'
+
+cat > "$workdir/map_alias_mutation.py" <<'PYTHON'
+def invalid_map_alias(mapping: dict[int, int]) -> None:
+  alias = mapping
+  mapping[1] = 2
+PYTHON
+run_rejected_program map_alias_mutation.py 'map updates through aliases are unsupported'
+
+cat > "$workdir/map_parameter_mutation.py" <<'PYTHON'
+def invalid_map_parameter(mapping: dict[int, int]) -> None:
+  mapping[1] = 2
+PYTHON
+run_rejected_program map_parameter_mutation.py 'map updates of function parameters are unsupported'
+
+cat > "$workdir/map_returned_alias.py" <<'PYTHON'
+def identity_map(mapping: dict[int, int]) -> dict[int, int]:
+  return mapping
+
+def invalid_returned_alias(mapping: dict[int, int]) -> None:
+  alias = identity_map(mapping)
+  mapping[1] = 2
+PYTHON
+run_rejected_program map_returned_alias.py 'map updates through aliases are unsupported'
 
 # Function pre/post and frame clauses are not valid specifications on a while
 # statement; users must express loop facts as invariants or decreases clauses.
