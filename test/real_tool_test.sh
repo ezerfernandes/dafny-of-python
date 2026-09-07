@@ -90,8 +90,21 @@ def tail(xs: list[int]) -> list[int]:
 def tail_caller(xs: list[int]) -> list[int]:
   return tail(xs)
 
+def nested_comprehension(values: list[list[int]]) -> list[list[int]]:
+  return [[x for x in x] for x in values]
+
 def mutate(xs: list[int]) -> None:
   xs.append(2)
+
+def identity_list(xs: list[int]) -> list[int]:
+  return xs
+
+def returned_alias_mutate(xs: list[int]) -> None:
+  ys = identity_list(xs)
+  ys.append(2)
+
+def identity_map(mapping: dict[int, int]) -> dict[int, int]:
+  return mapping
 
 def alias_mutate(xs: list[int]) -> None:
   ys = xs
@@ -147,6 +160,8 @@ def repeat_guard(x: int) -> None:
 assert first([1]) == 1
 tail_result = tail([1, 2])
 tail_caller_result = tail_caller([1, 2])
+nested_result = nested_comprehension([[1, 2]])
+assert nested_result == nested_result
 assert increment(1) == 2
 method_result = method_form(1)
 evaluation_xs: list[int] = [10, 20]
@@ -210,8 +225,13 @@ assert squares == squares
 selected = {item for item in loop_items if item == 1}
 assert selected == selected
 incremented = {item: item + 1 for item in loop_items}
+map_keys = {key for key in mapping}
+map_copy = {key: mapping[key] for key in mapping}
+assert map_keys == map_keys
+assert map_copy == map_copy
 
 mutate(loop_items)
+returned_alias_mutate(loop_items)
 PYTHON
 
 set +e
@@ -231,8 +251,11 @@ test "$status" -eq 0
 grep -q 'function first' "$workdir/valid_output"
 grep -q 'method tail' "$workdir/valid_output"
 grep -q 'method tail_caller' "$workdir/valid_output"
+grep -q 'method nested_comprehension' "$workdir/valid_output"
 grep -q 'rangeLower' "$workdir/valid_output"
 grep -q 'method mutate' "$workdir/valid_output"
+grep -q 'function identity_list' "$workdir/valid_output"
+grep -q 'method returned_alias_mutate' "$workdir/valid_output"
 grep -q 'method alias_mutate' "$workdir/valid_output"
 grep -q 'method branch_alias_mutate' "$workdir/valid_output"
 grep -q 'method alias_lookup' "$workdir/valid_output"
@@ -254,6 +277,8 @@ grep -q 'while true' "$workdir/valid_output"
 grep -q 'continue;' "$workdir/valid_output"
 grep -q 'squares' "$workdir/valid_output"
 grep -q 'incremented' "$workdir/valid_output"
+grep -q 'map_keys' "$workdir/valid_output"
+grep -q 'map_copy' "$workdir/valid_output"
 grep -q 'verifier finished with [0-9][0-9]* verified, 0 error' "$workdir/valid_output"
 # Dafny 4.11 reports harmless warnings (for example, an `old` expression that
 # does not dereference the heap) on stderr. A zero exit code and a zero-error
@@ -345,6 +370,27 @@ def invalid_map_parameter(mapping: dict[int, int]) -> None:
   mapping[1] = 2
 PYTHON
 run_rejected_program map_parameter_mutation.py 'map updates of function parameters are unsupported'
+
+cat > "$workdir/map_parameter_rebind.py" <<'PYTHON'
+def identity_map(mapping: dict[int, int]) -> dict[int, int]:
+  return mapping
+
+def invalid_map_parameter_rebind(mapping: dict[int, int]) -> None:
+  mapping = identity_map(mapping)
+  mapping[1] = 2
+PYTHON
+run_rejected_program map_parameter_rebind.py 'map updates of function parameters are unsupported'
+
+cat > "$workdir/returned_list_alias.py" <<'PYTHON'
+def identity_list(xs: list[int]) -> list[int]:
+  return xs
+
+def invalid_returned_list_alias(xs: list[int]) -> None:
+  ys = identity_list(xs)
+  for item in xs:
+    ys.append(item)
+PYTHON
+run_rejected_program returned_list_alias.py 'mutating list while iterating it is unsupported'
 
 cat > "$workdir/map_returned_alias.py" <<'PYTHON'
 def identity_map(mapping: dict[int, int]) -> dict[int, int]:

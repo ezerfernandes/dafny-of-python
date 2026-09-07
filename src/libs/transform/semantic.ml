@@ -386,6 +386,25 @@ let common_pairs environments pairs_of =
         List.mem (pairs_of environment) pair ~equal:(fun (left_name, left_root) (right_name, right_root) ->
           String.equal left_name right_name && String.equal left_root right_root)))
 
+let common_scopes environments =
+  match environments with
+  | [] -> []
+  | first :: _ ->
+    let scope_count = List.length first.scopes in
+    if not (List.for_all environments ~f:(fun environment -> List.length environment.scopes = scope_count)) then
+      first.scopes
+    else
+      List.mapi first.scopes ~f:(fun index scope ->
+        let bindings =
+          List.filter scope.bindings ~f:(fun (name, typ) ->
+            List.for_all environments ~f:(fun environment ->
+              match List.nth_exn environment.scopes index |> fun scope ->
+                    List.Assoc.find scope.bindings name ~equal:String.equal with
+              | Some other -> eqtyp typ other
+              | None -> false))
+        in
+        { scope with bindings })
+
 let common_map_keys environments =
   match environments with
   | [] -> []
@@ -561,7 +580,44 @@ let bind_value env name typ value =
       Some source
     | _ -> None
   in
+  let possible_list_alias_sources =
+    match value, collection_kind typ with
+    | Call (_, arguments), ListCollection ->
+      List.filter_map arguments ~f:(function
+        | Identifier source ->
+          let source_name = identifier_name (Identifier source) in
+          begin
+            match lookup env source_name with
+            | Some source_type ->
+              begin
+                match collection_kind source_type with
+                | ListCollection -> Some (list_alias_root env source_name)
+                | _ -> None
+              end
+            | None -> None
+          end
+        | _ -> None)
+    | _ -> []
+  in
+  let preserves_map_parameter =
+    (match collection_kind typ with MapCollection -> true | _ -> false)
+    && List.mem env.map_parameters name ~equal:String.equal
+    && match value with
+       | Call (_, arguments) ->
+         List.exists arguments ~f:(function
+           | Identifier source ->
+             String.equal
+               (map_alias_root env (identifier_name (Identifier source)))
+               (map_alias_root env name)
+           | _ -> false)
+       | _ -> false
+  in
     let env = bind env name typ in
+    let env =
+      if preserves_map_parameter
+      then { env with map_parameters = name :: env.map_parameters }
+      else env
+    in
     let env =
       match map_alias_source with
       | Some source -> { env with map_aliases = (name, source) :: env.map_aliases }
@@ -581,6 +637,18 @@ let bind_value env name typ value =
       match list_alias_source with
       | Some source -> { env with list_aliases = (name, source) :: env.list_aliases }
       | None -> env
+    in
+    let env =
+      { env with
+        possible_list_aliases =
+          List.fold possible_list_alias_sources ~init:env.possible_list_aliases
+            ~f:(fun aliases source ->
+              if List.mem aliases (name, source)
+                   ~equal:(fun (left_name, left_source) (right_name, right_source) ->
+                     String.equal left_name right_name
+                     && String.equal left_source right_source)
+              then aliases
+              else (name, source) :: aliases) }
     in
     match value with
     | Dict entries ->
@@ -1111,6 +1179,46 @@ let rec expression_order_sensitive = function
       ; expression_order_sensitive condition
       ; expression_order_sensitive when_false ]
 
+let comprehension_has_map_iteration env clauses =
+  let rec loop env = function
+    | [] -> false
+    | ComprehensionFor (targets, iterable) :: rest ->
+      let is_map =
+        match collection_kind (infer env iterable) with
+        | MapCollection -> true
+        | _ -> false
+      in
+      let element_type =
+        Option.value (comprehension_element_type (infer env iterable))
+          ~default:(TIdent def_seg)
+      in
+      let env =
+        match targets with
+        | [ target ] -> bind env (identifier_name (Identifier target)) element_type
+        | _ -> env
+      in
+      is_map || loop env rest
+    | ComprehensionIf _ :: rest -> loop env rest
+  in
+  loop (enter_scope env ComprehensionScope) clauses
+
+let comprehension_is_order_sensitive result key clauses =
+  let rec any_sensitive = function
+    | [] -> false
+    | ComprehensionFor (_, iterable) :: rest ->
+      if expression_order_sensitive iterable then true else any_sensitive rest
+    | ComprehensionIf condition :: rest ->
+      if expression_order_sensitive condition then true else any_sensitive rest
+  in
+  let clauses_sensitive = any_sensitive clauses in
+  if clauses_sensitive then true
+  else if expression_order_sensitive result then true
+  else Option.exists key ~f:expression_order_sensitive
+
+let comprehension_map_iteration_is_order_sensitive env result key clauses =
+  comprehension_has_map_iteration env clauses
+  && comprehension_is_order_sensitive result key clauses
+
 let rec statement_order_sensitive = function
   | Pass -> false
   | Assert expression | Exp expression -> expression_order_sensitive expression
@@ -1551,7 +1659,8 @@ and validate_statements env statements =
       let possible_map_aliases = possible_map_aliases branch_environments in
       let known_map_keys = common_map_keys branch_environments in
       { branch_environment with
-        memberships
+        scopes = common_scopes branch_environments
+      ; memberships
       ; list_aliases
       ; possible_list_aliases
       ; map_aliases

@@ -651,8 +651,23 @@ let test_comprehension_semantics_and_lowering () =
       ( Subscript (identifier "mapping", Index (Identifier x))
       , [ ComprehensionFor ([ x ], identifier "mapping") ] )
   in
+  let map_set_comp =
+    SetComprehension
+      ( Identifier x
+      , [ ComprehensionFor ([ x ], identifier "mapping") ] )
+  in
+  let map_dict_comp =
+    DictComprehension
+      ( Identifier x
+      , Subscript (identifier "mapping", Index (Identifier x))
+      , [ ComprehensionFor ([ x ], identifier "mapping") ] )
+  in
   Transform.Semantic.validate_exp env map_comp;
+  Transform.Semantic.validate_exp env map_set_comp;
+  Transform.Semantic.validate_exp env map_dict_comp;
   ignore (Transform.Semantic.infer env map_comp);
+  ignore (Transform.Semantic.infer env map_set_comp);
+  ignore (Transform.Semantic.infer env map_dict_comp);
   ignore (Transform.Semantic.normalize_exp list_comp);
   ignore (Transform.Semantic.normalize_exp set_comp);
   ignore (Transform.Semantic.normalize_exp dict_comp);
@@ -686,6 +701,57 @@ let test_comprehension_semantics_and_lowering () =
   let dict_lowered = Transform.Lowering.expression ~environment:env dict_comp in
   check bool "dict comprehension lowers through an explicit loop" true
     (contains_while dict_lowered.prelude);
+  let map_set_lowered = Transform.Lowering.expression ~environment:env map_set_comp in
+  check bool "set comprehensions may iterate over maps" true
+    (contains_while map_set_lowered.prelude);
+  let map_dict_lowered = Transform.Lowering.expression ~environment:env map_dict_comp in
+  check bool "dict comprehensions may iterate over maps" true
+    (contains_while map_dict_lowered.prelude);
+  check bool "pure map comprehensions are order-insensitive" false
+    (Transform.Semantic.comprehension_map_iteration_is_order_sensitive env
+       (Identifier x) None
+       [ ComprehensionFor ([ x ], identifier "mapping")
+       ; ComprehensionIf (CompareChain (Identifier x, [ (Gt def_seg, Literal (IntLit "0")) ])) ]);
+  check bool "effectful comprehension clauses are order-sensitive" true
+    (Transform.Semantic.comprehension_is_order_sensitive (Identifier x) None
+       [ ComprehensionFor ([ x ], Call (identifier "effect", [])) ]);
+  check bool "effectful comprehension filters are order-sensitive" true
+    (Transform.Semantic.comprehension_is_order_sensitive (Identifier x) None
+       [ ComprehensionIf (Call (identifier "effect", [])) ]);
+  ignore
+    (Transform.Semantic.comprehension_map_iteration_is_order_sensitive env
+       (Identifier x) None
+       [ ComprehensionFor ([ x; y ], identifier "mapping") ]);
+  let map_order_rejected =
+    try
+      ignore
+        (Transform.Lowering.expression ~environment:env
+           (SetComprehension (Call (identifier "effect", []),
+                              [ ComprehensionFor ([ x ], identifier "mapping") ])));
+      false
+    with
+    | Transform.Lowering.LoweringError message -> has_substring message "order-dependent behavior"
+    | _ -> false
+  in
+  check bool "order-sensitive map comprehensions are rejected" true map_order_rejected;
+  let nested_list_type = TGeneric (segment "list", [ list_type ]) in
+  let nested_env = Transform.Semantic.bind env "nested_values" nested_list_type in
+  let nested_comp =
+    ListComprehension
+      ( ListComprehension
+          ( Identifier x
+          , [ ComprehensionFor ([ x ], Identifier x) ] )
+      , [ ComprehensionFor ([ x ], identifier "nested_values") ] )
+  in
+  Transform.Semantic.validate_exp nested_env nested_comp;
+  let nested_lowered = Transform.Lowering.expression ~environment:nested_env nested_comp in
+  let nested_source, _ = Transform.Emitdfy.print_prog_with_sourcemap
+    (D.DProg ("", [ D.DMeth ([], segment "nested", [], [], [ D.DVoid ], Some nested_lowered.prelude) ]))
+  in
+  check bool "nested comprehensions preserve shadowed targets" true
+    (has_substring nested_source "lowered_" && not (has_substring nested_source "x :="));
+  ignore (Transform.Semantic.common_scopes []);
+  ignore (Transform.Semantic.common_scopes [ env; { env with scopes = [] } ]);
   let scoped_rejected =
     try
       ignore
@@ -2511,6 +2577,18 @@ let test_phase3_collections () =
     (Transform.Semantic.bind_value env "duplicate_map_return" map_type
        (Call (identifier "make_map", [ mapping; mapping ])));
   ignore
+    (Transform.Semantic.bind_value env "non_list_return" list_type
+       (Call (identifier "make_list", [ mapping ])));
+  ignore
+    (Transform.Semantic.bind_value env "unknown_list_return" list_type
+       (Call (identifier "make_list", [ identifier "unknown" ])));
+  ignore
+    (Transform.Semantic.bind_value env "literal_list_return" list_type
+       (Call (identifier "make_list", [ Literal (IntLit "1") ])));
+  ignore
+    (Transform.Semantic.bind_value env "duplicate_list_return" list_type
+       (Call (identifier "make_list", [ list; list ])));
+  ignore
     (Transform.Semantic.bind
        { returned_alias_environment with possible_map_aliases = [ ("alias", "mapping") ] }
        "alias" map_type);
@@ -2523,6 +2601,68 @@ let test_phase3_collections () =
        (fun (left_name, left_source) ->
           String.equal left_name "alias" && String.equal left_source "mapping")
        returned_alias_environment.possible_map_aliases);
+  let identity_list_signature : Transform.Semantic.callable_signature =
+    { name = "identity_list"; parameters = [ "source", list_type ]; return_type = list_type
+    ; kind = Transform.Semantic.PureFunction }
+  in
+  let returned_list_environment =
+    Transform.Semantic.empty
+    |> fun environment -> Transform.Semantic.add_function environment identity_list_signature
+    |> fun environment -> Transform.Semantic.bind environment "xs" list_type
+    |> fun environment -> Transform.Semantic.validate_statements environment
+         [ Assign (None, [ identifier "ys" ],
+                   [ Call (identifier "identity_list", [ identifier "xs" ]) ]) ]
+  in
+  check bool "returned list aliases are tracked conservatively" true
+    (List.exists
+       (fun (left_name, left_source) ->
+          String.equal left_name "ys" && String.equal left_source "xs")
+       returned_list_environment.possible_list_aliases);
+  expect_exception "returned list aliases are protected during iteration"
+    (function Transform.Semantic.SemanticError message -> has_substring message "while iterating" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements returned_list_environment
+                         [ For ([], [ segment "item" ], identifier "xs"
+                              , [ Exp (Call (Dot (identifier "ys", segment "append"),
+                                             [ Literal (IntLit "3") ])) ]) ]));
+  let map_parameter_environment =
+    Transform.Semantic.empty
+    |> fun environment -> Transform.Semantic.add_function environment identity_map_signature
+    |> fun environment -> Transform.Semantic.enter_scope environment
+         (Transform.Semantic.FunctionScope "map_parameter")
+    |> fun environment -> Transform.Semantic.bind_parameters environment [ "mapping", map_type ]
+  in
+  let rebound_map_parameter_environment =
+    Transform.Semantic.validate_statements map_parameter_environment
+      [ Assign (None, [ identifier "mapping" ],
+                [ Call (identifier "identity_map", [ identifier "mapping" ]) ]) ]
+  in
+  check bool "map parameter provenance survives self-passing calls" true
+    (List.mem "mapping" rebound_map_parameter_environment.map_parameters);
+  ignore
+    (Transform.Semantic.bind_value map_parameter_environment "mapping" map_type
+       (Call (identifier "identity_map", [ Literal (IntLit "1") ])));
+  expect_exception "updates after map parameter self-passing calls are rejected"
+    (function Transform.Semantic.SemanticError message -> has_substring message "function parameters" | _ -> false)
+    (fun () -> ignore (Transform.Semantic.validate_statements rebound_map_parameter_environment
+                         [ Assign (None, [ Subscript (identifier "mapping", Index (Literal (IntLit "1"))) ],
+                                   [ Literal (IntLit "2") ]) ]));
+  let common_branch_environment =
+    Transform.Semantic.empty
+    |> fun environment -> Transform.Semantic.bind environment "flag" (TBool def_seg)
+    |> fun environment -> Transform.Semantic.validate_statements environment
+         [ IfElse
+             ( identifier "flag"
+             , [ Assign (None, [ identifier "common_mapping" ], [ known_map ]) ]
+             , []
+             , [ Assign (None, [ identifier "common_mapping" ], [ known_map ]) ] ) ]
+  in
+  check bool "branch-common bindings survive the conditional join" true
+    (match Transform.Semantic.lookup common_branch_environment "common_mapping" with
+     | Some typ -> Transform.Semantic.collection_kind typ = Transform.Semantic.MapCollection
+     | None -> false);
+  ignore
+    (Transform.Semantic.validate_exp common_branch_environment
+       (Subscript (identifier "common_mapping", Index (Literal (IntLit "1")))));
   expect_exception "updates with returned map aliases are rejected"
     (function Transform.Semantic.SemanticError message -> has_substring message "aliases" | _ -> false)
     (fun () -> ignore (Transform.Semantic.validate_statements returned_alias_environment

@@ -15,6 +15,7 @@ type context =
   ; loop_depth : int
   ; iterated_lists : string list
   ; iterated_maps : string list
+  ; check_map_iteration_order : bool
   }
 
 type lowered =
@@ -59,6 +60,7 @@ let context environment =
   ; loop_depth = 0
   ; iterated_lists = []
   ; iterated_maps = []
+  ; check_map_iteration_order = true
   }
 
 let scoped context = { context with evaluation = Scoped }
@@ -274,33 +276,21 @@ let rec rename_comprehension_expression substitutions = function
          rename_comprehension_expression substitutions key
          , rename_comprehension_expression substitutions value))
   | Py.ListComprehension (result, clauses) ->
+    let clauses, substitutions = rename_comprehension_clauses substitutions clauses in
     Py.ListComprehension
       ( rename_comprehension_expression substitutions result
-      , List.map clauses ~f:(function
-          | Py.ComprehensionFor (targets, iterable) ->
-            Py.ComprehensionFor
-              (targets, rename_comprehension_expression substitutions iterable)
-          | Py.ComprehensionIf condition ->
-            Py.ComprehensionIf (rename_comprehension_expression substitutions condition)) )
+      , clauses )
   | Py.SetComprehension (result, clauses) ->
+    let clauses, substitutions = rename_comprehension_clauses substitutions clauses in
     Py.SetComprehension
       ( rename_comprehension_expression substitutions result
-      , List.map clauses ~f:(function
-          | Py.ComprehensionFor (targets, iterable) ->
-            Py.ComprehensionFor
-              (targets, rename_comprehension_expression substitutions iterable)
-          | Py.ComprehensionIf condition ->
-            Py.ComprehensionIf (rename_comprehension_expression substitutions condition)) )
+      , clauses )
   | Py.DictComprehension (key, value, clauses) ->
+    let clauses, substitutions = rename_comprehension_clauses substitutions clauses in
     Py.DictComprehension
       ( rename_comprehension_expression substitutions key
       , rename_comprehension_expression substitutions value
-      , List.map clauses ~f:(function
-          | Py.ComprehensionFor (targets, iterable) ->
-            Py.ComprehensionFor
-              (targets, rename_comprehension_expression substitutions iterable)
-          | Py.ComprehensionIf condition ->
-            Py.ComprehensionIf (rename_comprehension_expression substitutions condition)) )
+      , clauses )
   | Py.Tuple elements ->
     Py.Tuple (List.map elements ~f:(rename_comprehension_expression substitutions))
   | Py.SingletonTuple (comma, value) ->
@@ -334,7 +324,7 @@ let rec rename_comprehension_expression substitutions = function
       , rename_comprehension_expression substitutions condition
       , rename_comprehension_expression substitutions when_false )
 
-let rename_comprehension_clauses clauses =
+and rename_comprehension_clauses substitutions clauses =
   let rec loop substitutions = function
     | [] -> [], substitutions
     | Py.ComprehensionFor (targets, iterable) :: rest ->
@@ -351,7 +341,7 @@ let rename_comprehension_clauses clauses =
       let rest, substitutions = loop substitutions rest in
       Py.ComprehensionIf (rename_comprehension_expression substitutions condition) :: rest, substitutions
   in
-  loop [] clauses
+  loop substitutions clauses
 [@@@coverage on]
 
 let rec preserve_before_prelude context (values : lowered list) : lowered list =
@@ -854,8 +844,8 @@ and lower_for context specifications identifiers iterable body =
       @ [ snapshot_binding ]
       @ lower_value_loop (D.DMapKeys snapshot_expression)
     in
-    if Sem.map_iteration_is_order_sensitive body then
-      fail "order-dependent behavior in map iteration is unsupported"
+    if context.check_map_iteration_order && Sem.map_iteration_is_order_sensitive body then
+      raise (LoweringError "order-dependent behavior in map iteration is unsupported")
     else lowered
   | _ -> fail "for loop iterable is not a supported collection"
 
@@ -885,7 +875,10 @@ and lower_comprehension context expression =
     D.DAssignLvalue (None, [ D.Local accumulator ], [ initial_result ])
   in
   let accumulator_environment = Sem.bind context.environment accumulator_name initial_type in
-  let clauses, substitutions = rename_comprehension_clauses source_clauses in
+  if Sem.comprehension_map_iteration_is_order_sensitive
+       context.environment source_result source_key source_clauses
+  then raise (LoweringError "order-dependent behavior in map iteration is unsupported");
+  let clauses, substitutions = rename_comprehension_clauses [] source_clauses in
   let result = rename_comprehension_expression substitutions source_result in
   let key = Option.map source_key ~f:(rename_comprehension_expression substitutions) in
   let append_body result =
@@ -918,7 +911,12 @@ and lower_comprehension context expression =
       [ Py.IfElse (condition, build rest, [], []) ]
   in
   let generated = build clauses in
-  let body_context = { context with environment = accumulator_environment } in
+  let body_context =
+    { context with
+      environment = accumulator_environment
+    ; check_map_iteration_order = false
+    }
+  in
   let lowered_body = lower_statements body_context generated in
   { prelude = accumulator_binding :: lowered_body
   ; result = D.DIdentifier accumulator
