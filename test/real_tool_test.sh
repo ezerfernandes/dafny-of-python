@@ -66,8 +66,9 @@ def increment(x: int) -> int:
   return x + 1
 
 assert increment(1) == 2
-if exists k :: k == 0:
-  pass
+# This is valid for the parser and Dafny, but intentionally fails mypy. The
+# type comment is ignored by the parser, while mypy checks it.
+incompatible = 1  # type: str
 PYTHON
 
 set +e
@@ -85,9 +86,8 @@ set -e
 
 test "$status" -eq 2
 grep -q 'function increment' "$workdir/output"
-grep -q 'exists k ::' "$workdir/output"
 grep -q 'verifier finished with [0-9][0-9]* verified, 0 error' "$workdir/output"
-grep -q 'Typechecking failed (exit code 2)' "$workdir/errors"
+grep -q 'Typechecking failed (exit code 1)' "$workdir/errors"
 
 # A valid Python fixture must exercise the pinned mypy success path and the
 # CLI's zero exit code while Dafny verifies the generated program.
