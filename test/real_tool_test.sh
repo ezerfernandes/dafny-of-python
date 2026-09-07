@@ -62,13 +62,12 @@ cleanup() {
 trap cleanup EXIT
 
 cat > "$workdir/program.py" <<'PYTHON'
+import definitely_missing_for_dafny_of_python_smoke_test
+
 def increment(x: int) -> int:
   return x + 1
 
 assert increment(1) == 2
-# This is valid for the parser and Dafny, but intentionally fails mypy. The
-# type comment is ignored by the parser, while mypy checks it.
-incompatible = 1  # type: str
 PYTHON
 
 set +e
