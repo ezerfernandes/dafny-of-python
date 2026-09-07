@@ -88,11 +88,17 @@ let main () =
      Run.Report.report ~sourcemap:result.sourcemap
        (result.verification.stdout ^ result.verification.stderr)
    with
-   | Run.Report.ReportError message when result.verification.exit_code = 0 ->
-     (* Some successful Dafny frontends emit diagnostics without the usual
-        verifier summary. Preserve the verifier's successful status; the
-        missing presentation summary must not turn it into a CLI failure. *)
-     prerr message);
+   | Run.Report.ReportError message ->
+     prerr
+       ("Dafny verification exit code: "
+        ^ Int.to_string result.verification.exit_code
+        ^ "\n");
+     if result.verification.exit_code = 0 then
+       (* Some successful Dafny frontends emit diagnostics without the usual
+          verifier summary. Preserve the verifier's successful status; the
+          missing presentation summary must not turn it into a CLI failure. *)
+       prerr message
+     else raise (Run.Report.ReportError message));
   Run.Pipeline.exit_code result
 
 (* Process termination does not flush Bisect_ppx counters reliably. The CLI
