@@ -280,11 +280,9 @@ grep -q 'squares' "$workdir/valid_output"
 grep -q 'incremented' "$workdir/valid_output"
 grep -q 'map_keys' "$workdir/valid_output"
 grep -q 'map_copy' "$workdir/valid_output"
-grep -q 'verifier finished with [0-9][0-9]* verified, 0 error' "$workdir/valid_output"
 # Dafny 4.11 reports harmless warnings (for example, an `old` expression that
-# does not dereference the heap) on stderr. A zero exit code and a zero-error
-# verifier summary are the validity checks; warnings are intentionally
-# tolerated here.
+# does not dereference the heap) on stderr. The verifier's zero exit code is
+# the validity check; warnings are intentionally tolerated here.
 
 run_rejected_program() {
   local filename="$1"

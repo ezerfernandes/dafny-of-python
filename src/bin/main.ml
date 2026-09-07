@@ -84,8 +84,15 @@ let main () =
   printf "\n%s\n" result.dafny_source;
   if String.length result.verification.stderr > 0 then
     prerr result.verification.stderr;
-  Run.Report.report ~sourcemap:result.sourcemap
-    (result.verification.stdout ^ result.verification.stderr);
+  (try
+     Run.Report.report ~sourcemap:result.sourcemap
+       (result.verification.stdout ^ result.verification.stderr)
+   with
+   | Run.Report.ReportError message when result.verification.exit_code = 0 ->
+     (* Some successful Dafny frontends emit diagnostics without the usual
+        verifier summary. Preserve the verifier's successful status; the
+        missing presentation summary must not turn it into a CLI failure. *)
+     prerr message);
   Run.Pipeline.exit_code result
 
 (* Process termination does not flush Bisect_ppx counters reliably. The CLI

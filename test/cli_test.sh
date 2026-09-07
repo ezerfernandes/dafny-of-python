@@ -27,9 +27,13 @@ cat > "$workdir/dafny-reports" <<'SCRIPT'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$DAFNY_OF_PYTHON_DAFNY_ARGS"
 printf 'verification warning\n' >&2
-printf 'verifier finished with 1 verified, 0 errors\n'
 SCRIPT
-chmod +x "$workdir/mypy-fails" "$workdir/mypy-succeeds" "$workdir/dafny-succeeds" "$workdir/dafny-reports"
+cat > "$workdir/dafny-fails" <<'SCRIPT'
+#!/usr/bin/env bash
+printf 'verification failed\n' >&2
+exit 1
+SCRIPT
+chmod +x "$workdir/mypy-fails" "$workdir/mypy-succeeds" "$workdir/dafny-succeeds" "$workdir/dafny-reports" "$workdir/dafny-fails"
 
 # Defaults must not be resolved before --help is handled. Running from a
 # directory without src/libs/run makes this regression test meaningful.
@@ -76,8 +80,22 @@ status=$?
 set -e
 test "$status" -eq 0
 grep -q 'verification warning' "$workdir/success.err"
+grep -q 'Unable to obtain verification summary' "$workdir/success.err"
 test ! -e "$workdir/program.py"
 test ! -e "$workdir/program.dfy"
+
+# A verifier failure remains fatal even when it does not emit a summary.
+set +e
+(cd "$workdir" && printf 'x = 1\n' | "$main_exe" \
+  --mypy "$workdir/mypy-succeeds" \
+  --dafny "$workdir/dafny-fails" \
+  --prelude "$prelude" \
+  --list "$list_library" > failure.out 2> failure.err)
+status=$?
+set -e
+test "$status" -eq 1
+grep -q 'verification failed' "$workdir/failure.err"
+grep -q 'ReportError' "$workdir/failure.err"
 
 # Runtime resources can be discovered through the environment when callers do
 # not want to pass installation-specific paths explicitly.
