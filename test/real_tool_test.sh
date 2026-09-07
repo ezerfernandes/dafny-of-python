@@ -45,7 +45,21 @@ case "$($dafny_bin --version 2>&1)" in
 esac
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/dafny-of-python-real-test.XXXXXX")"
-trap 'rm -rf "$workdir"' EXIT
+cleanup() {
+  local status="$?"
+  if test "$status" -ne 0; then
+    printf '%s\n' 'real-tool smoke test diagnostics:' >&2
+    for artifact in output errors valid_output valid_errors rejected_output rejected_errors; do
+      if test -f "$workdir/$artifact"; then
+        printf '%s\n' "--- $artifact ---" >&2
+        sed -n '1,200p' "$workdir/$artifact" >&2
+      fi
+    done
+  fi
+  rm -rf "$workdir"
+  exit "$status"
+}
+trap cleanup EXIT
 
 cat > "$workdir/program.py" <<'PYTHON'
 def increment(x: int) -> int:
