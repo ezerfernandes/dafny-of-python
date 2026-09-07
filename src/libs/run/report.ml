@@ -7,6 +7,24 @@ let[@inline] failwith msg = raise (ReportError msg)
 let printf = Stdlib.Printf.printf
 let prerr = Stdlib.prerr_string
 
+let strip_ansi out =
+  let length = String.length out in
+  let buffer = Buffer.create length in
+  let rec skip_escape index =
+    if index >= length then index
+    else if Char.is_alpha out.[index] then index + 1
+    else skip_escape (index + 1)
+  in
+  let rec copy index =
+    if index >= length then ()
+    else if Char.equal out.[index] '\027' then copy (skip_escape (index + 1))
+    else (
+      Buffer.add_char buffer out.[index];
+      copy (index + 1))
+  in
+  copy 0;
+  Buffer.contents buffer
+
 let replace_num ?(sourcemap = ref []) p =
   let nums = (Re2.find_all_exn (Re2.create_exn "[0-9]*") p) in
   let line_column = List.filter ~f:(fun s -> 
@@ -25,6 +43,7 @@ let replace_num ?(sourcemap = ref []) p =
   let seg_str = print_seg seg in seg_str
 
 let verification_errors ?(sourcemap = ref []) out =
+  let out = strip_ansi out in
   try begin
     let line_rgx = Re2.create_exn "\\([0-9]*,[0-9]*\\).+" in
     let lines = Re2.find_all_exn line_rgx out in 
@@ -39,6 +58,7 @@ let verification_errors ?(sourcemap = ref []) out =
   | Re2.Exceptions.Regex_match_failed _ -> None
 
 let verification_summary out =
+  let out = strip_ansi out in
   try begin
     let line_rgx = Re2.create_exn ("verifier finished with [0-9]+ verified, [0-9]+ error") in
     let line = (Re2.find_first_exn line_rgx out) ^ "(s)" in

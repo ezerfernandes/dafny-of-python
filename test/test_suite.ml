@@ -695,6 +695,12 @@ let test_comprehension_semantics_and_lowering () =
   let list_lowered = Transform.Lowering.expression ~environment:env list_comp in
   check bool "list comprehension lowers through an explicit loop" true
     (contains_while list_lowered.prelude);
+  let collision_environment = Transform.Semantic.bind env "lowered_1" int_type in
+  let collision_lowered = Transform.Lowering.expression ~environment:collision_environment list_comp in
+  check bool "generated comprehension names avoid user bindings" true
+    (match collision_lowered.result with
+     | D.DIdentifier (_, Some name) -> not (String.equal name "lowered_1")
+     | _ -> false);
   let set_lowered = Transform.Lowering.expression ~environment:env set_comp in
   check bool "set comprehension lowers through an explicit loop" true
     (contains_while set_lowered.prelude);
@@ -1507,6 +1513,27 @@ let test_semantic_lowering_paths () =
     { name = "pure"; parameters = []; return_type = int_type; kind = Transform.Semantic.PureFunction }
   in
   let function_environment = Transform.Semantic.add_function environment signature in
+  check bool "known pure calls do not make map comprehensions order-sensitive" false
+    (Transform.Semantic.comprehension_map_iteration_is_order_sensitive function_environment
+       (Call (identifier "pure", [])) None
+       [ ComprehensionFor ([ segment "key" ], identifier "mapping") ]);
+  check bool "list comprehensions preserve map iteration order" true
+    (Transform.Semantic.comprehension_map_iteration_is_order_sensitive
+       ~preserves_order:true function_environment
+       (Identifier (segment "key")) None
+       [ ComprehensionFor ([ segment "key" ], identifier "mapping") ]);
+  check bool "method calls are order-sensitive in map comprehensions" true
+    (Transform.Semantic.comprehension_is_order_sensitive ~env:function_environment
+       (Call (Dot (identifier "mapping", segment "copy"), [])) None []);
+  check bool "unknown calls are order-sensitive in map comprehensions" true
+    (Transform.Semantic.comprehension_is_order_sensitive ~env:function_environment
+       (Call (identifier "unknown", [])) None []);
+  check bool "call arguments are included in map comprehension order analysis" true
+    (Transform.Semantic.comprehension_is_order_sensitive ~env:function_environment
+       (Call (identifier "pure", [ Call (identifier "unknown", []) ])) None []);
+  check bool "non-identifier calls are conservatively pure for order analysis" false
+    (Transform.Semantic.comprehension_is_order_sensitive ~env:function_environment
+       (Call (Literal TrueLit, [])) None []);
   let generator_signature : Transform.Semantic.callable_signature =
     { name = "generate"; parameters = []; return_type = int_type; kind = Transform.Semantic.Generator }
   in
@@ -1517,6 +1544,9 @@ let test_semantic_lowering_paths () =
     Transform.Semantic.add_function function_environment generator_signature
     |> fun environment -> Transform.Semantic.add_function environment constructor_signature
   in
+  check bool "generator calls are order-sensitive in map comprehensions" true
+    (Transform.Semantic.comprehension_is_order_sensitive ~env:callable_environment
+       (Call (identifier "generate", [])) None []);
   let list_consumer : Transform.Semantic.callable_signature =
     { name = "consume"; parameters = [ "items", list_type ]; return_type = int_type
     ; kind = Transform.Semantic.PureFunction }
@@ -4028,6 +4058,10 @@ let test_report_paths () =
   check bool "report prints mapped diagnostics" true (has_substring reported "first");
   Run.Report.report "verifier finished with 1 verified, 0 errors\n";
   Run.Report.verification_summary "verifier finished with 2 verified, 0 errors\n";
+  Run.Report.verification_summary
+    "\027[32mDafny program verifier finished with 3 verified, 0 errors\027[0m\n";
+  Run.Report.verification_summary
+    "Dafny program verifier finished with 4 verified, 0 errors\027";
   expect_exception "malformed verifier summary" (function Run.Report.ReportError _ -> true | _ -> false)
     (fun () -> Run.Report.verification_summary "no summary\n")
 

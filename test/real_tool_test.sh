@@ -113,9 +113,19 @@ def mutate(xs: list[int]) -> None:
 def identity_list(xs: list[int]) -> list[int]:
   return xs
 
+def square(value: int) -> int:
+  return value * value
+
+def pure_map_copy(mapping: dict[int, int]) -> dict[int, int]:
+  return {key: square(mapping[key]) for key in mapping}
+
 def returned_alias_mutate(xs: list[int]) -> None:
   ys = identity_list(xs)
   ys.append(2)
+
+def comprehension_name_collision(xs: list[int]) -> list[int]:
+  lowered_1 = 7
+  return [item for item in xs]
 
 def identity_map(mapping: dict[int, int]) -> dict[int, int]:
   return mapping
@@ -243,6 +253,8 @@ map_keys = {key for key in mapping}
 map_copy = {key: mapping[key] for key in mapping}
 assert map_keys == map_keys
 assert map_copy == map_copy
+pure_map_result = pure_map_copy(mapping)
+collision_result = comprehension_name_collision(loop_items)
 
 mutate(loop_items)
 returned_alias_mutate(loop_items)
@@ -269,7 +281,10 @@ grep -q 'method nested_comprehension' "$workdir/valid_output"
 grep -q 'rangeLower' "$workdir/valid_output"
 grep -q 'method mutate' "$workdir/valid_output"
 grep -q 'function identity_list' "$workdir/valid_output"
+grep -q 'function square' "$workdir/valid_output"
+grep -q 'method pure_map_copy' "$workdir/valid_output"
 grep -q 'method returned_alias_mutate' "$workdir/valid_output"
+grep -q 'method comprehension_name_collision' "$workdir/valid_output"
 grep -q 'method alias_mutate' "$workdir/valid_output"
 grep -q 'method branch_alias_mutate' "$workdir/valid_output"
 grep -q 'method alias_lookup' "$workdir/valid_output"
@@ -364,6 +379,12 @@ def invalid_map_order(mapping: dict[int, int]) -> None:
     break
 PY
 run_rejected_program map_iteration_order.py 'order-dependent behavior in map iteration is unsupported'
+
+cat > "$workdir/map_list_comprehension.py" <<'PY'
+def invalid_map_list(mapping: dict[int, int]) -> list[int]:
+  return [key for key in mapping]
+PY
+run_rejected_program map_list_comprehension.py 'order-dependent behavior in map iteration is unsupported'
 
 # List objects are functional in the runtime and do not have an index setter.
 cat > "$workdir/list_assignment.py" <<'PYTHON'

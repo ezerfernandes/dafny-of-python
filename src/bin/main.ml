@@ -84,7 +84,8 @@ let main () =
   printf "\n%s\n" result.dafny_source;
   if String.length result.verification.stderr > 0 then
     prerr result.verification.stderr;
-  Run.Report.report ~sourcemap:result.sourcemap result.verification.stdout;
+  Run.Report.report ~sourcemap:result.sourcemap
+    (result.verification.stdout ^ result.verification.stderr);
   Run.Pipeline.exit_code result
 
 (* Process termination does not flush Bisect_ppx counters reliably. The CLI

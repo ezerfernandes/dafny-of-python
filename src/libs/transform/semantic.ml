@@ -1134,50 +1134,63 @@ let require_set_source kind message =
 let any_order_sensitive values =
   List.exists values ~f:(fun value -> value)
 
-let rec expression_order_sensitive = function
+let call_order_sensitive env callee =
+  match callee with
+  | Dot _ -> true
+  | Identifier identifier ->
+    begin
+      match lookup_function env (Option.value (snd identifier) ~default:"") with
+      | Some { kind = PureFunction; _ } -> false
+      | Some _ | None -> true
+    end
+  | _ -> false
+
+let rec expression_order_sensitive ?env = function
   | Typ _ | Literal _ | Identifier _ -> false
   | Dot (value, _) | UnaryExp (_, value) | Index value | Len (_, value)
-  | Max (_, value) | Old (_, value) | Fresh (_, value) -> expression_order_sensitive value
+  | Max (_, value) | Old (_, value) | Fresh (_, value) -> expression_order_sensitive ?env value
   | BinaryExp (left, _, right) ->
     any_order_sensitive
-      [ expression_order_sensitive left; expression_order_sensitive right ]
+      [ expression_order_sensitive ?env left; expression_order_sensitive ?env right ]
   | CompareChain (first, comparisons) ->
     any_order_sensitive
-      (expression_order_sensitive first
-       :: List.map comparisons ~f:(fun (_, operand) -> expression_order_sensitive operand))
-  | Call _ -> true
+      (expression_order_sensitive ?env first
+       :: List.map comparisons ~f:(fun (_, operand) -> expression_order_sensitive ?env operand))
+  | Call (callee, arguments) ->
+    List.exists arguments ~f:(expression_order_sensitive ?env)
+    || Option.value_map env ~default:true ~f:(fun env -> call_order_sensitive env callee)
   | Lst elements | Array elements | Set elements | Tuple elements ->
-    List.exists elements ~f:expression_order_sensitive
+    List.exists elements ~f:(expression_order_sensitive ?env)
   | ListComprehension (result, clauses) | SetComprehension (result, clauses) ->
     List.exists clauses ~f:(function
-      | ComprehensionFor (_, iterable) -> expression_order_sensitive iterable
-      | ComprehensionIf condition -> expression_order_sensitive condition)
-    || expression_order_sensitive result
+      | ComprehensionFor (_, iterable) -> expression_order_sensitive ?env iterable
+      | ComprehensionIf condition -> expression_order_sensitive ?env condition)
+    || expression_order_sensitive ?env result
   | DictComprehension (key, value, clauses) ->
     List.exists clauses ~f:(function
-      | ComprehensionFor (_, iterable) -> expression_order_sensitive iterable
-      | ComprehensionIf condition -> expression_order_sensitive condition)
-    || expression_order_sensitive key
-    || expression_order_sensitive value
+      | ComprehensionFor (_, iterable) -> expression_order_sensitive ?env iterable
+      | ComprehensionIf condition -> expression_order_sensitive ?env condition)
+    || expression_order_sensitive ?env key
+    || expression_order_sensitive ?env value
   | Dict entries ->
     List.exists entries ~f:(fun (key, value) ->
       any_order_sensitive
-        [ expression_order_sensitive key; expression_order_sensitive value ])
-  | SingletonTuple (_, value) -> expression_order_sensitive value
+        [ expression_order_sensitive ?env key; expression_order_sensitive ?env value ])
+  | SingletonTuple (_, value) -> expression_order_sensitive ?env value
   | Subscript (value, selector) ->
     any_order_sensitive
-      [ expression_order_sensitive value; expression_order_sensitive selector ]
+      [ expression_order_sensitive ?env value; expression_order_sensitive ?env selector ]
   | Slice (lower, upper) ->
     any_order_sensitive
-      [ Option.exists lower ~f:expression_order_sensitive
-      ; Option.exists upper ~f:expression_order_sensitive ]
+      [ Option.exists lower ~f:(expression_order_sensitive ?env)
+      ; Option.exists upper ~f:(expression_order_sensitive ?env) ]
   | Forall (_, body) | Exists (_, body) | Lambda (_, body) ->
-    expression_order_sensitive body
+    expression_order_sensitive ?env body
   | IfElseExp (when_true, condition, when_false) ->
     any_order_sensitive
-      [ expression_order_sensitive when_true
-      ; expression_order_sensitive condition
-      ; expression_order_sensitive when_false ]
+      [ expression_order_sensitive ?env when_true
+      ; expression_order_sensitive ?env condition
+      ; expression_order_sensitive ?env when_false ]
 
 let comprehension_has_map_iteration env clauses =
   let rec loop env = function
@@ -1202,22 +1215,22 @@ let comprehension_has_map_iteration env clauses =
   in
   loop (enter_scope env ComprehensionScope) clauses
 
-let comprehension_is_order_sensitive result key clauses =
+let comprehension_is_order_sensitive ?env result key clauses =
   let rec any_sensitive = function
     | [] -> false
     | ComprehensionFor (_, iterable) :: rest ->
-      if expression_order_sensitive iterable then true else any_sensitive rest
+      if expression_order_sensitive ?env iterable then true else any_sensitive rest
     | ComprehensionIf condition :: rest ->
-      if expression_order_sensitive condition then true else any_sensitive rest
+      if expression_order_sensitive ?env condition then true else any_sensitive rest
   in
   let clauses_sensitive = any_sensitive clauses in
   if clauses_sensitive then true
-  else if expression_order_sensitive result then true
-  else Option.exists key ~f:expression_order_sensitive
+  else if expression_order_sensitive ?env result then true
+  else Option.exists key ~f:(expression_order_sensitive ?env)
 
-let comprehension_map_iteration_is_order_sensitive env result key clauses =
+let comprehension_map_iteration_is_order_sensitive ?(preserves_order = false) env result key clauses =
   comprehension_has_map_iteration env clauses
-  && comprehension_is_order_sensitive result key clauses
+  && (preserves_order || comprehension_is_order_sensitive ~env result key clauses)
 
 let rec statement_order_sensitive = function
   | Pass -> false

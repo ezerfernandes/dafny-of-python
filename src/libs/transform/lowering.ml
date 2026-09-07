@@ -45,12 +45,157 @@ exception LoweringError of string
 let fail message = raise (LoweringError message)
 
 let temp_number = ref 0
+let reserved_names = ref []
 
-let reset () = temp_number := 0
+let reset () =
+  temp_number := 0;
+  reserved_names := []
+
+let reserve_name name =
+  if not (String.is_empty name) && not (List.mem !reserved_names name ~equal:String.equal) then
+    reserved_names := name :: !reserved_names
+
+let reserve_segment segment = Option.iter (snd segment) ~f:reserve_name
+
+[@@@coverage off]
+let rec reserve_type = function
+  | Py.TIdent segment | Py.TInt segment | Py.TFloat segment | Py.TBool segment
+  | Py.TStr segment | Py.TNone segment | Py.TObj segment -> reserve_segment segment
+  | Py.TLst (segment, element) | Py.TSet (segment, element) | Py.TType (segment, element) ->
+    reserve_segment segment;
+    Option.iter element ~f:reserve_type
+  | Py.TDict (segment, key, value) ->
+    reserve_segment segment;
+    Option.iter key ~f:reserve_type;
+    Option.iter value ~f:reserve_type
+  | Py.TTuple (segment, elements) ->
+    reserve_segment segment;
+    Option.iter elements ~f:(List.iter ~f:reserve_type)
+  | Py.TCallable (segment, parameters, result) ->
+    reserve_segment segment;
+    List.iter parameters ~f:reserve_type;
+    reserve_type result
+  | Py.TGeneric (segment, arguments) ->
+    reserve_segment segment;
+    List.iter arguments ~f:reserve_type
+
+and reserve_expression = function
+  | Py.Typ typ -> reserve_type typ
+  | Py.Literal _ -> ()
+  | Py.Identifier identifier -> reserve_segment identifier
+  | Py.Dot (value, identifier) ->
+    reserve_expression value;
+    reserve_segment identifier
+  | Py.BinaryExp (left, operator, right) ->
+    reserve_expression left;
+    ignore operator;
+    reserve_expression right
+  | Py.CompareChain (first, comparisons) ->
+    reserve_expression first;
+    List.iter comparisons ~f:(fun (operator, operand) ->
+      ignore operator;
+      reserve_expression operand)
+  | Py.UnaryExp (operator, value) ->
+    ignore operator;
+    reserve_expression value
+  | Py.Call (callee, arguments) ->
+    reserve_expression callee;
+    List.iter arguments ~f:reserve_expression
+  | Py.Lst elements | Py.Array elements | Py.Set elements | Py.Tuple elements ->
+    List.iter elements ~f:reserve_expression
+  | Py.ListComprehension (result, clauses) | Py.SetComprehension (result, clauses) ->
+    reserve_expression result;
+    List.iter clauses ~f:reserve_clause
+  | Py.DictComprehension (key, value, clauses) ->
+    reserve_expression key;
+    reserve_expression value;
+    List.iter clauses ~f:reserve_clause
+  | Py.Dict entries ->
+    List.iter entries ~f:(fun (key, value) -> reserve_expression key; reserve_expression value)
+  | Py.SingletonTuple (comma, value) ->
+    reserve_segment comma;
+    reserve_expression value
+  | Py.Subscript (value, selector) ->
+    reserve_expression value;
+    reserve_expression selector
+  | Py.Index value -> reserve_expression value
+  | Py.Slice (lower, upper) ->
+    Option.iter lower ~f:reserve_expression;
+    Option.iter upper ~f:reserve_expression
+  | Py.Forall (identifiers, body) | Py.Exists (identifiers, body) | Py.Lambda (identifiers, body) ->
+    List.iter identifiers ~f:reserve_segment;
+    reserve_expression body
+  | Py.Len (segment, value) | Py.Max (segment, value) | Py.Old (segment, value)
+  | Py.Fresh (segment, value) ->
+    reserve_segment segment;
+    reserve_expression value
+  | Py.IfElseExp (when_true, condition, when_false) ->
+    reserve_expression when_true;
+    reserve_expression condition;
+    reserve_expression when_false
+
+and reserve_clause = function
+  | Py.ComprehensionFor (targets, iterable) ->
+    List.iter targets ~f:reserve_segment;
+    reserve_expression iterable
+  | Py.ComprehensionIf condition -> reserve_expression condition
+
+and reserve_specification = function
+  | Py.Pre value | Py.Post value | Py.Invariant value | Py.Decreases value
+  | Py.Reads value | Py.Modifies value -> reserve_expression value
+
+and reserve_statement = function
+  | Py.IfElse (condition, first, alternatives, last) ->
+    reserve_expression condition;
+    List.iter first ~f:reserve_statement;
+    List.iter alternatives ~f:(fun (condition, body) ->
+      reserve_expression condition;
+      List.iter body ~f:reserve_statement);
+    List.iter last ~f:reserve_statement
+  | Py.For (specifications, identifiers, iterable, body) ->
+    List.iter specifications ~f:reserve_specification;
+    List.iter identifiers ~f:reserve_segment;
+    reserve_expression iterable;
+    List.iter body ~f:reserve_statement
+  | Py.While (specifications, condition, body) ->
+    List.iter specifications ~f:reserve_specification;
+    reserve_expression condition;
+    List.iter body ~f:reserve_statement
+  | Py.Assign (annotation, targets, values) ->
+    Option.iter annotation ~f:reserve_expression;
+    List.iter targets ~f:reserve_expression;
+    List.iter values ~f:reserve_expression
+  | Py.Function (specifications, name, parameters, return_type, body) ->
+    List.iter specifications ~f:reserve_specification;
+    reserve_segment name;
+    List.iter parameters ~f:(fun (identifier, annotation) ->
+      reserve_segment identifier;
+      reserve_expression annotation);
+    reserve_expression return_type;
+    List.iter body ~f:reserve_statement
+  | Py.Return value | Py.Assert value | Py.Exp value -> reserve_expression value
+  | Py.Break | Py.Continue | Py.Pass -> ()
+[@@@coverage on]
+
+let reserve_environment (environment : Sem.environment) =
+  List.iter environment.scopes ~f:(fun scope ->
+    List.iter scope.bindings ~f:(fun (name, typ) ->
+      reserve_name name;
+      reserve_type typ));
+  List.iter environment.functions ~f:(fun signature -> reserve_name signature.name)
+
+let reserve_statements statements = List.iter statements ~f:reserve_statement
 
 let fresh_temp () =
-  Int.incr temp_number;
-  (S.def_pos, Some ("lowered_" ^ Int.to_string !temp_number))
+  let rec next () =
+    Int.incr temp_number;
+    let name = "lowered_" ^ Int.to_string !temp_number in
+    if List.mem !reserved_names name ~equal:String.equal then next ()
+    else (
+      reserve_name name;
+      (S.def_pos, Some name))
+  in
+  next ()
 
 let context environment =
   { environment
@@ -712,6 +857,11 @@ and lower_compare_chain context first comparisons =
     }
 
 and lower_for context specifications identifiers iterable body =
+  reserve_environment context.environment;
+  List.iter specifications ~f:reserve_specification;
+  List.iter identifiers ~f:reserve_segment;
+  reserve_expression iterable;
+  reserve_statements body;
   let lowered_iterable = lower context iterable in
   let iterable_type = Sem.infer context.environment iterable in
   let kind = Sem.collection_kind iterable_type in
@@ -855,6 +1005,8 @@ and lower_comprehension context expression =
     | Scoped -> raise (LoweringError (reject_scoped_comprehension ()))
     | Eager -> ()
   end;
+  reserve_environment context.environment;
+  reserve_expression expression;
   let accumulator = fresh_temp () in
   let accumulator_name = Option.value (snd accumulator) ~default:"" in
   let resolved_type = Sem.infer context.environment expression in
@@ -875,7 +1027,9 @@ and lower_comprehension context expression =
     D.DAssignLvalue (None, [ D.Local accumulator ], [ initial_result ])
   in
   let accumulator_environment = Sem.bind context.environment accumulator_name initial_type in
+  let preserves_order = match kind with `List -> true | `Set | `Dict -> false in
   if Sem.comprehension_map_iteration_is_order_sensitive
+       ~preserves_order
        context.environment source_result source_key source_clauses
   then raise (LoweringError "order-dependent behavior in map iteration is unsupported");
   let clauses, substitutions = rename_comprehension_clauses [] source_clauses in
@@ -1143,6 +1297,8 @@ and lower_assignment context annotation targets values =
 
 and statements ?(environment = Sem.empty) ?return_type statements =
   reset ();
+  reserve_environment environment;
+  reserve_statements statements;
   let context =
     Option.value_map return_type ~default:(context environment)
       ~f:(with_return_type (context environment))
@@ -1233,6 +1389,8 @@ and lower_statement context statement =
 
 let expression ?(environment = Sem.empty) ?expected_type expression =
   reset ();
+  reserve_environment environment;
+  reserve_expression expression;
   let context =
     Option.value_map expected_type ~default:(context environment) ~f:(with_expected_type (context environment))
   in
