@@ -66,8 +66,6 @@ import definitely_missing_for_dafny_of_python_smoke_test
 
 def increment(x: int) -> int:
   return x + 1
-
-assert increment(1) == 2
 PYTHON
 
 set +e
