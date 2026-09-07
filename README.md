@@ -19,7 +19,8 @@ function cube(x: int): (res: int)
 }
 ```
 
-Along with the outcome of verification, where the line and column information corresponds to the original Python program:
+The verifier outcome is reported with a source-map location corresponding to
+the nearest original Python segment:
 ```
 verifier finished with 0 verified, 1 error(s)
 Line: 2  Column: 4  Value: cube,  Error,  A postcondition might not hold on this return path.
@@ -27,6 +28,11 @@ Line: 1  Column: 11  Value: ==,  Related location,  This is the postcondition th
 ```
 
 As the specifications are written in comments, Python programs can remain executable without modification. Assuming the translation is correct, successful verification of the translated Dafny program implies that the same properties hold for the original Python program. While the aim is to prevent knowledge of Dafny from being essential, it would certainly help in understanding what can be verified. You can see [additional examples below](#examples) and find more information in the [wiki](https://github.com/arsalanc-v2/dafny-of-python/wiki).
+
+The exact accepted and rejected language is documented in
+[`docs/supported-subset.md`](docs/supported-subset.md). The roadmap in
+[`plan2.md`](plan2.md) includes future work such as classes and generators;
+typed list, set, and dictionary comprehensions are part of the current subset.
 
 ## Usage
 
@@ -56,6 +62,9 @@ The CLI exits with 0 when both mypy and Dafny succeed, 1 when translation or
 Dafny verification fails, and 2 when mypy fails but translation and Dafny
 verification still complete. A mypy failure is printed and does not prevent
 generated Dafny from being inspected.
+
+`make run FILE=program.py` invokes this complete pipeline, including mypy and
+Dafny, and returns the same status codes. It is not a translation-only dump.
 
 ## Development
 
@@ -91,6 +100,12 @@ Opam environment, runs the ordinary suite plus a real mypy/Dafny smoke test,
 and enforces the coverage gate. `make real-integration` skips locally when the
 real Dafny executable is unavailable; CI sets `REQUIRE_REAL_TOOLS=1` so the
 check cannot silently skip there.
+
+The README examples are compatibility fixtures for the supported subset. The
+Linear Search example includes a `decreases` clause because Dafny requires an
+explicit termination variant for that loop. The Binary Search predicate is a
+bodyless specification declaration and includes both a `reads xs` clause and a
+mypy error-code suppression so it remains valid for the pinned tools.
 ## Examples
 ### Type Variables and Aliases
 ```Python
@@ -131,6 +146,7 @@ def find(xs: list[int], key: int) -> int:
   index = 0
   # invariant 0 <= index and index <= len(xs)
   # invariant forall k :: 0 <= k and k < index ==> xs[k] != key
+  # decreases len(xs) - index
   while index < len(xs):
     if xs[index] == key:
       return index
@@ -141,6 +157,10 @@ def find(xs: list[int], key: int) -> int:
 ```
 ### Binary Search
 ```Python
+# mypy: disable-error-code="empty-body"
+# The predicate is intentionally bodyless; the reads clause and mypy
+# suppression keep this specification declaration valid in both tools.
+# reads xs
 # post res <==> forall j, k :: 0 <= j and j < k and k < len(xs) ==> xs[j] <= xs[k]
 def is_sorted(xs: list[int]) -> bool:
   # implementation ommitted so that the function will be treated as a predicate

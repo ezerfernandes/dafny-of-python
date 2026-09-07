@@ -551,6 +551,233 @@ let test_phase3_collection_parser_forms () =
    | [ Assign (_, _, [ CompareChain (_, [ (In _, BinaryExp (_, BitOr _, _)) ]) ]) ] -> ()
    | _ -> fail "membership should accept a set algebra expression")
 
+let test_comprehension_parser_forms () =
+  let open Ast in
+  let parsed = parse_program "squares = [x * x for x in values if x > 0]\n" in
+  (match parsed with
+   | [ Assign (_, _, [ ListComprehension
+                          ( BinaryExp (Identifier (_, Some "x"), Times _, Identifier (_, Some "x"))
+                          , [ ComprehensionFor ([ (_, Some "x") ], Identifier (_, Some "values"))
+                            ; ComprehensionIf (CompareChain (Identifier (_, Some "x"), [ (Gt _, Literal (IntLit "0")) ])) ] ) ]) ] -> ()
+   | _ -> fail "list comprehensions should preserve clauses and filters");
+  (match parse_program "values = {x for x in source}\n" with
+   | [ Assign (_, _, [ SetComprehension
+                          ( Identifier (_, Some "x")
+                          , [ ComprehensionFor ([ (_, Some "x") ], Identifier (_, Some "source")) ] ) ]) ] -> ()
+   | _ -> fail "set comprehensions should preserve their generator");
+  (match parse_program "mapping = {x: x + 1 for x in source for y in other}\n" with
+   | [ Assign (_, _, [ DictComprehension
+                          ( Identifier (_, Some "x")
+                          , BinaryExp (Identifier (_, Some "x"), Plus _, Literal (IntLit "1"))
+                          , [ ComprehensionFor ([ (_, Some "x") ], Identifier (_, Some "source"))
+                            ; ComprehensionFor ([ (_, Some "y") ], Identifier (_, Some "other")) ] ) ]) ] -> ()
+   | _ -> fail "dictionary comprehensions should preserve nested generators")
+
+let test_comprehension_semantics_and_lowering () =
+  let open Ast in
+  let int_type = TInt def_seg in
+  let list_type = TLst (def_seg, Some int_type) in
+  let map_type = TDict (def_seg, Some int_type, Some int_type) in
+  let env =
+    Transform.Semantic.empty
+    |> fun env -> Transform.Semantic.bind env "values" list_type
+    |> fun env -> Transform.Semantic.bind env "other" list_type
+    |> fun env -> Transform.Semantic.bind env "mapping" map_type
+  in
+  let values = identifier "values" in
+  let x = segment "x" in
+  let y = segment "y" in
+  let for_x = ComprehensionFor ([ x ], values) in
+  let list_comp =
+    ListComprehension
+      ( BinaryExp (Identifier x, Times def_seg, Identifier x)
+      , [ for_x; ComprehensionIf (CompareChain (Identifier x, [ (Gt def_seg, Literal (IntLit "0")) ])) ] )
+  in
+  Transform.Semantic.validate_exp env list_comp;
+  check bool "list comprehension inference" true
+    (Transform.Semantic.collection_kind (Transform.Semantic.infer env list_comp)
+     = Transform.Semantic.ListCollection);
+  let set_comp = SetComprehension (Identifier x, [ for_x ]) in
+  let filtered_set_comp =
+    SetComprehension
+      ( Identifier x
+      , [ for_x; ComprehensionIf (CompareChain (Identifier x, [ (Gt def_seg, Literal (IntLit "0")) ])) ] )
+  in
+  Transform.Semantic.validate_exp env set_comp;
+  ignore (Transform.Semantic.infer env set_comp);
+  ignore
+    (Transform.Semantic.infer env
+       (SetComprehension
+          ( Identifier x
+          , [ for_x; ComprehensionIf (CompareChain (Identifier x, [ (Gt def_seg, Literal (IntLit "0")) ])) ] )));
+  let dict_comp =
+    DictComprehension
+      ( Identifier x
+      , BinaryExp (Identifier x, Plus def_seg, Literal (IntLit "1"))
+      , [ for_x ] )
+  in
+  let filtered_dict_comp =
+    DictComprehension
+      ( Identifier x
+      , Identifier x
+      , [ for_x; ComprehensionIf (CompareChain (Identifier x, [ (Gt def_seg, Literal (IntLit "0")) ])) ] )
+  in
+  Transform.Semantic.validate_exp env dict_comp;
+  ignore (Transform.Semantic.infer env dict_comp);
+  ignore
+    (Transform.Semantic.infer env
+       (DictComprehension
+          ( Identifier x
+          , Identifier x
+          , [ for_x; ComprehensionIf (CompareChain (Identifier x, [ (Gt def_seg, Literal (IntLit "0")) ])) ] )));
+  ignore
+    (Transform.Semantic.infer env
+       (ListComprehension
+          ( Identifier x
+          , [ ComprehensionFor ([ x; y ], values) ] )));
+  ignore
+    (Transform.Semantic.infer env
+       (SetComprehension
+          ( Identifier x
+          , [ ComprehensionFor ([ x; y ], values) ] )));
+  ignore
+    (Transform.Semantic.infer env
+       (DictComprehension
+          ( Identifier x
+          , Identifier x
+          , [ ComprehensionFor ([ x; y ], values) ] )));
+  let map_comp =
+    ListComprehension
+      ( Subscript (identifier "mapping", Index (Identifier x))
+      , [ ComprehensionFor ([ x ], identifier "mapping") ] )
+  in
+  Transform.Semantic.validate_exp env map_comp;
+  ignore (Transform.Semantic.infer env map_comp);
+  ignore (Transform.Semantic.normalize_exp list_comp);
+  ignore (Transform.Semantic.normalize_exp set_comp);
+  ignore (Transform.Semantic.normalize_exp dict_comp);
+  check bool "comprehensions require method lowering" true
+    (Transform.Semantic.expression_needs_method env list_comp);
+  ignore (Transform.Semantic.expression_needs_method env set_comp);
+  ignore (Transform.Semantic.expression_needs_method env dict_comp);
+  ignore
+    (Transform.Semantic.expression_needs_method env
+       (ListComprehension
+          ( Identifier x
+          , [ for_x; ComprehensionIf (Call (identifier "effect", [])) ] )));
+  ignore
+    (Transform.Semantic.expression_needs_method env
+       (DictComprehension (Identifier x, Identifier x, [ for_x; ComprehensionIf (Identifier x) ])));
+  check bool "effectful comprehension clauses are order-sensitive" true
+    (Transform.Semantic.map_iteration_is_order_sensitive
+       [ Assert
+           (ListComprehension
+              ( Call (identifier "effect", [])
+              , [ ComprehensionFor ([ x ], values) ] )) ]);
+  let contains_while statements =
+    List.exists (function D.DWhile _ -> true | _ -> false) statements
+  in
+  let list_lowered = Transform.Lowering.expression ~environment:env list_comp in
+  check bool "list comprehension lowers through an explicit loop" true
+    (contains_while list_lowered.prelude);
+  let set_lowered = Transform.Lowering.expression ~environment:env set_comp in
+  check bool "set comprehension lowers through an explicit loop" true
+    (contains_while set_lowered.prelude);
+  let dict_lowered = Transform.Lowering.expression ~environment:env dict_comp in
+  check bool "dict comprehension lowers through an explicit loop" true
+    (contains_while dict_lowered.prelude);
+  let scoped_rejected =
+    try
+      ignore
+        (Transform.Lowering.lower (Transform.Lowering.scoped (Transform.Lowering.context env)) list_comp);
+      false
+    with
+    | Transform.Lowering.LoweringError message -> has_substring message "scoped expressions"
+    | _ -> false
+  in
+  check bool "scoped comprehensions are rejected" true scoped_rejected;
+  let malformed_rejected =
+    try
+      ignore (Transform.Lowering.lower_comprehension (Transform.Lowering.context env) (Literal TrueLit));
+      false
+    with
+    | Transform.Lowering.LoweringError message -> has_substring message "expected a comprehension"
+    | _ -> false
+  in
+  check bool "direct comprehension lowering rejects non-comprehensions" true malformed_rejected;
+  let unknown_rejected =
+    try
+      Transform.Semantic.validate_exp env
+        (ListComprehension (Identifier x, [ ComprehensionFor ([ x ], identifier "unknown") ]));
+      false
+    with
+    | Transform.Semantic.SemanticError message -> has_substring message "concrete element type"
+    | _ -> false
+  in
+  check bool "comprehensions require concrete iterable elements" true unknown_rejected;
+  check bool "set comprehension order analysis visits filters" true
+    (Transform.Semantic.map_iteration_is_order_sensitive
+       [ Assert
+           (SetComprehension
+              ( Call (identifier "effect", [])
+              , [ for_x; ComprehensionIf (Call (identifier "effect", [])) ] )) ]);
+  check bool "dict comprehension order analysis visits clauses" true
+    (Transform.Semantic.map_iteration_is_order_sensitive
+       [ Assert
+           (DictComprehension
+              ( Call (identifier "effect", [])
+              , Call (identifier "effect", [])
+              , [ for_x; ComprehensionIf (Call (identifier "effect", [])) ] )) ]);
+  ignore
+    (Transform.Semantic.map_iteration_is_order_sensitive
+       [ Assert (DictComprehension (Call (identifier "effect", []), Identifier x, [ for_x ])) ]);
+  ignore
+    (Transform.Semantic.map_iteration_is_order_sensitive
+       [ Assert (DictComprehension (Identifier x, Call (identifier "effect", []), [ for_x ])) ]);
+  let typed_program =
+    Program
+      [ Function
+          ( []
+          , segment "list_comp"
+          , [ segment "xs", Typ list_type ]
+          , Typ list_type
+          , [ Return (ListComprehension (Identifier x, [ ComprehensionFor ([ x ], identifier "xs") ])) ] )
+      ; Function
+          ( []
+          , segment "set_comp"
+          , [ segment "xs", Typ list_type ]
+          , Typ (TSet (def_seg, Some int_type))
+          , [ Return (SetComprehension (Identifier x, [ ComprehensionFor ([ x ], identifier "xs") ])) ] )
+      ; Function
+          ( []
+          , segment "dict_comp"
+          , [ segment "xs", Typ list_type ]
+          , Typ map_type
+          , [ Return (DictComprehension
+                        ( Identifier x
+                        , BinaryExp (Identifier x, Plus def_seg, Literal (IntLit "1"))
+                        , [ ComprehensionFor ([ x ], identifier "xs") ] )) ] ) ]
+  in
+  ignore (Transform.Todafnyast.prog_dfy typed_program);
+  ignore (Transform.Todafnyast.statement_modifies [ "xs" ] (Return set_comp));
+  ignore (Transform.Todafnyast.statement_modifies [ "xs" ] (Return dict_comp));
+  ignore (Transform.Todafnyast.statement_modifies [ "xs" ] (Return filtered_set_comp));
+  ignore (Transform.Todafnyast.statement_modifies [ "xs" ] (Return filtered_dict_comp));
+  List.iter
+    (fun expression ->
+      try ignore (Transform.Todafnyast.exp_dfy expression) with
+      | Transform.Todafnyast.ToDfyError _ -> ())
+    [ set_comp; dict_comp ];
+  let rejected =
+    try
+      ignore (Transform.Todafnyast.exp_dfy list_comp);
+      false
+    with
+    | Transform.Todafnyast.ToDfyError _ -> true
+    | _ -> false
+  in
+  check bool "compatibility conversion requires semantic comprehensions" true rejected
+
 let test_ast_utilities () =
   let open Ast in
   let int_type = TInt Pyparse.Sourcemap.def_seg in
@@ -3760,6 +3987,7 @@ let () =
                   ; test_case "expression and type forms" `Quick test_parser_expression_and_type_forms
                   ; test_case "phase 2 parser forms" `Quick test_phase2_parser_forms
                   ; test_case "phase 3 collection parser forms" `Quick test_phase3_collection_parser_forms
+                  ; test_case "comprehension parser forms" `Quick test_comprehension_parser_forms
                   ; test_case "AST utilities" `Quick test_ast_utilities
                   ; test_case "AST serializers and subtyping" `Quick test_ast_serializers_and_subtyping ])
     ; ("transforms", [ test_case "call state reset" `Quick test_transform_state_resets
@@ -3770,6 +3998,7 @@ let () =
                       ; test_case "call and for conversion" `Quick test_convertcall_and_convertfor_paths
                       ; test_case "for statement paths" `Quick test_convertfor_statement_paths
                       ; test_case "semantic lowering paths" `Quick test_semantic_lowering_paths
+                      ; test_case "comprehension semantics and lowering" `Quick test_comprehension_semantics_and_lowering
                       ; test_case "phase 2 semantics and chains" `Quick test_phase2_semantics_and_chains
                       ; test_case "phase 3 collections" `Quick test_phase3_collections
                       ; test_case "collection order and alias paths" `Quick test_collection_order_and_alias_paths

@@ -113,6 +113,11 @@ let rec normalize_type = function
 let rec normalize_param (identifier, annotation_expression) =
   identifier, normalize_exp annotation_expression
 
+and normalize_comprehension_clause = function
+  | ComprehensionFor (targets, iterable) ->
+    ComprehensionFor (targets, normalize_exp iterable)
+  | ComprehensionIf condition -> ComprehensionIf (normalize_exp condition)
+
 and normalize_exp = function
   | Typ typ -> Typ (normalize_type typ)
   | Literal _ as expression -> expression
@@ -129,6 +134,17 @@ and normalize_exp = function
   | Lst elements -> Lst (List.map elements ~f:normalize_exp)
   | Array elements -> Array (List.map elements ~f:normalize_exp)
   | Set elements -> Set (List.map elements ~f:normalize_exp)
+  | ListComprehension (result, clauses) ->
+    ListComprehension
+      (normalize_exp result, List.map clauses ~f:normalize_comprehension_clause)
+  | SetComprehension (result, clauses) ->
+    SetComprehension
+      (normalize_exp result, List.map clauses ~f:normalize_comprehension_clause)
+  | DictComprehension (key, value, clauses) ->
+    DictComprehension
+      ( normalize_exp key
+      , normalize_exp value
+      , List.map clauses ~f:normalize_comprehension_clause )
   | Dict entries ->
     Dict (List.map entries ~f:(fun (key, value) -> normalize_exp key, normalize_exp value))
   | Tuple [] -> fail "empty tuples are unsupported"
@@ -627,6 +643,11 @@ let integer_literal = function
   | Literal (IntLit value) -> (try Some (Int.of_string value) with _ -> None)
   | _ -> None
 
+let comprehension_element_type typ =
+  match collection_kind typ with
+  | MapCollection -> Option.map (map_types typ) ~f:fst
+  | _ -> collection_element_type typ
+
 let rec infer env = function
   | Typ typ -> normalize_type typ
   | Literal literal -> infer_literal literal
@@ -718,6 +739,67 @@ let rec infer env = function
   | Set elements ->
     let element = List.find_map elements ~f:(fun element -> Some (infer env element)) in
     generic "set" (Option.to_list element)
+  | ListComprehension (result, clauses) ->
+    let scoped = enter_scope env ComprehensionScope in
+    let rec infer_clauses env = function
+      | [] -> env
+      | ComprehensionFor (targets, iterable) :: rest ->
+        let element_type =
+          Option.value (comprehension_element_type (infer env iterable))
+            ~default:(TIdent def_seg)
+        in
+        let env =
+          match targets with
+          | [ target ] -> bind env (identifier_name (Identifier target)) element_type
+          | _ -> env
+        in
+        infer_clauses env rest
+      | ComprehensionIf condition :: rest ->
+        ignore (infer env condition);
+        infer_clauses env rest
+    in
+    generic "list" [ infer (infer_clauses scoped clauses) result ]
+  | SetComprehension (result, clauses) ->
+    let scoped = enter_scope env ComprehensionScope in
+    let rec infer_clauses env = function
+      | [] -> env
+      | ComprehensionFor (targets, iterable) :: rest ->
+        let element_type =
+          Option.value (comprehension_element_type (infer env iterable))
+            ~default:(TIdent def_seg)
+        in
+        let env =
+          match targets with
+          | [ target ] -> bind env (identifier_name (Identifier target)) element_type
+          | _ -> env
+        in
+        infer_clauses env rest
+      | ComprehensionIf condition :: rest ->
+        ignore (infer env condition);
+        infer_clauses env rest
+    in
+    generic "set" [ infer (infer_clauses scoped clauses) result ]
+  | DictComprehension (key, value, clauses) ->
+    let scoped = enter_scope env ComprehensionScope in
+    let rec infer_clauses env = function
+      | [] -> env
+      | ComprehensionFor (targets, iterable) :: rest ->
+        let element_type =
+          Option.value (comprehension_element_type (infer env iterable))
+            ~default:(TIdent def_seg)
+        in
+        let env =
+          match targets with
+          | [ target ] -> bind env (identifier_name (Identifier target)) element_type
+          | _ -> env
+        in
+        infer_clauses env rest
+      | ComprehensionIf condition :: rest ->
+        ignore (infer env condition);
+        infer_clauses env rest
+    in
+    let scoped = infer_clauses scoped clauses in
+    generic "map" [ infer scoped key; infer scoped value ]
   | Dict entries ->
     let key, value =
       match List.find_map entries ~f:(fun (key, value) -> Some (infer env key, infer env value)) with
@@ -854,6 +936,19 @@ let rec expression_needs_method env = function
     true
   | Array elements | Set elements | Tuple elements ->
     List.exists elements ~f:(expression_needs_method env)
+  | ListComprehension (result, clauses) | SetComprehension (result, clauses) ->
+    ignore (expression_needs_method env result);
+    List.iter clauses ~f:(function
+      | ComprehensionFor (_, iterable) -> ignore (expression_needs_method env iterable)
+      | ComprehensionIf condition -> ignore (expression_needs_method env condition));
+    true
+  | DictComprehension (key, value, clauses) ->
+    ignore (expression_needs_method env key);
+    ignore (expression_needs_method env value);
+    List.iter clauses ~f:(function
+      | ComprehensionFor (_, iterable) -> ignore (expression_needs_method env iterable)
+      | ComprehensionIf condition -> ignore (expression_needs_method env condition));
+    true
   | Dict entries ->
     List.exists entries ~f:(fun (key, value) ->
       expression_needs_method env key || expression_needs_method env value)
@@ -920,6 +1015,9 @@ let compatible_types left right =
 
 let require condition message = if not condition then fail message
 
+let reject_abstract_comprehension_element () =
+  "comprehension iterable requires a concrete element type"
+
 let require_compatible left right message = require (compatible_types left right) message
 
 let rec is_hashable_type typ =
@@ -982,6 +1080,17 @@ let rec expression_order_sensitive = function
   | Call _ -> true
   | Lst elements | Array elements | Set elements | Tuple elements ->
     List.exists elements ~f:expression_order_sensitive
+  | ListComprehension (result, clauses) | SetComprehension (result, clauses) ->
+    List.exists clauses ~f:(function
+      | ComprehensionFor (_, iterable) -> expression_order_sensitive iterable
+      | ComprehensionIf condition -> expression_order_sensitive condition)
+    || expression_order_sensitive result
+  | DictComprehension (key, value, clauses) ->
+    List.exists clauses ~f:(function
+      | ComprehensionFor (_, iterable) -> expression_order_sensitive iterable
+      | ComprehensionIf condition -> expression_order_sensitive condition)
+    || expression_order_sensitive key
+    || expression_order_sensitive value
   | Dict entries ->
     List.exists entries ~f:(fun (key, value) ->
       any_order_sensitive
@@ -1173,6 +1282,38 @@ let rec validate_call env callee arguments =
     end
   | _ -> ()
 
+and validate_comprehension env clauses =
+  require (not (List.is_empty clauses)) "comprehensions require at least one for clause";
+  let rec validate_clauses env = function
+    | [] -> env
+    | ComprehensionFor (targets, iterable) :: rest ->
+      validate_exp env iterable;
+      require (List.length targets = 1) "comprehension targets require one identifier";
+      let target = List.hd_exn targets in
+      let element_type =
+        Option.value (comprehension_element_type (infer env iterable))
+          ~default:(TIdent def_seg)
+      in
+      begin
+        match normalize_type element_type with
+        | TIdent _ -> raise (SemanticError (reject_abstract_comprehension_element ()))
+        | _ -> ()
+      end;
+      let target_name = identifier_name (Identifier target) in
+      let env = bind env target_name element_type in
+      let env =
+        match collection_kind (infer env iterable), iterable with
+        | MapCollection, Identifier map ->
+          add_membership env target_name (identifier_name (Identifier map))
+        | _ -> env
+      in
+      validate_clauses env rest
+    | ComprehensionIf condition :: rest ->
+      validate_exp env condition;
+      validate_clauses env rest
+  in
+  validate_clauses (enter_scope env ComprehensionScope) clauses
+
 and validate_exp env = function
   | Typ _ | Literal _ | Identifier _ -> ()
   | Dot (value, _) -> validate_exp env value
@@ -1216,6 +1357,18 @@ and validate_exp env = function
           require_compatible first_type (infer env element) "collection elements have incompatible types";
           require_hashable (infer env element) "set elements must be hashable")
     end
+  | ListComprehension (result, clauses) ->
+    let scoped = validate_comprehension env clauses in
+    validate_exp scoped result
+  | SetComprehension (result, clauses) ->
+    let scoped = validate_comprehension env clauses in
+    validate_exp scoped result;
+    require_hashable (infer scoped result) "set comprehension elements must be hashable"
+  | DictComprehension (key, value, clauses) ->
+    let scoped = validate_comprehension env clauses in
+    validate_exp scoped key;
+    validate_exp scoped value;
+    require_hashable (infer scoped key) "dictionary comprehension keys must be hashable"
   | Dict entries ->
     List.iter entries ~f:(fun (key, value) -> validate_exp env key; validate_exp env value);
     begin

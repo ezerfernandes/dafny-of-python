@@ -6,6 +6,8 @@ DUNE ?= dune
 PYTHON ?= python
 PYTEST ?= pytest
 OCAML_VERSION ?= 4.14.2
+MYPY_BIN ?= $(shell $(UV) run --frozen -- which mypy 2>/dev/null)
+DAFNY_BIN ?= $(shell command -v dafny 2>/dev/null)
 
 UV_RUN := $(UV) run --frozen --
 OPAM_EXEC := $(UV_RUN) $(OPAM) exec --
@@ -33,7 +35,7 @@ help:
 	  'make coverage       Run Python and OCaml coverage gates' \
 	  'make real-integration Run the real mypy/Dafny smoke test' \
 	  'make integration     Build and run all integration checks' \
-	  'make run FILE=x.py  Translate FILE with the CLI' \
+	  'make run FILE=x.py  Verify FILE with mypy and Dafny' \
 	  'make clean           Remove generated build and coverage output'
 
 uv-sync:
@@ -96,7 +98,13 @@ integration: test real-integration
 
 run:
 	@test -n "$(FILE)" || { printf '%s\n' 'Usage: make run FILE=program.py' >&2; exit 2; }
-	$(OCAML_EXEC) exec src/bin/main.exe < "$(FILE)"
+	@test -n "$(MYPY_BIN)" || { printf '%s\n' 'Unable to locate the uv-managed mypy executable; run make setup or set MYPY_BIN.' >&2; exit 2; }
+	@test -n "$(DAFNY_BIN)" || { printf '%s\n' 'Unable to locate Dafny; install the pinned tool or set DAFNY_BIN.' >&2; exit 2; }
+	$(OCAML_EXEC) exec src/bin/main.exe -- \
+		--mypy "$(MYPY_BIN)" \
+		--dafny "$(DAFNY_BIN)" \
+		--prelude "$(CURDIR)/src/libs/run/prelude.dfy" \
+		--list "$(CURDIR)/src/libs/run/list.dfy" < "$(FILE)"
 
 clean:
 	$(OCAML_EXEC) clean

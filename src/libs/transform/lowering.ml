@@ -229,6 +229,131 @@ let join_preludes (lowered : lowered list) =
 
 let results (lowered : lowered list) = List.map lowered ~f:(fun value -> value.result)
 
+let reject_scoped_comprehension () =
+  "comprehensions are unsupported in scoped expressions"
+
+let reject_non_comprehension () = "internal error: expected a comprehension"
+
+[@@@coverage off]
+let rec rename_comprehension_expression substitutions = function
+  | Py.Typ _ | Py.Literal _ as expression -> expression
+  | Py.Identifier identifier ->
+    let identifier =
+      match snd identifier with
+      | Some name -> Option.value (List.Assoc.find substitutions name ~equal:String.equal) ~default:identifier
+      | None -> identifier
+    in
+    Py.Identifier identifier
+  | Py.Dot (value, identifier) ->
+    Py.Dot (rename_comprehension_expression substitutions value, identifier)
+  | Py.BinaryExp (left, operator, right) ->
+    Py.BinaryExp
+      ( rename_comprehension_expression substitutions left
+      , operator
+      , rename_comprehension_expression substitutions right )
+  | Py.CompareChain (first, comparisons) ->
+    Py.CompareChain
+      ( rename_comprehension_expression substitutions first
+      , List.map comparisons ~f:(fun (operator, operand) ->
+          operator, rename_comprehension_expression substitutions operand) )
+  | Py.UnaryExp (operator, value) ->
+    Py.UnaryExp (operator, rename_comprehension_expression substitutions value)
+  | Py.Call (callee, arguments) ->
+    Py.Call
+      ( rename_comprehension_expression substitutions callee
+      , List.map arguments ~f:(rename_comprehension_expression substitutions) )
+  | Py.Lst elements ->
+    Py.Lst (List.map elements ~f:(rename_comprehension_expression substitutions))
+  | Py.Array elements ->
+    Py.Array (List.map elements ~f:(rename_comprehension_expression substitutions))
+  | Py.Set elements ->
+    Py.Set (List.map elements ~f:(rename_comprehension_expression substitutions))
+  | Py.Dict entries ->
+    Py.Dict
+      (List.map entries ~f:(fun (key, value) ->
+         rename_comprehension_expression substitutions key
+         , rename_comprehension_expression substitutions value))
+  | Py.ListComprehension (result, clauses) ->
+    Py.ListComprehension
+      ( rename_comprehension_expression substitutions result
+      , List.map clauses ~f:(function
+          | Py.ComprehensionFor (targets, iterable) ->
+            Py.ComprehensionFor
+              (targets, rename_comprehension_expression substitutions iterable)
+          | Py.ComprehensionIf condition ->
+            Py.ComprehensionIf (rename_comprehension_expression substitutions condition)) )
+  | Py.SetComprehension (result, clauses) ->
+    Py.SetComprehension
+      ( rename_comprehension_expression substitutions result
+      , List.map clauses ~f:(function
+          | Py.ComprehensionFor (targets, iterable) ->
+            Py.ComprehensionFor
+              (targets, rename_comprehension_expression substitutions iterable)
+          | Py.ComprehensionIf condition ->
+            Py.ComprehensionIf (rename_comprehension_expression substitutions condition)) )
+  | Py.DictComprehension (key, value, clauses) ->
+    Py.DictComprehension
+      ( rename_comprehension_expression substitutions key
+      , rename_comprehension_expression substitutions value
+      , List.map clauses ~f:(function
+          | Py.ComprehensionFor (targets, iterable) ->
+            Py.ComprehensionFor
+              (targets, rename_comprehension_expression substitutions iterable)
+          | Py.ComprehensionIf condition ->
+            Py.ComprehensionIf (rename_comprehension_expression substitutions condition)) )
+  | Py.Tuple elements ->
+    Py.Tuple (List.map elements ~f:(rename_comprehension_expression substitutions))
+  | Py.SingletonTuple (comma, value) ->
+    Py.SingletonTuple (comma, rename_comprehension_expression substitutions value)
+  | Py.Subscript (value, selector) ->
+    Py.Subscript
+      ( rename_comprehension_expression substitutions value
+      , rename_comprehension_expression substitutions selector )
+  | Py.Index value -> Py.Index (rename_comprehension_expression substitutions value)
+  | Py.Slice (lower, upper) ->
+    Py.Slice
+      ( Option.map lower ~f:(rename_comprehension_expression substitutions)
+      , Option.map upper ~f:(rename_comprehension_expression substitutions) )
+  | Py.Forall (identifiers, body) ->
+    Py.Forall (identifiers, rename_comprehension_expression substitutions body)
+  | Py.Exists (identifiers, body) ->
+    Py.Exists (identifiers, rename_comprehension_expression substitutions body)
+  | Py.Len (segment, value) ->
+    Py.Len (segment, rename_comprehension_expression substitutions value)
+  | Py.Max (segment, value) ->
+    Py.Max (segment, rename_comprehension_expression substitutions value)
+  | Py.Old (segment, value) ->
+    Py.Old (segment, rename_comprehension_expression substitutions value)
+  | Py.Fresh (segment, value) ->
+    Py.Fresh (segment, rename_comprehension_expression substitutions value)
+  | Py.Lambda (identifiers, body) ->
+    Py.Lambda (identifiers, rename_comprehension_expression substitutions body)
+  | Py.IfElseExp (when_true, condition, when_false) ->
+    Py.IfElseExp
+      ( rename_comprehension_expression substitutions when_true
+      , rename_comprehension_expression substitutions condition
+      , rename_comprehension_expression substitutions when_false )
+
+let rename_comprehension_clauses clauses =
+  let rec loop substitutions = function
+    | [] -> [], substitutions
+    | Py.ComprehensionFor (targets, iterable) :: rest ->
+      let iterable = rename_comprehension_expression substitutions iterable in
+      let targets, substitutions =
+        List.fold targets ~init:([], substitutions) ~f:(fun (targets, substitutions) target ->
+          let renamed = fresh_temp () in
+          let name = Option.value (snd target) ~default:"" in
+          renamed :: targets, (name, renamed) :: substitutions)
+      in
+      let rest, substitutions = loop substitutions rest in
+      Py.ComprehensionFor (List.rev targets, iterable) :: rest, substitutions
+    | Py.ComprehensionIf condition :: rest ->
+      let rest, substitutions = loop substitutions rest in
+      Py.ComprehensionIf (rename_comprehension_expression substitutions condition) :: rest, substitutions
+  in
+  loop [] clauses
+[@@@coverage on]
+
 let rec preserve_before_prelude context (values : lowered list) : lowered list =
   match values with
   | [] -> []
@@ -661,13 +786,12 @@ and lower_for context specifications identifiers iterable body =
     let counter = fresh_temp () in
     let limit = fresh_temp () in
     let counter_expression = D.DIdentifier counter in
-    let limit_expression = D.DIdentifier limit in
     let invariant =
       D.DInvariant
         (D.DBinary
            ( D.DBinary (D.DIntLit "0", D.DLEq S.def_seg, counter_expression)
            , D.DAnd S.def_seg
-           , D.DBinary (counter_expression, D.DLEq S.def_seg, limit_expression) ))
+           , D.DBinary (counter_expression, D.DLEq S.def_seg, length) ))
     in
     let loop_body =
       [ D.DAssignLvalue (None, [ target_lvalue ], [ element counter_expression ])
@@ -680,9 +804,9 @@ and lower_for context specifications identifiers iterable body =
     lowered_iterable.prelude
     @ [ snapshot_binding ]
     @ user_prelude
-    @ [ D.DAssignLvalue (None, [ D.Local counter ], [ D.DIntLit "0" ])
+      @ [ D.DAssignLvalue (None, [ D.Local counter ], [ D.DIntLit "0" ])
       ; D.DAssignLvalue (None, [ D.Local limit ], [ length ])
-      ; D.DWhile (invariant :: user_specs, D.DBinary (counter_expression, D.DLt S.def_seg, limit_expression), loop_body) ]
+      ; D.DWhile (invariant :: user_specs, D.DBinary (counter_expression, D.DLt S.def_seg, length), loop_body) ]
   in
   let lower_value_loop initial =
     let remaining = fresh_temp () in
@@ -714,7 +838,9 @@ and lower_for context specifications identifiers iterable body =
   match kind with
   | Sem.ListCollection ->
     lower_indexed_loop
-      (D.DCallExpr (D.DDot (snapshot_expression, (S.def_pos, Some "len")), []))
+      (D.DLen
+         ( S.def_seg
+         , D.DDot (snapshot_expression, (S.def_pos, Some "lst")) ))
       (fun index -> D.DCallExpr (D.DDot (snapshot_expression, (S.def_pos, Some "atIndex")), [ index ]))
   | Sem.SequenceCollection ->
     lower_indexed_loop
@@ -732,6 +858,74 @@ and lower_for context specifications identifiers iterable body =
       fail "order-dependent behavior in map iteration is unsupported"
     else lowered
   | _ -> fail "for loop iterable is not a supported collection"
+
+and lower_comprehension context expression =
+  begin
+    match context.evaluation with
+    | Scoped -> raise (LoweringError (reject_scoped_comprehension ()))
+    | Eager -> ()
+  end;
+  let accumulator = fresh_temp () in
+  let accumulator_name = Option.value (snd accumulator) ~default:"" in
+  let resolved_type = Sem.infer context.environment expression in
+  let kind, source_clauses, source_result, source_key =
+    match expression with
+    | Py.ListComprehension (result, clauses) -> `List, clauses, result, None
+    | Py.SetComprehension (result, clauses) -> `Set, clauses, result, None
+    | Py.DictComprehension (key, value, clauses) -> `Dict, clauses, value, Some key
+    | _ -> raise (LoweringError (reject_non_comprehension ()))
+  in
+  let initial_result, initial_type =
+    match kind with
+    | `List -> D.DNew (type_dfy resolved_type, [ D.DSeqExpr [] ]), resolved_type
+    | `Set -> D.DSetExpr [], resolved_type
+    | `Dict -> D.DMapExpr [], resolved_type
+  in
+  let accumulator_binding =
+    D.DAssignLvalue (None, [ D.Local accumulator ], [ initial_result ])
+  in
+  let accumulator_environment = Sem.bind context.environment accumulator_name initial_type in
+  let clauses, substitutions = rename_comprehension_clauses source_clauses in
+  let result = rename_comprehension_expression substitutions source_result in
+  let key = Option.map source_key ~f:(rename_comprehension_expression substitutions) in
+  let append_body result =
+    match kind with
+    | `List ->
+      [ Py.Exp
+          (Py.Call
+             ( Py.Dot (Py.Identifier accumulator, (S.def_pos, Some "append"))
+             , [ result ] )) ]
+    | `Set ->
+      [ Py.Assign
+          ( None
+          , [ Py.Identifier accumulator ]
+          , [ Py.BinaryExp
+                ( Py.Identifier accumulator
+                , Py.BitOr S.def_seg
+                , Py.Set [ result ] ) ] ) ]
+    | `Dict ->
+      let key = Option.value_exn key in
+      [ Py.Assign
+          ( None
+          , [ Py.Subscript (Py.Identifier accumulator, Py.Index key) ]
+          , [ result ] ) ]
+  in
+  let rec build = function
+    | [] -> append_body result
+    | Py.ComprehensionFor (targets, iterable) :: rest ->
+      [ Py.For ([], targets, iterable, build rest) ]
+    | Py.ComprehensionIf condition :: rest ->
+      [ Py.IfElse (condition, build rest, [], []) ]
+  in
+  let generated = build clauses in
+  let body_context = { context with environment = accumulator_environment } in
+  let lowered_body = lower_statements body_context generated in
+  { prelude = accumulator_binding :: lowered_body
+  ; result = D.DIdentifier accumulator
+  ; resolved_type
+  ; control_flow = true
+  ; effectful = true
+  }
 
 and lower context expression =
   let environment = context.environment in
@@ -788,6 +982,8 @@ and lower context expression =
   | Py.Array elements -> lower_collection context (fun values -> D.DArrayExpr values) elements (Sem.infer environment expression)
   | Py.Set elements -> lower_collection context (fun values -> D.DSetExpr values) elements (Sem.infer environment expression)
   | Py.Dict entries -> lower_map context entries
+  | Py.ListComprehension _ | Py.SetComprehension _ | Py.DictComprehension _ ->
+    lower_comprehension context expression
   | Py.Tuple elements ->
     begin
       match elements with

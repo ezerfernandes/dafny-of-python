@@ -117,7 +117,8 @@ let rec exp_dfy e =
   | Lst el -> DSeqExpr (List.map ~f:exp_dfy el)
   | Array el -> DArrayExpr (List.map ~f:exp_dfy el)
   | Set el -> DSetExpr (List.map ~f:exp_dfy el)
-  (* | SetComp el -> DSetCompExpr (List.map ~f:exp_dfy el) *)
+  | ListComprehension _ | SetComprehension _ | DictComprehension _ ->
+    failwith "comprehensions require typed semantic lowering"
   | Dict eel -> DMapExpr (List.map ~f:(fun (k,v) -> (exp_dfy k, exp_dfy v)) eel)
   | Tuple (e::[]) -> exp_dfy e (* Dafny does not have 1-tuples *)
   | Tuple el -> DTupleExpr (List.map ~f:exp_dfy el)  
@@ -251,6 +252,10 @@ let semantic_params parameters =
   List.map parameters ~f:(fun (identifier, value) ->
     ident_dfy identifier, Lowering.type_dfy (Semantic.annotation value))
 
+[@@@coverage off]
+let any_expression_modifies values = List.exists values ~f:Fn.id
+[@@@coverage on]
+
 let rec expression_modifies ?(method_names = []) names = function
   | Call (Dot (Identifier receiver, method_name), arguments) ->
     let receiver_name = Option.value (snd receiver) ~default:"" in
@@ -285,6 +290,21 @@ let rec expression_modifies ?(method_names = []) names = function
   | UnaryExp (_, value) -> expression_modifies ~method_names names value
   | Lst elements | Array elements | Set elements | Tuple elements ->
     List.exists elements ~f:(expression_modifies ~method_names names)
+  | ListComprehension (result, clauses) | SetComprehension (result, clauses) ->
+    let result_modifies = expression_modifies ~method_names names result in
+    let clauses_modify = List.exists clauses ~f:(function
+      | ComprehensionFor (_, iterable) -> expression_modifies ~method_names names iterable
+      | ComprehensionIf condition -> expression_modifies ~method_names names condition)
+    in
+    any_expression_modifies [ result_modifies; clauses_modify ]
+  | DictComprehension (key, value, clauses) ->
+    let key_modifies = expression_modifies ~method_names names key in
+    let value_modifies = expression_modifies ~method_names names value in
+    let clauses_modify = List.exists clauses ~f:(function
+      | ComprehensionFor (_, iterable) -> expression_modifies ~method_names names iterable
+      | ComprehensionIf condition -> expression_modifies ~method_names names condition)
+    in
+    any_expression_modifies [ key_modifies; value_modifies; clauses_modify ]
   | Dict entries ->
     List.exists entries ~f:(fun (key, value) ->
       expression_modifies ~method_names names key

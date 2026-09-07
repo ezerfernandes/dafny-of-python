@@ -205,6 +205,12 @@ loop_items: list[int] = [1]
 for loop_item in loop_items:
   continue
 
+squares = [item * item for item in loop_items]
+assert squares == squares
+selected = {item for item in loop_items if item == 1}
+assert selected == selected
+incremented = {item: item + 1 for item in loop_items}
+
 mutate(loop_items)
 PYTHON
 
@@ -246,6 +252,8 @@ grep -q '.contains' "$workdir/valid_output"
 grep -q 'new List<int>(\[\])' "$workdir/valid_output"
 grep -q 'while true' "$workdir/valid_output"
 grep -q 'continue;' "$workdir/valid_output"
+grep -q 'squares' "$workdir/valid_output"
+grep -q 'incremented' "$workdir/valid_output"
 grep -q 'verifier finished with [0-9][0-9]* verified, 0 error' "$workdir/valid_output"
 # Dafny 4.11 reports harmless warnings (for example, an `old` expression that
 # does not dereference the heap) on stderr. A zero exit code and a zero-error

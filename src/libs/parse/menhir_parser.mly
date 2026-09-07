@@ -275,11 +275,28 @@ slice:
   ; 
 
 lst_exp:
-  | LBRACK; el=exp_star; RBRACK { Lst el }
+  | LBRACK; RBRACK { Lst [] }
+  | LBRACK; result=exp; clauses=comp_for; RBRACK { ListComprehension (result, clauses) }
+  | LBRACK; first=exp; COMMA; rest=exp_star; RBRACK { Lst (first::rest) }
+  | LBRACK; first=exp; RBRACK { Lst [first] }
   ;
 
 dict_exp:
+  | LBRACE; key=exp; COLON; value=exp; clauses=comp_for; RBRACE
+    { DictComprehension (key, value, clauses) }
   | LBRACE; eel=kv_star; RBRACE { Dict eel }
+  ;
+
+comp_for:
+  | FOR; targets=star_targets; IN; iterable=implication; rest=comp_iter
+    { ComprehensionFor (targets, iterable) :: rest }
+  ;
+
+comp_iter:
+  | IF; condition=exp; rest=comp_iter { ComprehensionIf condition :: rest }
+  | FOR; targets=star_targets; IN; iterable=implication; rest=comp_iter
+    { ComprehensionFor (targets, iterable) :: rest }
+  | { [] }
   ;
 
 kv_star:
@@ -298,7 +315,10 @@ kv:
   ;
 
 set_exp:
-  | LBRACE; el=exp_star; RBRACE { Set el }
+  | LBRACE; RBRACE { Set [] }
+  | LBRACE; result=exp; clauses=comp_for; RBRACE { SetComprehension (result, clauses) }
+  | LBRACE; first=exp; COMMA; rest=exp_star; RBRACE { Set (first::rest) }
+  | LBRACE; first=exp; RBRACE { Set [first] }
   ;
 
 spec:

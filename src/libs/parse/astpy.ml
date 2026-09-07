@@ -126,7 +126,9 @@ type exp =
   | Lst of exp list
   | Array of exp list
   | Set of exp list
-  (* | SetComp of exp * exp * exp * exp list result, target, domain, conditions *)
+  | ListComprehension of exp * comprehension_clause list
+  | SetComprehension of exp * comprehension_clause list
+  | DictComprehension of exp * exp * comprehension_clause list
   | Dict of (exp * exp) list
   | Tuple of exp list
   (* The comma is retained until semantic normalization so source locations
@@ -143,6 +145,11 @@ type exp =
   | Fresh of segment * exp
   | Lambda of identifier list * exp
   | IfElseExp of exp * exp * exp
+  [@@deriving sexp]
+
+and comprehension_clause =
+  | ComprehensionFor of identifier list * exp
+  | ComprehensionIf of exp
   [@@deriving sexp]
 
 type param = identifier * exp (* name: type *)
