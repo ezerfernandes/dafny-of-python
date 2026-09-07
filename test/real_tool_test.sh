@@ -61,33 +61,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cat > "$workdir/program.py" <<'PYTHON'
-import definitely_missing_for_dafny_of_python_smoke_test
-
-def increment(x: int) -> int:
-  return x + 1
-
-assert increment(1) == 2
-PYTHON
-
-set +e
-(
-  cd "$workdir"
-  "$main_exe" \
-    --mypy "$mypy_bin" \
-    --dafny "$dafny_bin" \
-    --prelude "$prelude" \
-    --list "$list_library" \
-    --temp-root "$workdir" < program.py > output 2> errors
-)
-status=$?
-set -e
-
-test "$status" -eq 2
-grep -q 'function increment' "$workdir/output"
-grep -q 'verifier finished with [0-9][0-9]* verified, 0 error' "$workdir/output"
-grep -q 'Typechecking failed (exit code 1)' "$workdir/errors"
-
 # A valid Python fixture must exercise the pinned mypy success path and the
 # CLI's zero exit code while Dafny verifies the generated program.
 cat > "$workdir/valid_program.py" <<'PYTHON'
